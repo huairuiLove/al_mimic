@@ -120,7 +120,7 @@ def _contrastive_chunk(
     # (IEEE (-inf)*0 == NaN).
     if start == 0 and stop == int(flat.shape[0]):
         # Square full-batch path: fill_diagonal_ is cheaper than a dense bool mask.
-        positive = positive.clone()
+        # Clone only denom logits; mutating the autograd-bearing logits breaks backward.
         positive.fill_diagonal_(False)
         denom_logits = logits.clone()
         denom_logits.fill_diagonal_(float("-inf"))
