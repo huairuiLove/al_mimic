@@ -39,6 +39,10 @@ def multilabel_metrics(
         metrics["auroc_micro"] = float(roc_auc_score(labels, probabilities, average="micro"))
     except ValueError:
         metrics["auroc_micro"] = None
+    try:
+        metrics["auroc_macro"] = float(roc_auc_score(labels, probabilities, average="macro"))
+    except ValueError:
+        metrics["auroc_macro"] = None
     label_sums = labels.sum(axis=1)
     for k in (1, 3, 5):
         actual_k = min(k, labels.shape[1])

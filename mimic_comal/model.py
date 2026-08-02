@@ -96,15 +96,17 @@ def _contrastive_chunk(
     temperature: float,
 ) -> tuple[torch.Tensor, int]:
     chunk = flat[start:stop]
-    logits = (chunk @ flat.T).div_(temperature)
+    width = stop - start
+    logits = chunk.matmul(flat.transpose(0, 1)).div_(temperature)
     logits = logits - logits.max(dim=1, keepdim=True).values.detach()
     positive = class_ids[start:stop, None].eq(class_ids[None, :])
-    eye = torch.arange(stop - start, device=flat.device)
+    eye = torch.arange(width, device=flat.device)
     self_columns = start + eye
-    positive = positive.clone()
-    positive[eye, self_columns] = False
-    valid = torch.ones_like(positive)
-    valid[eye, self_columns] = False
+    # Build masks without Python-side clone churn on the hot path.
+    self_mask = torch.zeros_like(positive)
+    self_mask[eye, self_columns] = True
+    positive = positive & ~self_mask
+    valid = ~self_mask
     denom = torch.logsumexp(logits.masked_fill(~valid, -torch.inf), dim=1, keepdim=True)
     log_prob = logits - denom
     counts = positive.sum(dim=1)
