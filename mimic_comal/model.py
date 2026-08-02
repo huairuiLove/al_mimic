@@ -196,11 +196,11 @@ def own_prototype_similarity(
     num_labels: int,
 ) -> torch.Tensor:
     # Prototypes are unit-normalized in set_prototypes; only normalize latents.
-    return torch.einsum(
-        "nld,ld->nl",
-        F.normalize(latent_features.float(), dim=-1),
-        prototypes[:num_labels].float(),
-    )
+    latents = latent_features if latent_features.dtype == torch.float32 else latent_features.float()
+    proto = prototypes[:num_labels]
+    if proto.dtype != torch.float32:
+        proto = proto.float()
+    return torch.einsum("nld,ld->nl", F.normalize(latents, dim=-1), proto)
 
 
 @torch.inference_mode()
