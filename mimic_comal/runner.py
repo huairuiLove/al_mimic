@@ -206,6 +206,16 @@ class ActiveLearningExperiment:
                 return_latents=False,
                 similarity_mode="full",
             )
+            # Kick off eval D2H before acquisition predict so PCIe overlaps the next GEMMs.
+            host_keys = ["indices", "labels", "probabilities"]
+            if not will_query:
+                host_keys.append("prototype_similarities")
+            validation_host = {
+                name: eval_tensors[name][:split].detach().to("cpu", non_blocking=True) for name in host_keys
+            }
+            test_host = {
+                name: eval_tensors[name][split:].detach().to("cpu", non_blocking=True) for name in host_keys
+            }
             if fuse_mode == "paper":
                 # Acquisition only needs own/background sims — skip the L×(L+1) GEMM.
                 acq_indices = np.concatenate([labeled_array, candidates])
@@ -246,15 +256,6 @@ class ActiveLearningExperiment:
                     eval_tensors["labels"][split:], eval_tensors["prototype_similarities"][split:]
                 )
             )
-            host_keys = ["indices", "labels", "probabilities"]
-            if not will_query:
-                host_keys.append("prototype_similarities")
-            validation_host = {
-                name: eval_tensors[name][:split].detach().to("cpu", non_blocking=True) for name in host_keys
-            }
-            test_host = {
-                name: eval_tensors[name][split:].detach().to("cpu", non_blocking=True) for name in host_keys
-            }
             if self.device.type == "cuda":
                 torch.cuda.current_stream(self.device).synchronize()
             validation_prediction = {name: value.numpy() for name, value in validation_host.items()}
