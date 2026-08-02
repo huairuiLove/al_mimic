@@ -37,6 +37,22 @@ def _write_json(path: Path, value: Any) -> None:
     path.write_text(json.dumps(value, indent=2, ensure_ascii=False, allow_nan=False) + "\n", encoding="utf-8")
 
 
+def _async_to_host(
+    tensor: torch.Tensor, copy_stream: torch.cuda.Stream | None
+) -> torch.Tensor:
+    """D2H into pinned memory; optional side stream enables compute overlap."""
+    if tensor.device.type != "cuda":
+        return tensor.detach().cpu()
+    host = torch.empty(tensor.shape, dtype=tensor.dtype, pin_memory=True)
+    if copy_stream is None:
+        host.copy_(tensor.detach(), non_blocking=True)
+        return host
+    copy_stream.wait_stream(torch.cuda.current_stream(tensor.device))
+    with torch.cuda.stream(copy_stream):
+        host.copy_(tensor.detach(), non_blocking=True)
+    return host
+
+
 def _summary(values: np.ndarray) -> dict[str, float]:
     return {
         "mean": float(values.mean()),
@@ -206,15 +222,16 @@ class ActiveLearningExperiment:
                 return_latents=False,
                 similarity_mode="full",
             )
-            # Kick off eval D2H before acquisition predict so PCIe overlaps the next GEMMs.
+            # Kick off pinned D2H on a side stream before acquisition predict.
             host_keys = ["indices", "labels", "probabilities"]
             if not will_query:
                 host_keys.append("prototype_similarities")
+            copy_stream = torch.cuda.Stream(device=self.device) if self.device.type == "cuda" else None
             validation_host = {
-                name: eval_tensors[name][:split].detach().to("cpu", non_blocking=True) for name in host_keys
+                name: _async_to_host(eval_tensors[name][:split], copy_stream) for name in host_keys
             }
             test_host = {
-                name: eval_tensors[name][split:].detach().to("cpu", non_blocking=True) for name in host_keys
+                name: _async_to_host(eval_tensors[name][split:], copy_stream) for name in host_keys
             }
             if fuse_mode == "paper":
                 # Acquisition only needs own/background sims — skip the L×(L+1) GEMM.
@@ -256,8 +273,8 @@ class ActiveLearningExperiment:
                     eval_tensors["labels"][split:], eval_tensors["prototype_similarities"][split:]
                 )
             )
-            if self.device.type == "cuda":
-                torch.cuda.current_stream(self.device).synchronize()
+            if copy_stream is not None:
+                copy_stream.synchronize()
             validation_prediction = {name: value.numpy() for name, value in validation_host.items()}
             test_prediction = {name: value.numpy() for name, value in test_host.items()}
             threshold = float(self.training_cfg.get("threshold", 0.5))
@@ -341,7 +358,7 @@ class ActiveLearningExperiment:
                         raise ValueError("acquisition.formula must be paper or weighted")
                     score_tensor = parts.combined.detach()
                     component_host = {
-                        name: getattr(parts, name).detach().to("cpu", non_blocking=True)
+                        name: _async_to_host(getattr(parts, name).detach(), copy_stream)
                         for name in component_names
                     }
                 else:
@@ -358,12 +375,14 @@ class ActiveLearningExperiment:
                         dim=-1,
                     )
                 host = {
-                    "indices": pool_tensors["indices"].detach().to("cpu", non_blocking=True),
-                    "labels": pool_tensors["labels"].detach().to("cpu", non_blocking=True),
-                    "probabilities": pool_tensors["probabilities"].detach().to("cpu", non_blocking=True),
-                    "prototype_similarities": compact_sims.detach().to("cpu", non_blocking=True),
+                    "indices": _async_to_host(pool_tensors["indices"], copy_stream),
+                    "labels": _async_to_host(pool_tensors["labels"], copy_stream),
+                    "probabilities": _async_to_host(pool_tensors["probabilities"], copy_stream),
+                    "prototype_similarities": _async_to_host(compact_sims, copy_stream),
                 }
-                if self.device.type == "cuda":
+                if copy_stream is not None:
+                    copy_stream.synchronize()
+                elif self.device.type == "cuda":
                     torch.cuda.current_stream(self.device).synchronize()
                 pool = {name: value.numpy() for name, value in host.items()}
                 if strategy == "comal":
