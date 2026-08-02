@@ -240,22 +240,37 @@ class ActiveLearningExperiment:
             test_host = {
                 name: _async_to_host(eval_tensors[name][split:], copy_stream) for name in host_keys
             }
+            cached_labeled_own = trained.labeled_own_similarity
+            cached_labeled_labels = trained.labeled_labels
             if fuse_mode == "paper":
-                # Acquisition only needs own/background sims — skip the L×(L+1) GEMM.
-                acq_indices = np.concatenate([labeled_array, candidates])
-                acq = predict_tensors(
-                    trained,
-                    self.features,
-                    self.labels,
-                    acq_indices,
-                    self.config,
-                    self.device,
-                    return_latents=False,
-                    similarity_mode="own_bg",
-                )
-                labeled_count = int(labeled_array.size)
-                labeled_tensors = {name: value[:labeled_count] for name, value in acq.items()}
-                pool_tensors = {name: value[labeled_count:] for name, value in acq.items()}
+                # Labeled own-sims were cached at the end of train_round; scan candidates only.
+                if cached_labeled_labels is not None and cached_labeled_own is not None:
+                    pool_tensors = predict_tensors(
+                        trained,
+                        self.features,
+                        self.labels,
+                        candidates,
+                        self.config,
+                        self.device,
+                        return_latents=False,
+                        similarity_mode="own_bg",
+                    )
+                else:
+                    # CPU / non-resident fallback: encode labeled+candidates together.
+                    acq_indices = np.concatenate([labeled_array, candidates])
+                    acq = predict_tensors(
+                        trained,
+                        self.features,
+                        self.labels,
+                        acq_indices,
+                        self.config,
+                        self.device,
+                        return_latents=False,
+                        similarity_mode="own_bg",
+                    )
+                    labeled_count = int(labeled_array.size)
+                    labeled_tensors = {name: value[:labeled_count] for name, value in acq.items()}
+                    pool_tensors = {name: value[labeled_count:] for name, value in acq.items()}
             elif fuse_mode in {"weighted", "random"}:
                 pool_tensors = predict_tensors(
                     trained,
@@ -306,22 +321,37 @@ class ActiveLearningExperiment:
                     components = {"combined": scores}
                 elif strategy == "comal":
                     if formula == "paper":
-                        assert labeled_tensors is not None
-                        expected_cardinality = labeled_tensors["labels"].sum(dim=1).mean()
                         prototypes = trained.comal.prototypes.detach()
-                        labeled_sims = labeled_tensors["prototype_similarities"]
                         pool_sims = pool_tensors["prototype_similarities"]
-                        if labeled_sims.shape[-1] == 2:
-                            labeled_own = labeled_sims[..., 0]
-                            pool_own = pool_sims[..., 0]
+                        pool_own = (
+                            pool_sims[..., 0]
+                            if pool_sims.shape[-1] == 2
+                            else pool_sims[
+                                :,
+                                torch.arange(pool_sims.shape[1], device=self.device),
+                                torch.arange(pool_sims.shape[1], device=self.device),
+                            ]
+                        )
+                        if cached_labeled_labels is not None and cached_labeled_own is not None:
+                            labeled_labels_t = cached_labeled_labels
+                            labeled_own = cached_labeled_own
                         else:
-                            num_labels = int(labeled_tensors["labels"].shape[1])
-                            label_index = torch.arange(num_labels, device=self.device)
-                            labeled_own = labeled_sims[:, label_index, label_index]
-                            pool_own = pool_sims[:, label_index, label_index]
+                            assert labeled_tensors is not None
+                            labeled_labels_t = labeled_tensors["labels"]
+                            labeled_sims = labeled_tensors["prototype_similarities"]
+                            labeled_own = (
+                                labeled_sims[..., 0]
+                                if labeled_sims.shape[-1] == 2
+                                else labeled_sims[
+                                    :,
+                                    torch.arange(labeled_sims.shape[1], device=self.device),
+                                    torch.arange(labeled_sims.shape[1], device=self.device),
+                                ]
+                            )
+                        expected_cardinality = labeled_labels_t.sum(dim=1).mean()
                         thresholds = positive_similarity_thresholds(
                             None,
-                            labeled_tensors["labels"],
+                            labeled_labels_t,
                             prototypes,
                             own_similarity=labeled_own,
                         )

@@ -195,6 +195,9 @@ class TrainedRound:
     comal: CoMALModule
     history: dict[str, list[float]]
     timings: dict[str, float]
+    # Optional resident labeled-pool caches for paper acquisition (avoids a re-encode).
+    labeled_labels: torch.Tensor | None = None
+    labeled_own_similarity: torch.Tensor | None = None
 
 
 def build_modules(
@@ -443,13 +446,34 @@ def train_round(
             comal_epoch_losses.append(epoch_loss / max(steps, 1))
         # Reuse frozen classifier features instead of re-encoding the labeled pool.
         prototypes_from_cache = True
+        eval_batch = int(training.get("eval_batch_size", 1024))
         _refresh_prototypes_from_cached(
             comal,
             cached_features,
             cached_labels,
-            int(training.get("eval_batch_size", 1024)),
+            eval_batch,
+        )
+        # Cache labeled own-sims for paper acquisition so the next scan is candidates-only.
+        labeled_own_parts: list[torch.Tensor] = []
+        comal.eval()
+        with torch.inference_mode():
+            for start in range(0, max(int(cached_features.shape[0]), 1), eval_batch):
+                if cached_features.shape[0] == 0:
+                    break
+                stop = min(start + eval_batch, int(cached_features.shape[0]))
+                sims = comal(
+                    cached_features[start:stop],
+                    compute_reconstruction=False,
+                    compute_similarities="own_bg",
+                )["prototype_similarities"]
+                labeled_own_parts.append(sims[..., 0])
+        labeled_labels_cache = cached_labels
+        labeled_own_cache = (
+            torch.cat(labeled_own_parts, dim=0) if labeled_own_parts else cached_features.new_zeros((0, 0))
         )
     else:
+        labeled_labels_cache = None
+        labeled_own_cache = None
         comal_loader = build_loader(
             features,
             labels,
@@ -509,7 +533,14 @@ def train_round(
             )
         else:
             refresh_prototypes(classifier, comal, features, labels, indices, config, device)
-    return TrainedRound(classifier, comal, history, timings)
+    return TrainedRound(
+        classifier,
+        comal,
+        history,
+        timings,
+        labeled_labels=labeled_labels_cache,
+        labeled_own_similarity=labeled_own_cache,
+    )
 
 
 @torch.inference_mode()
