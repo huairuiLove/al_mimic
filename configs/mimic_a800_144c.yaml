@@ -40,6 +40,8 @@ training:
   # Contrastive cost grows with (batch * labels)^2; chunked anchors keep this safe on 80GB.
   # Contiguous shuffle+slice + full GEMM when (B*L)^2 fits; 192 is a sweet spot on A800-80GB.
   comal_batch_size: 192
+  # Amortize clip_grad_norm_ syncs across the many small CoMAL steps.
+  gradient_clip_interval: 4
   # Resident tensors remove DataLoader from the hot path; workers would only steal the 18-core quota.
   num_workers: 0
   persistent_workers: false
