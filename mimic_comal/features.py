@@ -21,8 +21,15 @@ def _fingerprint(records: list[MIMICRecord], cfg: dict[str, Any]) -> str:
     # Keep sha256 so existing feature caches remain valid across adapter upgrades.
     digest = hashlib.sha256()
     update = digest.update
-    for record in records:
-        update(f"{record.row_index}:{record.hadm_id}:{record.split}\n".encode())
+    # Batch the membership string to cut Python call overhead on 50k+ records.
+    chunk: list[str] = []
+    for index, record in enumerate(records):
+        chunk.append(f"{record.row_index}:{record.hadm_id}:{record.split}\n")
+        if (index & 1023) == 1023:
+            update("".join(chunk).encode())
+            chunk.clear()
+    if chunk:
+        update("".join(chunk).encode())
     update(json.dumps(cfg, sort_keys=True).encode())
     return digest.hexdigest()
 
@@ -100,6 +107,11 @@ def _bert_features(records: list[MIMICRecord], cfg: dict[str, Any]) -> tuple[np.
     device = torch.device(str(cfg.get("device", "cuda" if torch.cuda.is_available() else "cpu")))
     model.to(device).eval()
     model.requires_grad_(False)
+    if device.type == "cuda" and bool(cfg.get("torch_compile", False)) and hasattr(torch, "compile"):
+        try:
+            model = torch.compile(model, mode="reduce-overhead", dynamic=True)  # type: ignore[assignment]
+        except Exception:
+            pass
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
         # Prefer cudnn SDPA / flash paths for encoder self-attention.
@@ -117,7 +129,8 @@ def _bert_features(records: list[MIMICRecord], cfg: dict[str, Any]) -> tuple[np.
     use_autocast = precision != "fp32" and device.type == "cuda"
 
     # Prefer the fast tokenizer backend and keep a deep CPU tokenize queue.
-    tokenize_workers = max(1, min(2, effective_cpu_count() // 4 or 1))
+    # 18-core quota: 4 tokenizers leave headroom for gzip/Python while GPU encodes.
+    tokenize_workers = max(1, min(4, max(2, effective_cpu_count() // 4)))
 
     def tokenize(start: int) -> dict[str, torch.Tensor]:
         texts = [record.text for record in records[start : start + batch_size]]
@@ -134,6 +147,19 @@ def _bert_features(records: list[MIMICRecord], cfg: dict[str, Any]) -> tuple[np.
     feature_dim = int(getattr(model.config, "hidden_size", 768))
     host_features = np.empty((len(records), feature_dim), dtype=np.float16)
     copy_stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
+    # Double-buffer pinned host slots so D2H of batch N overlaps encode of batch N+1.
+    pin = device.type == "cuda"
+    host_slots = [
+        torch.empty((batch_size, feature_dim), dtype=torch.float16, pin_memory=pin),
+        torch.empty((batch_size, feature_dim), dtype=torch.float16, pin_memory=pin),
+    ]
+    # (slot, start, width, gpu_tensor_keepalive)
+    pending_copy: tuple[int, int, int, torch.Tensor] | None = None
+
+    def _flush_copy(slot: int, row_start: int, width: int, _keepalive: torch.Tensor) -> None:
+        if copy_stream is not None:
+            copy_stream.synchronize()
+        host_features[row_start : row_start + width] = host_slots[slot][:width].numpy()
 
     with ThreadPoolExecutor(max_workers=tokenize_workers) as pool:
         pending = [pool.submit(tokenize, start) for start in starts[:tokenize_workers]]
@@ -154,15 +180,26 @@ def _bert_features(records: list[MIMICRecord], cfg: dict[str, Any]) -> tuple[np.
                 if hidden is None:
                     hidden = output.last_hidden_state[:, 0]
                 hidden = F.normalize(hidden.float(), dim=1)
-            host = torch.empty((hidden.shape[0], feature_dim), dtype=torch.float16, pin_memory=device.type == "cuda")
-            if copy_stream is not None:
-                with torch.cuda.stream(copy_stream):
-                    host.copy_(hidden.to(dtype=torch.float16), non_blocking=True)
-                copy_stream.synchronize()
-            else:
-                host.copy_(hidden.to(dtype=torch.float16))
             stop = min(start + batch_size, len(records))
-            host_features[start:stop] = host[: stop - start].numpy()
+            width = stop - start
+            slot = offset & 1
+            # Wait only for the previous copy into this same slot (N-2), not the latest D2H.
+            if pending_copy is not None and pending_copy[0] == slot:
+                _flush_copy(*pending_copy)
+                pending_copy = None
+            host = host_slots[slot][:width]
+            if copy_stream is not None:
+                compute_stream = torch.cuda.current_stream(device)
+                copy_stream.wait_stream(compute_stream)
+                gpu_fp16 = hidden[:width].to(dtype=torch.float16)
+                with torch.cuda.stream(copy_stream):
+                    host.copy_(gpu_fp16, non_blocking=True)
+                pending_copy = (slot, start, width, gpu_fp16)
+            else:
+                host.copy_(hidden[:width].to(dtype=torch.float16))
+                host_features[start:stop] = host.numpy()
+        if pending_copy is not None:
+            _flush_copy(*pending_copy)
     return host_features, {
         "encoder": "bert",
         "dimension": feature_dim,

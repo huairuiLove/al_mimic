@@ -16,7 +16,8 @@ features:
   local_files_only: true
   max_length: 256
   # Inference-only BF16 encode on 80GB; raise in steps of 32 if util is still low.
-  batch_size: 480
+  # Double-buffered D2H overlaps copy with the next encode; 512 keeps A800 saturated.
+  batch_size: 512
   precision: bf16
   device: cuda
   svd_n_iter: 7
@@ -34,9 +35,11 @@ training:
   torch_compile: false
   # Keep the whole 51k embedding table on GPU (~150 MiB at 768-d) and index in-place.
   batch_size: 16384
-  eval_batch_size: 32768
+  # Cover the full ~51k table in one resident predict when memory allows.
+  eval_batch_size: 65536
   # Contrastive cost grows with (batch * labels)^2; chunked anchors keep this safe on 80GB.
-  comal_batch_size: 160
+  # Contiguous shuffle+slice + full GEMM when (B*L)^2 fits; 192 is a sweet spot on A800-80GB.
+  comal_batch_size: 192
   # Resident tensors remove DataLoader from the hot path; workers would only steal the 18-core quota.
   num_workers: 0
   persistent_workers: false

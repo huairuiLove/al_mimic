@@ -9,12 +9,18 @@ from sklearn.metrics import average_precision_score, f1_score, precision_score, 
 
 
 def _safe_macro_auprc(labels: np.ndarray, probabilities: np.ndarray) -> tuple[float, list[float | None]]:
-    values: list[float | None] = []
-    for column in range(labels.shape[1]):
-        if np.unique(labels[:, column]).size < 2:
-            values.append(None)
-        else:
-            values.append(float(average_precision_score(labels[:, column], probabilities[:, column])))
+    # One sklearn call with average=None; mark single-class labels as missing.
+    usable = labels.max(axis=0) != labels.min(axis=0)
+    values: list[float | None] = [None] * int(labels.shape[1])
+    if not np.any(usable):
+        return 0.0, values
+    scores = average_precision_score(labels[:, usable], probabilities[:, usable], average=None)
+    scores = np.atleast_1d(np.asarray(scores, dtype=np.float64))
+    cursor = 0
+    for column, keep in enumerate(usable):
+        if keep:
+            values[column] = float(scores[cursor])
+            cursor += 1
     valid = [value for value in values if value is not None]
     return (float(np.mean(valid)) if valid else 0.0), values
 
@@ -22,8 +28,9 @@ def _safe_macro_auprc(labels: np.ndarray, probabilities: np.ndarray) -> tuple[fl
 def multilabel_metrics(
     labels: np.ndarray, probabilities: np.ndarray, threshold: float = 0.5
 ) -> dict[str, Any]:
-    labels = np.asarray(labels, dtype=np.int64)
-    probabilities = np.asarray(probabilities, dtype=np.float64)
+    labels = np.asarray(labels, dtype=np.int8)
+    # float32 is enough for ranking metrics and cuts sklearn bandwidth.
+    probabilities = np.asarray(probabilities, dtype=np.float32)
     predictions = probabilities >= threshold
     macro_auprc, per_label = _safe_macro_auprc(labels, probabilities)
     metrics: dict[str, Any] = {

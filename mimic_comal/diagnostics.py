@@ -31,7 +31,7 @@ def expected_calibration_error(labels: np.ndarray, probabilities: np.ndarray, bi
 def build_round_diagnostics(
     labels: np.ndarray,
     probabilities: np.ndarray,
-    latents: np.ndarray,
+    latents: np.ndarray | torch.Tensor | None,
     prototypes: torch.Tensor,
     label_names: tuple[str, ...],
     *,
@@ -61,6 +61,8 @@ def build_round_diagnostics(
         positive_similarity = None
         background_similarity = None
     if positive_similarity is None or background_similarity is None:
+        if latents is None:
+            raise ValueError("latents are required when prototype_similarities are unavailable")
         if isinstance(latents, torch.Tensor):
             latent = F.normalize(latents.detach().float(), dim=-1)
             proto = F.normalize(prototypes.detach().to(device=latent.device).float(), dim=-1)

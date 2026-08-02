@@ -22,12 +22,16 @@ from .model import CoMALModule, TextMLPClassifier, supervised_contrastive_loss
 def label_matrix(records: list[MIMICRecord], label_names: tuple[str, ...]) -> np.ndarray:
     positions = {label: index for index, label in enumerate(label_names)}
     values = np.zeros((len(records), len(label_names)), dtype=np.float32)
+    rows: list[int] = []
+    cols: list[int] = []
     for row, record in enumerate(records):
-        if not record.labels:
-            continue
-        columns = [positions[label] for label in record.labels if label in positions]
-        if columns:
-            values[row, columns] = 1.0
+        for label in record.labels:
+            column = positions.get(label)
+            if column is not None:
+                rows.append(row)
+                cols.append(column)
+    if rows:
+        values[np.asarray(rows, dtype=np.int64), np.asarray(cols, dtype=np.int64)] = 1.0
     return values
 
 
@@ -117,6 +121,26 @@ def _index_batches(
         yield order[start : start + batch_size]
 
 
+def _shuffled_slices(
+    features: torch.Tensor,
+    labels: torch.Tensor,
+    batch_size: int,
+) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
+    """Permute once, then emit contiguous row slices (faster than scattered index_select)."""
+    count = int(features.shape[0])
+    if count == 0:
+        return
+    if batch_size >= count:
+        yield features, labels
+        return
+    perm = torch.randperm(count, device=features.device)
+    ordered_x = features[perm]
+    ordered_y = labels[perm]
+    for start in range(0, count, batch_size):
+        stop = min(start + batch_size, count)
+        yield ordered_x[start:stop], ordered_y[start:stop]
+
+
 def _autocast(device: torch.device, precision: str):
     if device.type != "cuda" or precision == "fp32":
         return nullcontext()
@@ -141,13 +165,17 @@ def _pos_weight(labels: np.ndarray | torch.Tensor, indices: np.ndarray | torch.T
 def _maybe_compile(module: nn.Module, enabled: bool) -> nn.Module:
     if not enabled or not hasattr(torch, "compile"):
         return module
-    try:
-        return torch.compile(module, mode="max-autotune-no-cudagraphs")  # type: ignore[return-value]
-    except Exception:
+    # Prefer dynamic shapes: AL labeled/candidate widths change every round.
+    for kwargs in (
+        {"mode": "max-autotune-no-cudagraphs", "dynamic": True},
+        {"mode": "default", "dynamic": True},
+        {"mode": "reduce-overhead"},
+    ):
         try:
-            return torch.compile(module, mode="reduce-overhead")  # type: ignore[return-value]
+            return torch.compile(module, **kwargs)  # type: ignore[return-value]
         except Exception:
-            return module
+            continue
+    return module
 
 
 @dataclass
@@ -186,11 +214,22 @@ def build_modules(
 def _cache_classifier_features(
     classifier: TextMLPClassifier,
     feature_tensor: torch.Tensor,
-    index_tensor: torch.Tensor,
+    index_tensor: torch.Tensor | None,
     eval_batch_size: int,
 ) -> torch.Tensor:
     """Frozen-classifier features for the labeled pool; avoids re-encoding each CoMAL step."""
     classifier.eval()
+    if index_tensor is None:
+        count = int(feature_tensor.shape[0])
+        if count == 0:
+            return feature_tensor.new_zeros((0, classifier.feature_dim))
+        if count <= eval_batch_size:
+            return classifier(feature_tensor)["features"]
+        out = feature_tensor.new_empty((count, classifier.feature_dim))
+        for start in range(0, count, eval_batch_size):
+            stop = min(start + eval_batch_size, count)
+            out[start:stop] = classifier(feature_tensor[start:stop])["features"]
+        return out
     count = int(index_tensor.numel())
     if count == 0:
         return feature_tensor.new_zeros((0, classifier.feature_dim))
@@ -215,13 +254,21 @@ def train_round(
     previous: TrainedRound | None = None,
 ) -> TrainedRound:
     training = config.get("training", {})
-    indices = np.asarray(sorted(set(int(value) for value in labeled_indices)), dtype=np.int64)
+    indices = np.unique(np.asarray(list(labeled_indices), dtype=np.int64))
     if not indices.size:
         raise ValueError("at least one labeled sample is required")
-    classifier, comal = build_modules(features.shape[1], labels.shape[1], config, device)
-    if previous is not None and bool(training.get("inherit_across_rounds", False)):
-        classifier.load_state_dict(previous.classifier.state_dict())
-        comal.load_state_dict(previous.comal.state_dict())
+    inherit = previous is not None and bool(training.get("inherit_across_rounds", False))
+    if inherit:
+        # Reuse live modules: avoids rebuild + state_dict clone on every AL round.
+        assert previous is not None
+        classifier = previous.classifier
+        comal = previous.comal
+        for parameter in classifier.parameters():
+            parameter.requires_grad_(True)
+        for parameter in comal.parameters():
+            parameter.requires_grad_(True)
+    else:
+        classifier, comal = build_modules(features.shape[1], labels.shape[1], config, device)
     precision = str(training.get("precision", "bf16" if device.type == "cuda" else "fp32")).lower()
     if precision not in {"bf16", "fp16", "fp32"}:
         raise ValueError("training.precision must be bf16, fp16, or fp32")
@@ -266,36 +313,25 @@ def train_round(
     grad_clip = float(training.get("gradient_clip", 5.0))
     start = time.perf_counter()
     classifier.train()
+    classifier_epoch_losses: list[torch.Tensor] = []
     if resident:
         assert labeled_features is not None and labeled_targets is not None
-        local_indices = torch.arange(labeled_features.shape[0], device=device, dtype=torch.long)
-        full_batch = batch_size >= int(labeled_features.shape[0])
         for _ in range(int(training.get("epochs", 20))):
-            if full_batch:
+            epoch_loss = labeled_features.new_zeros(())
+            steps = 0
+            for inputs, targets in _shuffled_slices(labeled_features, labeled_targets, batch_size):
                 optimizer.zero_grad(set_to_none=True)
                 with _autocast(device, precision):
-                    output = classifier(labeled_features)
-                    loss = criterion(output["logits"], labeled_targets)
+                    output = classifier(inputs)
+                    loss = criterion(output["logits"], targets)
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(classifier.parameters(), grad_clip)
-                optimizer.step()
-                history["classifier_loss"].append(float(loss.detach().item()))
-            else:
-                epoch_loss = labeled_features.new_zeros(())
-                steps = 0
-                for batch_index in _index_batches(local_indices, batch_size, shuffle=True):
-                    inputs = labeled_features.index_select(0, batch_index)
-                    targets = labeled_targets.index_select(0, batch_index)
-                    optimizer.zero_grad(set_to_none=True)
-                    with _autocast(device, precision):
-                        output = classifier(inputs)
-                        loss = criterion(output["logits"], targets)
-                    loss.backward()
+                if grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(classifier.parameters(), grad_clip)
-                    optimizer.step()
-                    epoch_loss = epoch_loss + loss.detach()
-                    steps += 1
-                history["classifier_loss"].append(float(epoch_loss.item() / max(steps, 1)))
+                optimizer.step()
+                epoch_loss = epoch_loss + loss.detach()
+                steps += 1
+            # Defer .item() sync until after the phase barrier.
+            classifier_epoch_losses.append(epoch_loss / max(steps, 1))
     else:
         classifier_loader = build_loader(
             features,
@@ -315,13 +351,16 @@ def train_round(
                     output = classifier(inputs)
                     loss = criterion(output["logits"], targets)
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(classifier.parameters(), grad_clip)
+                if grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(classifier.parameters(), grad_clip)
                 optimizer.step()
-                losses.append(float(loss.detach().cpu()))
-            history["classifier_loss"].append(float(np.mean(losses)))
+                losses.append(loss.detach())
+            classifier_epoch_losses.append(torch.stack(losses).mean() if losses else torch.zeros(()))
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     timings["classifier_training_sec"] = time.perf_counter() - start
+    if classifier_epoch_losses:
+        history["classifier_loss"] = torch.stack(classifier_epoch_losses).detach().cpu().tolist()
 
     # The original implementation freezes the classifier before training CoMAL.
     classifier.eval()
@@ -344,23 +383,26 @@ def train_round(
     comal_batch_size = int(training.get("comal_batch_size", 32))
     start = time.perf_counter()
     comal.train()
+    prototypes_from_cache = False
     if resident:
         assert labeled_features is not None and labeled_targets is not None
         # Classifier is frozen: encode labeled pool once, then train CoMAL on cached fused features.
         cached_features = _cache_classifier_features(
             classifier,
             labeled_features,
-            torch.arange(labeled_features.shape[0], device=device, dtype=torch.long),
+            None,
             int(training.get("eval_batch_size", 1024)),
         )
         cached_labels = labeled_targets
-        local_indices = torch.arange(cached_features.shape[0], device=device, dtype=torch.long)
+        recon_w = float(comal_cfg.get("reconstruction_weight", 0.2))
+        clf_w = float(comal_cfg.get("classification_weight", 0.5))
+        temperature = float(comal_cfg.get("temperature", 0.07))
+        anchor_chunk = int(comal_cfg.get("anchor_chunk_size", 1024))
+        comal_epoch_losses: list[torch.Tensor] = []
         for _ in range(int(training.get("comal_epochs", 10))):
             epoch_loss = cached_features.new_zeros(())
             steps = 0
-            for batch_index in _index_batches(local_indices, comal_batch_size, shuffle=True):
-                fused = cached_features.index_select(0, batch_index)
-                targets = cached_labels.index_select(0, batch_index)
+            for fused, targets in _shuffled_slices(cached_features, cached_labels, comal_batch_size):
                 optimizer_comal.zero_grad(set_to_none=True)
                 with _autocast(device, precision):
                     # Skip similarity matmul in the train loss path only; eval always computes it.
@@ -368,22 +410,27 @@ def train_round(
                     contrastive = supervised_contrastive_loss(
                         output["latent_features"],
                         targets,
-                        temperature=float(comal_cfg.get("temperature", 0.07)),
-                        anchor_chunk_size=int(comal_cfg.get("anchor_chunk_size", 1024)),
+                        temperature=temperature,
+                        anchor_chunk_size=anchor_chunk,
                     )
                     reconstruction = F.mse_loss(output["reconstructed_features"], fused)
                     reconstruction_bce = criterion(output["reconstructed_logits"], targets)
-                    loss = (
-                        contrastive
-                        + float(comal_cfg.get("reconstruction_weight", 0.2)) * reconstruction
-                        + float(comal_cfg.get("classification_weight", 0.5)) * reconstruction_bce
-                    )
+                    loss = contrastive + recon_w * reconstruction + clf_w * reconstruction_bce
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(comal.parameters(), grad_clip)
+                if grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(comal.parameters(), grad_clip)
                 optimizer_comal.step()
                 epoch_loss = epoch_loss + loss.detach()
                 steps += 1
-            history["comal_loss"].append(float(epoch_loss.item() / max(steps, 1)))
+            comal_epoch_losses.append(epoch_loss / max(steps, 1))
+        # Reuse frozen classifier features instead of re-encoding the labeled pool.
+        prototypes_from_cache = True
+        _refresh_prototypes_from_cached(
+            comal,
+            cached_features,
+            cached_labels,
+            int(training.get("eval_batch_size", 1024)),
+        )
     else:
         comal_loader = build_loader(
             features,
@@ -393,6 +440,11 @@ def train_round(
             shuffle=True,
             training=training,
         )
+        comal_epoch_losses = []
+        recon_w = float(comal_cfg.get("reconstruction_weight", 0.2))
+        clf_w = float(comal_cfg.get("classification_weight", 0.5))
+        temperature = float(comal_cfg.get("temperature", 0.07))
+        anchor_chunk = int(comal_cfg.get("anchor_chunk_size", 1024))
         for _ in range(int(training.get("comal_epochs", 10))):
             losses = []
             for batch in comal_loader:
@@ -407,37 +459,67 @@ def train_round(
                     contrastive = supervised_contrastive_loss(
                         output["latent_features"],
                         targets,
-                        temperature=float(comal_cfg.get("temperature", 0.07)),
-                        anchor_chunk_size=int(comal_cfg.get("anchor_chunk_size", 1024)),
+                        temperature=temperature,
+                        anchor_chunk_size=anchor_chunk,
                     )
                     reconstruction = F.mse_loss(output["reconstructed_features"], fused)
                     reconstruction_bce = criterion(output["reconstructed_logits"], targets)
-                    loss = (
-                        contrastive
-                        + float(comal_cfg.get("reconstruction_weight", 0.2)) * reconstruction
-                        + float(comal_cfg.get("classification_weight", 0.5)) * reconstruction_bce
-                    )
+                    loss = contrastive + recon_w * reconstruction + clf_w * reconstruction_bce
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(comal.parameters(), grad_clip)
+                if grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(comal.parameters(), grad_clip)
                 optimizer_comal.step()
-                losses.append(float(loss.detach().cpu()))
-            history["comal_loss"].append(float(np.mean(losses)))
+                losses.append(loss.detach())
+            comal_epoch_losses.append(torch.stack(losses).mean() if losses else torch.zeros(()))
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     timings["comal_training_sec"] = time.perf_counter() - start
-    if resident:
-        assert feature_tensor is not None and label_tensor is not None
-        _refresh_prototypes_tensors(
-            classifier,
-            comal,
-            feature_tensor,
-            label_tensor,
-            index_tensor if index_tensor is not None else torch.as_tensor(indices, device=device, dtype=torch.long),
-            int(training.get("eval_batch_size", 1024)),
-        )
-    else:
-        refresh_prototypes(classifier, comal, features, labels, indices, config, device)
+    if comal_epoch_losses:
+        history["comal_loss"] = torch.stack(comal_epoch_losses).detach().cpu().tolist()
+    if not prototypes_from_cache:
+        if resident:
+            assert feature_tensor is not None and label_tensor is not None
+            _refresh_prototypes_tensors(
+                classifier,
+                comal,
+                feature_tensor,
+                label_tensor,
+                index_tensor if index_tensor is not None else torch.as_tensor(indices, device=device, dtype=torch.long),
+                int(training.get("eval_batch_size", 1024)),
+            )
+        else:
+            refresh_prototypes(classifier, comal, features, labels, indices, config, device)
     return TrainedRound(classifier, comal, history, timings)
+
+
+@torch.inference_mode()
+def _refresh_prototypes_from_cached(
+    comal: CoMALModule,
+    cached_features: torch.Tensor,
+    cached_labels: torch.Tensor,
+    eval_batch_size: int,
+) -> None:
+    """Refresh prototypes from frozen classifier features (no classifier re-encode)."""
+    sums = torch.zeros_like(comal.prototypes, dtype=torch.float32, device=cached_features.device)
+    counts = torch.zeros_like(comal.prototype_counts, dtype=torch.float32, device=cached_features.device)
+    comal.eval()
+    count = int(cached_features.shape[0])
+    for start in range(0, max(count, 1), eval_batch_size):
+        if count == 0:
+            break
+        stop = min(start + eval_batch_size, count)
+        fused = cached_features[start:stop]
+        targets = cached_labels[start:stop]
+        # Prototype refresh only needs latents; skip similarity GEMM.
+        latent = F.normalize(
+            comal(fused, compute_similarities=False)["latent_features"].float(), dim=-1
+        )
+        negative = 1.0 - targets
+        sums[:-1] += torch.einsum("bl,bld->ld", targets, latent)
+        counts[:-1] += targets.sum(dim=0)
+        sums[-1] += torch.einsum("bl,bld->d", negative, latent)
+        counts[-1] += negative.sum()
+    comal.set_prototypes(sums, counts)
 
 
 @torch.inference_mode()
@@ -453,14 +535,23 @@ def _refresh_prototypes_tensors(
     counts = torch.zeros_like(comal.prototype_counts, dtype=torch.float32, device=feature_tensor.device)
     classifier.eval()
     comal.eval()
-    for batch_index in _index_batches(index_tensor, eval_batch_size, shuffle=False):
-        inputs = feature_tensor.index_select(0, batch_index)
-        targets = label_tensor.index_select(0, batch_index)
-        latent = F.normalize(comal(classifier(inputs)["features"])["latent_features"].float(), dim=-1)
+    selected_features = feature_tensor.index_select(0, index_tensor)
+    selected_labels = label_tensor.index_select(0, index_tensor)
+    count = int(selected_features.shape[0])
+    for start in range(0, max(count, 1), eval_batch_size):
+        if count == 0:
+            break
+        stop = min(start + eval_batch_size, count)
+        inputs = selected_features[start:stop]
+        targets = selected_labels[start:stop]
+        fused = classifier(inputs)["features"]
+        latent = F.normalize(
+            comal(fused, compute_similarities=False)["latent_features"].float(), dim=-1
+        )
+        negative = 1.0 - targets
         sums[:-1] += torch.einsum("bl,bld->ld", targets, latent)
         counts[:-1] += targets.sum(dim=0)
-        negative = 1.0 - targets
-        sums[-1] += (latent * negative[..., None]).sum(dim=(0, 1))
+        sums[-1] += torch.einsum("bl,bld->d", negative, latent)
         counts[-1] += negative.sum()
     comal.set_prototypes(sums, counts)
 
@@ -502,11 +593,14 @@ def refresh_prototypes(
     for batch in loader:
         inputs = batch["features"].to(device, non_blocking=True)
         targets = batch["labels"].to(device, non_blocking=True)
-        latent = F.normalize(comal(classifier(inputs)["features"])["latent_features"].float(), dim=-1)
+        fused = classifier(inputs)["features"]
+        latent = F.normalize(
+            comal(fused, compute_similarities=False)["latent_features"].float(), dim=-1
+        )
+        negative = 1.0 - targets
         sums[:-1] += torch.einsum("bl,bld->ld", targets, latent)
         counts[:-1] += targets.sum(dim=0)
-        negative = 1.0 - targets
-        sums[-1] += (latent * negative[..., None]).sum(dim=(0, 1))
+        sums[-1] += torch.einsum("bl,bld->d", negative, latent)
         counts[-1] += negative.sum()
     comal.set_prototypes(sums, counts)
 
@@ -519,10 +613,12 @@ def predict_tensors(
     indices: Iterable[int],
     config: dict[str, Any],
     device: torch.device,
+    *,
+    return_latents: bool = True,
 ) -> dict[str, torch.Tensor]:
     """GPU-resident prediction path used by acquisition and evaluation."""
     training = config.get("training", {})
-    index_array = np.asarray(list(indices), dtype=np.int64)
+    index_array = np.asarray(indices, dtype=np.int64)
     trained.classifier.eval()
     trained.comal.eval()
     num_labels = int(labels.shape[1])
@@ -533,32 +629,44 @@ def predict_tensors(
         label_tensor = _to_device_matrix(labels, device)
         index_tensor = torch.as_tensor(index_array, device=device, dtype=torch.long)
         count = int(index_tensor.numel())
-        out_indices = torch.empty(count, dtype=torch.long, device=device)
-        out_labels = torch.empty(count, num_labels, dtype=label_tensor.dtype, device=device)
+        # One gather makes subsequent batching contiguous (far cheaper than scattered selects).
+        selected_features = feature_tensor.index_select(0, index_tensor)
+        selected_labels = label_tensor.index_select(0, index_tensor)
         out_probs = torch.empty(count, num_labels, dtype=torch.float32, device=device)
-        out_latents = torch.empty(count, num_labels, prototype_dim, dtype=torch.float32, device=device)
+        out_latents = (
+            torch.empty(count, num_labels, prototype_dim, dtype=torch.float32, device=device)
+            if return_latents
+            else None
+        )
         out_similarities = torch.empty(
             count, num_labels, num_labels + 1, dtype=torch.float32, device=device
         )
-        cursor = 0
-        for batch_index in _index_batches(index_tensor, eval_batch, shuffle=False):
-            width = int(batch_index.numel())
-            inputs = feature_tensor.index_select(0, batch_index)
-            output = trained.classifier(inputs)
+
+        def _write(start: int, stop: int, output: dict[str, torch.Tensor], comal_output: dict[str, torch.Tensor]) -> None:
+            out_probs[start:stop] = torch.sigmoid(output["logits"])
+            out_similarities[start:stop] = comal_output["prototype_similarities"].float()
+            if out_latents is not None:
+                out_latents[start:stop] = comal_output["latent_features"].float()
+
+        if count <= eval_batch:
+            output = trained.classifier(selected_features)
             comal_output = trained.comal(output["features"])
-            out_indices[cursor : cursor + width] = batch_index
-            out_labels[cursor : cursor + width] = label_tensor.index_select(0, batch_index)
-            out_probs[cursor : cursor + width] = torch.sigmoid(output["logits"])
-            out_latents[cursor : cursor + width] = comal_output["latent_features"].float()
-            out_similarities[cursor : cursor + width] = comal_output["prototype_similarities"].float()
-            cursor += width
-        return {
-            "indices": out_indices,
-            "labels": out_labels,
+            _write(0, count, output, comal_output)
+        else:
+            for start in range(0, count, eval_batch):
+                stop = min(start + eval_batch, count)
+                output = trained.classifier(selected_features[start:stop])
+                comal_output = trained.comal(output["features"])
+                _write(start, stop, output, comal_output)
+        result = {
+            "indices": index_tensor,
+            "labels": selected_labels,
             "probabilities": out_probs,
-            "latents": out_latents,
             "prototype_similarities": out_similarities,
         }
+        if out_latents is not None:
+            result["latents"] = out_latents
+        return result
     loader = build_loader(
         features,
         labels,
@@ -579,19 +687,24 @@ def predict_tensors(
         index_parts.append(batch["index"].to(device))
         label_parts.append(batch["labels"].to(device))
         prob_parts.append(torch.sigmoid(output["logits"]))
-        latent_parts.append(comal_output["latent_features"].float())
+        if return_latents:
+            latent_parts.append(comal_output["latent_features"].float())
         similarity_parts.append(comal_output["prototype_similarities"].float())
-    return {
+    result = {
         "indices": torch.cat(index_parts) if index_parts else torch.empty(0, dtype=torch.long, device=device),
         "labels": torch.cat(label_parts) if label_parts else torch.empty(0, num_labels, device=device),
         "probabilities": torch.cat(prob_parts) if prob_parts else torch.empty(0, num_labels, device=device),
-        "latents": torch.cat(latent_parts)
-        if latent_parts
-        else torch.empty(0, num_labels, prototype_dim, device=device),
         "prototype_similarities": torch.cat(similarity_parts)
         if similarity_parts
         else torch.empty(0, num_labels, num_labels + 1, device=device),
     }
+    if return_latents:
+        result["latents"] = (
+            torch.cat(latent_parts)
+            if latent_parts
+            else torch.empty(0, num_labels, prototype_dim, device=device)
+        )
+    return result
 
 
 @torch.inference_mode()

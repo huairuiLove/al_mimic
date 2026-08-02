@@ -15,13 +15,14 @@ class TextMLPClassifier(nn.Module):
     def __init__(self, input_dim: int, num_labels: int, hidden_dims: tuple[int, int], dropout: float) -> None:
         super().__init__()
         drop: nn.Module = nn.Identity() if float(dropout) <= 0.0 else nn.Dropout(dropout)
+        gelu = nn.GELU(approximate="tanh")
         self.backbone = nn.Sequential(
             nn.LayerNorm(input_dim),
             nn.Linear(input_dim, hidden_dims[0]),
-            nn.GELU(),
+            gelu,
             drop,
             nn.Linear(hidden_dims[0], hidden_dims[1]),
-            nn.GELU(),
+            nn.GELU(approximate="tanh"),
             nn.Identity() if float(dropout) <= 0.0 else nn.Dropout(dropout),
         )
         self.classifier = nn.Linear(hidden_dims[1], num_labels)
@@ -68,7 +69,7 @@ class CoMALModule(nn.Module):
         batch = features.shape[0]
         label_features = self.to_label(features).view(batch, self.num_labels, -1)
         latent = self.to_latent(label_features)
-        decoded = self.from_latent(latent).reshape(batch, -1)
+        decoded = self.from_latent(latent).view(batch, -1)
         reconstructed = self.aggregate(decoded)
         reconstructed_logits = self.reconstruction_classifier(reconstructed)
         result = {
@@ -94,7 +95,7 @@ def _contrastive_chunk(
     start: int,
     stop: int,
     temperature: float,
-) -> tuple[torch.Tensor, int]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     chunk = flat[start:stop]
     width = stop - start
     logits = chunk.matmul(flat.transpose(0, 1)).div_(temperature)
@@ -102,20 +103,20 @@ def _contrastive_chunk(
     positive = class_ids[start:stop, None].eq(class_ids[None, :])
     eye = torch.arange(width, device=flat.device)
     self_columns = start + eye
-    # Build masks without Python-side clone churn on the hot path.
+    # Exclude self from positives; mask only the softmax denominator.
+    # Do not store -inf in logits that later multiply by a zero positive mask
+    # (IEEE (-inf)*0 == NaN).
     self_mask = torch.zeros_like(positive)
     self_mask[eye, self_columns] = True
     positive = positive & ~self_mask
-    valid = ~self_mask
-    denom = torch.logsumexp(logits.masked_fill(~valid, -torch.inf), dim=1, keepdim=True)
+    denom = torch.logsumexp(logits.masked_fill(self_mask, float("-inf")), dim=1, keepdim=True)
     log_prob = logits - denom
-    counts = positive.sum(dim=1)
+    pos = positive.to(dtype=log_prob.dtype)
+    counts = pos.sum(dim=1)
+    per_anchor = -(log_prob * pos).sum(dim=1) / counts.clamp_min(1)
     active = counts > 0
-    if not active.any():
-        return flat.new_zeros(()), 0
-    per_anchor = -(log_prob.masked_fill(~positive, 0).sum(dim=1) / counts.clamp_min(1))
-    selected = per_anchor[active]
-    return selected.sum(), int(selected.numel())
+    selected = per_anchor * active.to(dtype=per_anchor.dtype)
+    return selected.sum(), active.sum()
 
 
 def supervised_contrastive_loss(
@@ -132,22 +133,23 @@ def supervised_contrastive_loss(
     flat = F.normalize(features, dim=-1).reshape(batch_size * num_labels, features.shape[-1])
     label_ids = torch.arange(num_labels, device=labels.device).expand(batch_size, -1)
     class_ids = torch.where(labels >= 0.5, label_ids, num_labels).reshape(-1)
-    total = flat.shape[0]
+    total = int(flat.shape[0])
     temperature = max(float(temperature), 1e-6)
     # Prefer one full pairwise GEMM when it fits; chunking is only a memory guard.
     bytes_needed = total * total * flat.element_size()
     max_full_bytes = 2 * 1024**3 if flat.is_cuda else 512 * 1024**2
-    step = total if bytes_needed <= max_full_bytes else max(1, int(anchor_chunk_size))
+    if bytes_needed <= max_full_bytes:
+        loss_sum, loss_count = _contrastive_chunk(flat, class_ids, 0, total, temperature)
+        return torch.where(loss_count > 0, loss_sum / loss_count.clamp_min(1), features.sum() * 0)
+    step = max(1, int(anchor_chunk_size))
     loss_sum = flat.new_zeros(())
-    loss_count = 0
+    loss_count = flat.new_zeros(())
     for start in range(0, total, step):
         stop = min(start + step, total)
         part_sum, part_count = _contrastive_chunk(flat, class_ids, start, stop, temperature)
         loss_sum = loss_sum + part_sum
-        loss_count += part_count
-    if loss_count == 0:
-        return features.sum() * 0
-    return loss_sum / loss_count
+        loss_count = loss_count + part_count
+    return torch.where(loss_count > 0, loss_sum / loss_count.clamp_min(1), features.sum() * 0)
 
 
 @dataclass(frozen=True)
@@ -166,18 +168,30 @@ class PaperAcquisitionComponents:
     combined: torch.Tensor
 
 
+def own_prototype_similarity(
+    latent_features: torch.Tensor,
+    prototypes: torch.Tensor,
+    num_labels: int,
+) -> torch.Tensor:
+    # Prototypes are unit-normalized in set_prototypes; only normalize latents.
+    return torch.einsum(
+        "nld,ld->nl",
+        F.normalize(latent_features.float(), dim=-1),
+        prototypes[:num_labels].float(),
+    )
+
+
 @torch.inference_mode()
 def positive_similarity_thresholds(
     latent_features: torch.Tensor,
     labels: torch.Tensor,
     prototypes: torch.Tensor,
+    *,
+    own_similarity: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Midpoint of labeled positive min/max similarity from original CoMAL."""
-    own_similarity = torch.einsum(
-        "nld,ld->nl",
-        F.normalize(latent_features.float(), dim=-1),
-        F.normalize(prototypes[: labels.shape[1]].float(), dim=-1),
-    )
+    if own_similarity is None:
+        own_similarity = own_prototype_similarity(latent_features, prototypes, int(labels.shape[1]))
     positive_mask = labels >= 0.5
     # Vectorized per-label min/max over masked positions; empty labels stay 0.
     large = torch.finfo(own_similarity.dtype).max
@@ -191,6 +205,7 @@ def positive_similarity_thresholds(
     return thresholds
 
 
+@torch.inference_mode()
 def paper_comal_acquisition_scores(
     probabilities: torch.Tensor,
     latent_features: torch.Tensor,
@@ -198,13 +213,13 @@ def paper_comal_acquisition_scores(
     positive_thresholds: torch.Tensor,
     *,
     expected_cardinality: float,
+    own_similarity: torch.Tensor | None = None,
 ) -> PaperAcquisitionComponents:
     """CoMAL score from ``selection_methods.query_samples`` in the release."""
-    own_similarity = torch.einsum(
-        "nld,ld->nl",
-        F.normalize(latent_features.float(), dim=-1),
-        F.normalize(prototypes[: probabilities.shape[1]].float(), dim=-1),
-    )
+    if own_similarity is None:
+        own_similarity = own_prototype_similarity(
+            latent_features, prototypes, int(probabilities.shape[1])
+        )
     prototype_positive = own_similarity > positive_thresholds[None, :]
     prototype_positive_count = prototype_positive.sum(dim=1).float()
     cardinality_mismatch = (prototype_positive_count - expected_cardinality).abs()
@@ -222,6 +237,7 @@ def paper_comal_acquisition_scores(
     )
 
 
+@torch.inference_mode()
 def comal_acquisition_scores(
     probabilities: torch.Tensor,
     latent_features: torch.Tensor,
@@ -234,11 +250,9 @@ def comal_acquisition_scores(
 ) -> AcquisitionComponents:
     """Rank uncertain notes whose predicted positives are far from prototypes."""
     uncertainty = (1.0 - (2.0 * probabilities - 1.0).abs()).mean(dim=1)
-    normalized = F.normalize(latent_features, dim=-1)
-    positive_prototypes = prototypes[: probabilities.shape[1]]
-    similarity = torch.einsum("nld,ld->nl", normalized, positive_prototypes)
+    similarity = own_prototype_similarity(latent_features, prototypes, int(probabilities.shape[1]))
     predicted_positive = probabilities.ge(0.5)
-    fallback = torch.topk(probabilities, k=1, dim=1).indices
+    fallback = probabilities.argmax(dim=1, keepdim=True)
     predicted_positive = predicted_positive.scatter(1, fallback, True)
     selected_similarity = (similarity * predicted_positive).sum(dim=1) / predicted_positive.sum(
         dim=1

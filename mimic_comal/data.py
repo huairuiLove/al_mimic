@@ -10,6 +10,7 @@ from __future__ import annotations
 import csv
 import gzip
 import hashlib
+import io
 import json
 import re
 from collections import Counter, defaultdict
@@ -31,12 +32,21 @@ class MIMICRecord:
     text: str
 
 
+_WHITESPACE_RE = re.compile(r"\s+")
+
+
 def _read_rows(path: Path) -> Iterable[list[str]]:
-    # 1 MiB text buffer keeps NOTEEVENTS.csv.gz decode from syscall-thrashing the 18-core quota.
+    # Large decode buffers keep NOTEEVENTS.csv.gz from syscall-thrashing the 18-core quota.
     if path.suffix == ".gz":
-        handle = gzip.open(path, "rt", encoding="utf-8", errors="replace", newline="")
+        raw = gzip.open(path, "rb")
+        handle = io.TextIOWrapper(
+            io.BufferedReader(raw, buffer_size=8 * 1024 * 1024),
+            encoding="utf-8",
+            errors="replace",
+            newline="",
+        )
     else:
-        handle = open(path, "rt", encoding="utf-8", errors="replace", newline="", buffering=1024 * 1024)
+        handle = open(path, "rt", encoding="utf-8", errors="replace", newline="", buffering=8 * 1024 * 1024)
     with handle:
         # csv.reader over a buffered TextIO-like stream; avoid per-row Python wrapping.
         yield from csv.reader(handle)
@@ -56,7 +66,7 @@ def _stable_fraction(value: str, seed: int) -> float:
 
 def _clean_text(value: str, max_chars: int) -> str:
     # Keep section content while removing line-level PHI formatting noise.
-    text = re.sub(r"\s+", " ", value.replace("\x00", " ")).strip()
+    text = _WHITESPACE_RE.sub(" ", value.replace("\x00", " ")).strip()
     return text[:max_chars]
 
 
@@ -90,14 +100,16 @@ def _admission_map(path: Path, max_records: int | None) -> dict[str, str]:
 def _diagnosis_map(path: Path, admissions: dict[str, str], length: int) -> dict[str, set[str]]:
     rows = _read_rows(path)
     header = next(rows)
-    positions = {name: header.index(name) for name in ("HADM_ID", "ICD9_CODE")}
+    hadm_i = header.index("HADM_ID")
+    code_i = header.index("ICD9_CODE")
+    min_width = max(hadm_i, code_i)
     result: dict[str, set[str]] = defaultdict(set)
     for row in rows:
-        if len(row) <= max(positions.values()):
+        if len(row) <= min_width:
             continue
-        hadm = row[positions["HADM_ID"]]
+        hadm = row[hadm_i]
         if hadm in admissions:
-            code = _code_prefix(row[positions["ICD9_CODE"]], length)
+            code = _code_prefix(row[code_i], length)
             if code:
                 result[hadm].add(code)
     return result
@@ -112,26 +124,32 @@ def _note_map(
 ) -> dict[str, str]:
     rows = _read_rows(path)
     header = next(rows)
-    positions = {name: header.index(name) for name in ("HADM_ID", "CATEGORY", "DESCRIPTION", "TEXT")}
+    hadm_i = header.index("HADM_ID")
+    category_i = header.index("CATEGORY")
+    description_i = header.index("DESCRIPTION")
+    text_i = header.index("TEXT")
+    min_width = max(hadm_i, category_i, description_i, text_i)
+    allowed_descriptions = {"", "report", "addendum"}
     chunks: dict[str, list[str]] = defaultdict(list)
+    full: set[str] = set()
     for row in rows:
-        if len(row) <= max(positions.values()):
+        if len(row) <= min_width:
             continue
-        hadm = row[positions["HADM_ID"]]
-        if hadm not in admissions:
+        hadm = row[hadm_i]
+        if hadm not in admissions or hadm in full:
             continue
-        category = row[positions["CATEGORY"]].strip()
-        description = row[positions["DESCRIPTION"]].strip()
         # MIMIC has several discharge-summary spellings; exact categories remain configurable.
-        if categories and category not in categories:
+        if categories and row[category_i].strip() not in categories:
             continue
-        if description and description.lower() not in {"report", "addendum"}:
+        if row[description_i].strip().lower() not in allowed_descriptions:
             continue
-        if len(chunks[hadm]) >= max_notes:
+        text = _clean_text(row[text_i], max_chars)
+        if not text:
             continue
-        text = _clean_text(row[positions["TEXT"]], max_chars)
-        if text:
-            chunks[hadm].append(text)
+        bucket = chunks[hadm]
+        bucket.append(text)
+        if len(bucket) >= max_notes:
+            full.add(hadm)
     return {hadm: "\n".join(values)[:max_chars] for hadm, values in chunks.items() if values}
 
 
@@ -247,7 +265,7 @@ def load_records(prepared_dir: str | Path) -> list[MIMICRecord]:
         raise FileNotFoundError(f"prepared records not found: {path}; run `prepare` first")
     records: list[MIMICRecord] = []
     # Large buffered reads keep the 18-core host in sequential decode instead of syscall chatter.
-    with path.open("rb", buffering=1024 * 1024) as handle:
+    with path.open("rb", buffering=8 * 1024 * 1024) as handle:
         for raw in handle:
             payload = json.loads(raw)
             records.append(
