@@ -447,30 +447,15 @@ def train_round(
         # Reuse frozen classifier features instead of re-encoding the labeled pool.
         prototypes_from_cache = True
         eval_batch = int(training.get("eval_batch_size", 1024))
-        _refresh_prototypes_from_cached(
+        # One labeled pass: refresh prototypes and cache own-sims for paper acquisition.
+        labeled_own_cache = _refresh_prototypes_from_cached(
             comal,
             cached_features,
             cached_labels,
             eval_batch,
+            return_own_similarity=True,
         )
-        # Cache labeled own-sims for paper acquisition so the next scan is candidates-only.
-        labeled_own_parts: list[torch.Tensor] = []
-        comal.eval()
-        with torch.inference_mode():
-            for start in range(0, max(int(cached_features.shape[0]), 1), eval_batch):
-                if cached_features.shape[0] == 0:
-                    break
-                stop = min(start + eval_batch, int(cached_features.shape[0]))
-                sims = comal(
-                    cached_features[start:stop],
-                    compute_reconstruction=False,
-                    compute_similarities="own_bg",
-                )["prototype_similarities"]
-                labeled_own_parts.append(sims[..., 0])
         labeled_labels_cache = cached_labels
-        labeled_own_cache = (
-            torch.cat(labeled_own_parts, dim=0) if labeled_own_parts else cached_features.new_zeros((0, 0))
-        )
     else:
         labeled_labels_cache = None
         labeled_own_cache = None
@@ -549,31 +534,42 @@ def _refresh_prototypes_from_cached(
     cached_features: torch.Tensor,
     cached_labels: torch.Tensor,
     eval_batch_size: int,
-) -> None:
+    *,
+    return_own_similarity: bool = False,
+) -> torch.Tensor | None:
     """Refresh prototypes from frozen classifier features (no classifier re-encode)."""
     sums = torch.zeros_like(comal.prototypes, dtype=torch.float32, device=cached_features.device)
     counts = torch.zeros_like(comal.prototype_counts, dtype=torch.float32, device=cached_features.device)
     comal.eval()
     count = int(cached_features.shape[0])
+    latent_parts: list[torch.Tensor] = []
     for start in range(0, max(count, 1), eval_batch_size):
         if count == 0:
             break
         stop = min(start + eval_batch_size, count)
         fused = cached_features[start:stop]
         targets = cached_labels[start:stop]
-        # Prototype refresh only needs latents; skip similarity GEMM.
         latent = F.normalize(
             comal(fused, compute_similarities=False, compute_reconstruction=False)[
                 "latent_features"
             ].float(),
             dim=-1,
         )
+        if return_own_similarity:
+            latent_parts.append(latent)
         negative = 1.0 - targets
         sums[:-1] += torch.einsum("bl,bld->ld", targets, latent)
         counts[:-1] += targets.sum(dim=0)
         sums[-1] += torch.einsum("bl,bld->d", negative, latent)
         counts[-1] += negative.sum()
     comal.set_prototypes(sums, counts)
+    if not return_own_similarity:
+        return None
+    if not latent_parts:
+        return cached_features.new_zeros((0, int(cached_labels.shape[1])))
+    # Own-sims must use the refreshed prototypes, not the pre-update buffers.
+    latents = torch.cat(latent_parts, dim=0)
+    return torch.einsum("nld,ld->nl", latents, comal.prototypes[:-1].float())
 
 
 @torch.inference_mode()
