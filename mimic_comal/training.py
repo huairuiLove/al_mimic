@@ -542,7 +542,10 @@ def _refresh_prototypes_from_cached(
     counts = torch.zeros_like(comal.prototype_counts, dtype=torch.float32, device=cached_features.device)
     comal.eval()
     count = int(cached_features.shape[0])
-    latent_parts: list[torch.Tensor] = []
+    num_labels = int(cached_labels.shape[1])
+    latents: torch.Tensor | None = None
+    if return_own_similarity and count > 0:
+        latents = cached_features.new_empty((count, num_labels, int(comal.prototype_dim)))
     for start in range(0, max(count, 1), eval_batch_size):
         if count == 0:
             break
@@ -555,8 +558,8 @@ def _refresh_prototypes_from_cached(
             ].float(),
             dim=-1,
         )
-        if return_own_similarity:
-            latent_parts.append(latent)
+        if latents is not None:
+            latents[start:stop] = latent
         negative = 1.0 - targets
         sums[:-1] += torch.einsum("bl,bld->ld", targets, latent)
         counts[:-1] += targets.sum(dim=0)
@@ -565,10 +568,9 @@ def _refresh_prototypes_from_cached(
     comal.set_prototypes(sums, counts)
     if not return_own_similarity:
         return None
-    if not latent_parts:
-        return cached_features.new_zeros((0, int(cached_labels.shape[1])))
+    if latents is None:
+        return cached_features.new_zeros((0, num_labels))
     # Own-sims must use the refreshed prototypes, not the pre-update buffers.
-    latents = torch.cat(latent_parts, dim=0)
     return torch.einsum("nld,ld->nl", latents, comal.prototypes[:-1].float())
 
 
