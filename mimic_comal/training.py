@@ -760,8 +760,8 @@ def predict_tensors(
             compute_reconstruction=False,
             compute_similarities=similarity_mode,
         )
-        index_parts.append(batch["index"].to(device))
-        label_parts.append(batch["labels"].to(device))
+        index_parts.append(batch["index"].to(device, non_blocking=True))
+        label_parts.append(batch["labels"].to(device, non_blocking=True))
         prob_parts.append(torch.sigmoid(output["logits"]))
         if return_latents:
             latent_parts.append(comal_output["latent_features"].float())
