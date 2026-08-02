@@ -22,7 +22,7 @@ features:
   device: cuda
   svd_n_iter: 7
   transform_batch_size: 8192
-  joblib_compress: 1
+  joblib_compress: 0
 
 training:
   device: cuda
