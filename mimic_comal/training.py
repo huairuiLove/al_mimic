@@ -746,21 +746,71 @@ def predict(
     return {name: value.detach().cpu().numpy() for name, value in tensors.items()}
 
 
+def _empty_prototype_similarity_metrics() -> dict[str, float | None]:
+    return {
+        "prototype_positive_own_similarity": None,
+        "prototype_negative_own_similarity": None,
+        "prototype_background_similarity": None,
+        "prototype_positive_vs_background_margin": None,
+    }
+
+
+@torch.inference_mode()
+def prototype_similarity_metrics_torch(
+    labels: torch.Tensor, prototype_similarities: torch.Tensor
+) -> dict[str, float | None]:
+    """GPU reductions for prototype similarity metrics; one host sync for scalars."""
+    sims = prototype_similarities
+    if sims.ndim != 3 or int(sims.shape[0]) == 0:
+        return _empty_prototype_similarity_metrics()
+    if sims.shape[-1] == 2:
+        own = sims[..., 0]
+        background = sims[..., 1]
+    else:
+        index = torch.arange(sims.shape[1], device=sims.device)
+        own = sims[:, index, index]
+        background = sims[:, :, -1]
+    pos_mask = labels >= 0.5
+    neg_mask = ~pos_mask
+    pos_count = pos_mask.sum()
+    neg_count = neg_mask.sum()
+    pos_own = own.masked_select(pos_mask).sum()
+    neg_own = own.masked_select(neg_mask).sum()
+    pos_margin = (own - background).masked_select(pos_mask).sum()
+    bg_mean = background.mean()
+    packed = torch.stack(
+        (
+            bg_mean,
+            pos_count.to(dtype=bg_mean.dtype),
+            neg_count.to(dtype=bg_mean.dtype),
+            pos_own,
+            neg_own,
+            pos_margin,
+        )
+    )
+    bg_v, pos_n, neg_n, pos_s, neg_s, margin_s = packed.detach().cpu().tolist()
+    return {
+        "prototype_background_similarity": float(bg_v),
+        "prototype_positive_own_similarity": float(pos_s / pos_n) if pos_n > 0 else None,
+        "prototype_negative_own_similarity": float(neg_s / neg_n) if neg_n > 0 else None,
+        "prototype_positive_vs_background_margin": float(margin_s / pos_n) if pos_n > 0 else None,
+    }
+
+
 def prototype_similarity_metrics(
     labels: np.ndarray, prototype_similarities: np.ndarray
 ) -> dict[str, float | None]:
     """Evaluation metrics derived from CoMAL prototype similarities [N, L, L+1]."""
     sims = np.asarray(prototype_similarities)
     if sims.ndim != 3 or sims.shape[0] == 0:
-        return {
-            "prototype_positive_own_similarity": None,
-            "prototype_negative_own_similarity": None,
-            "prototype_background_similarity": None,
-            "prototype_positive_vs_background_margin": None,
-        }
-    index = np.arange(sims.shape[1])
-    own = sims[:, index, index]
-    background = sims[:, :, -1]
+        return _empty_prototype_similarity_metrics()
+    if sims.shape[-1] == 2:
+        own = sims[..., 0]
+        background = sims[..., 1]
+    else:
+        index = np.arange(sims.shape[1])
+        own = sims[:, index, index]
+        background = sims[:, :, -1]
     pos_mask = np.asarray(labels) >= 0.5
     neg_mask = ~pos_mask
     return {

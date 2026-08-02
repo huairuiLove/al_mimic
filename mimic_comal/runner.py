@@ -26,7 +26,7 @@ from .training import (
     TrainedRound,
     label_matrix,
     predict_tensors,
-    prototype_similarity_metrics,
+    prototype_similarity_metrics_torch,
     train_round,
 )
 
@@ -230,33 +230,41 @@ class ActiveLearningExperiment:
                     return_latents=fuse_mode == "weighted",
                     similarity_mode="full" if fuse_mode == "weighted" else "own_bg",
                 )
-            metric_keys = ("indices", "labels", "probabilities", "prototype_similarities")
-            # Overlap host copies; one sync before .numpy().
+            # Prototype similarity metrics stay on-device; only D2H sims on the final round for npz.
+            validation_metrics = {}
+            test_metrics = {}
+            validation_metrics.update(
+                prototype_similarity_metrics_torch(
+                    eval_tensors["labels"][:split], eval_tensors["prototype_similarities"][:split]
+                )
+            )
+            test_metrics.update(
+                prototype_similarity_metrics_torch(
+                    eval_tensors["labels"][split:], eval_tensors["prototype_similarities"][split:]
+                )
+            )
+            host_keys = ["indices", "labels", "probabilities"]
+            if not will_query:
+                host_keys.append("prototype_similarities")
             validation_host = {
-                name: eval_tensors[name][:split].detach().to("cpu", non_blocking=True) for name in metric_keys
+                name: eval_tensors[name][:split].detach().to("cpu", non_blocking=True) for name in host_keys
             }
             test_host = {
-                name: eval_tensors[name][split:].detach().to("cpu", non_blocking=True) for name in metric_keys
+                name: eval_tensors[name][split:].detach().to("cpu", non_blocking=True) for name in host_keys
             }
             if self.device.type == "cuda":
                 torch.cuda.current_stream(self.device).synchronize()
             validation_prediction = {name: value.numpy() for name, value in validation_host.items()}
             test_prediction = {name: value.numpy() for name, value in test_host.items()}
             threshold = float(self.training_cfg.get("threshold", 0.5))
-            validation_metrics = multilabel_metrics(
-                validation_prediction["labels"], validation_prediction["probabilities"], threshold
-            )
-            test_metrics = multilabel_metrics(
-                test_prediction["labels"], test_prediction["probabilities"], threshold
-            )
             validation_metrics.update(
-                prototype_similarity_metrics(
-                    validation_prediction["labels"], validation_prediction["prototype_similarities"]
+                multilabel_metrics(
+                    validation_prediction["labels"], validation_prediction["probabilities"], threshold
                 )
             )
             test_metrics.update(
-                prototype_similarity_metrics(
-                    test_prediction["labels"], test_prediction["prototype_similarities"]
+                multilabel_metrics(
+                    test_prediction["labels"], test_prediction["probabilities"], threshold
                 )
             )
             queries: list[int] = []
