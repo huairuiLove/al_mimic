@@ -263,11 +263,17 @@ def load_records(prepared_dir: str | Path) -> list[MIMICRecord]:
     path = Path(prepared_dir) / "records.jsonl"
     if not path.is_file():
         raise FileNotFoundError(f"prepared records not found: {path}; run `prepare` first")
+    try:
+        import orjson
+
+        loads = orjson.loads
+    except ImportError:  # pragma: no cover - stdlib fallback
+        loads = json.loads
     records: list[MIMICRecord] = []
     # Large buffered reads keep the 18-core host in sequential decode instead of syscall chatter.
     with path.open("rb", buffering=8 * 1024 * 1024) as handle:
         for raw in handle:
-            payload = json.loads(raw)
+            payload = loads(raw)
             records.append(
                 MIMICRecord(
                     int(payload["row_index"]),
