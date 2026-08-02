@@ -29,7 +29,9 @@ class TextMLPClassifier(nn.Module):
         self.feature_dim = hidden_dims[1]
 
     def forward(self, features: torch.Tensor) -> dict[str, torch.Tensor]:
-        fused = self.backbone(features.float())
+        # Resident caches are already float32; skip a redundant cast on the hot path.
+        inputs = features if features.dtype == torch.float32 else features.float()
+        fused = self.backbone(inputs)
         return {"logits": self.classifier(fused), "features": fused}
 
 
