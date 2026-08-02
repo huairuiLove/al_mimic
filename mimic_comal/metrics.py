@@ -64,10 +64,13 @@ def multilabel_metrics(
     except ValueError:
         metrics["auroc_macro"] = None
     label_sums = labels.sum(axis=1)
+    max_k = min(5, labels.shape[1])
+    # One top-5 partition; slice prefixes for P@1/P@3/P@5.
+    top5 = np.argpartition(-probabilities, kth=max_k - 1, axis=1)[:, :max_k]
+    top5_labels = np.take_along_axis(labels, top5, axis=1)
     for k in (1, 3, 5):
         actual_k = min(k, labels.shape[1])
-        top = np.argpartition(-probabilities, kth=actual_k - 1, axis=1)[:, :actual_k]
-        hits = np.take_along_axis(labels, top, axis=1).sum(axis=1)
+        hits = top5_labels[:, :actual_k].sum(axis=1)
         metrics[f"precision_at_{k}"] = float(np.mean(hits / actual_k))
         metrics[f"ndcg_proxy_at_{k}"] = float(np.mean(hits / np.minimum(np.maximum(label_sums, 1), actual_k)))
     return metrics
