@@ -297,36 +297,21 @@ class ActiveLearningExperiment:
                     similarity_mode="own_bg",
                 )
             # Prototype similarity metrics stay on-device; only D2H sims on the final round for npz.
-            validation_metrics = {}
-            test_metrics = {}
-            validation_metrics.update(
-                prototype_similarity_metrics_torch(
+            # Defer eval host sync + sklearn metrics until after acquisition so ranking is not blocked.
+            validation_metrics = {
+                **prototype_similarity_metrics_torch(
                     eval_tensors["labels"][:split], eval_tensors["prototype_similarities"][:split]
                 )
-            )
-            test_metrics.update(
-                prototype_similarity_metrics_torch(
+            }
+            test_metrics = {
+                **prototype_similarity_metrics_torch(
                     eval_tensors["labels"][split:], eval_tensors["prototype_similarities"][split:]
                 )
-            )
-            if copy_stream is not None:
-                copy_stream.synchronize()
-            validation_prediction = {name: value.numpy() for name, value in validation_host.items()}
-            test_prediction = {name: value.numpy() for name, value in test_host.items()}
-            threshold = float(self.training_cfg.get("threshold", 0.5))
-            validation_metrics.update(
-                multilabel_metrics(
-                    validation_prediction["labels"], validation_prediction["probabilities"], threshold
-                )
-            )
-            test_metrics.update(
-                multilabel_metrics(
-                    test_prediction["labels"], test_prediction["probabilities"], threshold
-                )
-            )
+            }
             queries: list[int] = []
             acquisition: dict[str, Any] = {}
-            diagnostics_prediction = validation_prediction
+            validation_prediction: dict[str, Any] | None = None
+            test_prediction: dict[str, Any] | None = None
             if will_query:
                 assert pool_tensors is not None
                 score_tensor: torch.Tensor | None = None
@@ -474,6 +459,26 @@ class ActiveLearningExperiment:
                 diagnostic_scores = np.asarray(scores)
             else:
                 diagnostic_scores = None
+            # Pool D2H already drained the copy stream when querying; otherwise sync eval hosts now.
+            if not will_query:
+                if copy_stream is not None:
+                    copy_stream.synchronize()
+                elif self.device.type == "cuda":
+                    torch.cuda.current_stream(self.device).synchronize()
+            validation_prediction = {name: value.numpy() for name, value in validation_host.items()}
+            test_prediction = {name: value.numpy() for name, value in test_host.items()}
+            threshold = float(self.training_cfg.get("threshold", 0.5))
+            validation_metrics.update(
+                multilabel_metrics(
+                    validation_prediction["labels"], validation_prediction["probabilities"], threshold
+                )
+            )
+            test_metrics.update(
+                multilabel_metrics(
+                    test_prediction["labels"], test_prediction["probabilities"], threshold
+                )
+            )
+            if not will_query:
                 # Final / no-query rounds diagnose on validation; similarities already suffice.
                 diagnostics_prediction = validation_prediction
             diagnostics = build_round_diagnostics(
