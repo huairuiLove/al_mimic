@@ -173,6 +173,7 @@ class ActiveLearningExperiment:
         # Fixed each round; concatenate once instead of rebuilding val+test indices.
         eval_indices = np.concatenate([validation_indices, test_indices])
         warm_resident_matrices(self.features, self.labels, self.device, self.training_cfg)
+        copy_stream = torch.cuda.Stream(device=self.device) if self.device.type == "cuda" else None
         for round_index in range(rounds):
             round_start = time.perf_counter()
             # Shallow-copy only the training dict when overriding incremental epochs.
@@ -240,7 +241,6 @@ class ActiveLearningExperiment:
             host_keys = ["indices", "labels", "probabilities"]
             if not will_query:
                 host_keys.append("prototype_similarities")
-            copy_stream = torch.cuda.Stream(device=self.device) if self.device.type == "cuda" else None
             validation_host = {
                 name: _async_to_host(eval_tensors[name][:split], copy_stream) for name in host_keys
             }
