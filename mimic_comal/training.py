@@ -106,11 +106,13 @@ def _to_device_matrix(
     if cached is not None and cached.device == device and cached.shape[0] == values.shape[0]:
         return cached
     array = np.asarray(values)
-    if not array.flags["C_CONTIGUOUS"] or array.dtype != np.float32:
-        array = np.ascontiguousarray(array, dtype=np.float32)
+    # Keep native dtype on host (e.g. float16 BERT caches); cast on the device copy.
+    if not array.flags["C_CONTIGUOUS"]:
+        array = np.ascontiguousarray(array)
     host = torch.from_numpy(array)
     if device.type == "cuda":
-        host = host.pin_memory()
+        if not host.is_pinned():
+            host = host.pin_memory()
         tensor = host.to(device=device, dtype=dtype, non_blocking=True)
         torch.cuda.current_stream().synchronize()
         _DEVICE_MATRIX_CACHE[cache_key] = tensor
