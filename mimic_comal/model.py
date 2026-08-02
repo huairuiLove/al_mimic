@@ -118,10 +118,18 @@ def _contrastive_chunk(
     # Exclude self from positives; mask only the softmax denominator.
     # Do not store -inf in logits that later multiply by a zero positive mask
     # (IEEE (-inf)*0 == NaN).
-    self_mask = torch.zeros_like(positive)
-    self_mask[eye, self_columns] = True
-    positive = positive & ~self_mask
-    denom = torch.logsumexp(logits.masked_fill(self_mask, float("-inf")), dim=1, keepdim=True)
+    if start == 0 and stop == int(flat.shape[0]):
+        # Square full-batch path: fill_diagonal_ is cheaper than a dense bool mask.
+        positive = positive.clone()
+        positive.fill_diagonal_(False)
+        denom_logits = logits.clone()
+        denom_logits.fill_diagonal_(float("-inf"))
+        denom = torch.logsumexp(denom_logits, dim=1, keepdim=True)
+    else:
+        self_mask = torch.zeros_like(positive)
+        self_mask[eye, self_columns] = True
+        positive = positive & ~self_mask
+        denom = torch.logsumexp(logits.masked_fill(self_mask, float("-inf")), dim=1, keepdim=True)
     log_prob = logits - denom
     pos = positive.to(dtype=log_prob.dtype)
     counts = pos.sum(dim=1)
