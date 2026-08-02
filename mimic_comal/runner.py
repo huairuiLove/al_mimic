@@ -226,7 +226,8 @@ class ActiveLearningExperiment:
             labeled_array = np.asarray(labeled, dtype=np.int64)
             labeled_tensors: dict[str, torch.Tensor] | None = None
             pool_tensors: dict[str, torch.Tensor] | None = None
-            # Eval always keeps full [N,L,L+1] similarities for metrics / final npz.
+            # Intermediate rounds only need own/background for GPU metrics; full
+            # [N,L,L+1] cubes are reserved for the final npz / diagnostics dump.
             eval_tensors = predict_tensors(
                 trained,
                 self.features,
@@ -235,7 +236,7 @@ class ActiveLearningExperiment:
                 self.config,
                 self.device,
                 return_latents=False,
-                similarity_mode="full",
+                similarity_mode="full" if not will_query else "own_bg",
             )
             # Kick off pinned D2H on a side stream before acquisition predict.
             host_keys = ["indices", "labels", "probabilities"]
