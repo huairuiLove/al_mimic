@@ -294,8 +294,9 @@ def train_round(
         feature_tensor = _to_device_matrix(features, device)
         label_tensor = _to_device_matrix(labels, device)
         index_tensor = torch.as_tensor(indices, device=device, dtype=torch.long)
-        labeled_features = feature_tensor.index_select(0, index_tensor).contiguous()
-        labeled_targets = label_tensor.index_select(0, index_tensor).contiguous()
+        # index_select already returns contiguous rows; avoid a redundant clone.
+        labeled_features = feature_tensor.index_select(0, index_tensor)
+        labeled_targets = label_tensor.index_select(0, index_tensor)
         criterion = nn.BCEWithLogitsLoss(
             pos_weight=_pos_weight(label_tensor, index_tensor, float(training.get("maximum_pos_weight", 20)))
         )
