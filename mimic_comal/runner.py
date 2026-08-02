@@ -368,10 +368,7 @@ class ActiveLearningExperiment:
                 diagnostic_scores = np.asarray(scores)
             else:
                 diagnostic_scores = None
-                # Final / no-query rounds diagnose on validation; latents were kept above.
-                validation_prediction["latents"] = (
-                    eval_tensors["latents"][:split].detach().cpu().numpy()
-                )
+                # Final / no-query rounds diagnose on validation; similarities already suffice.
                 diagnostics_prediction = validation_prediction
             diagnostics = build_round_diagnostics(
                 diagnostics_prediction["labels"],
