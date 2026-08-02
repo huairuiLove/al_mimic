@@ -378,9 +378,15 @@ class ActiveLearningExperiment:
                             "combined",
                         )
                     elif formula == "weighted":
-                        expected_cardinality = float(
-                            self.labels[np.asarray(labeled)].sum(axis=1).mean()
-                        )
+                        # Prefer on-device labeled labels (cached or pool fallback) to avoid a host sync.
+                        if cached_labeled_labels is not None:
+                            expected_cardinality = cached_labeled_labels.sum(dim=1).mean()
+                        elif labeled_tensors is not None:
+                            expected_cardinality = labeled_tensors["labels"].sum(dim=1).mean()
+                        else:
+                            expected_cardinality = float(
+                                self.labels[np.asarray(labeled)].sum(axis=1).mean()
+                            )
                         pool_sims = pool_tensors["prototype_similarities"]
                         pool_own = pool_sims[..., 0] if pool_sims.shape[-1] == 2 else None
                         parts = comal_acquisition_scores(
