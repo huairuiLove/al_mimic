@@ -139,6 +139,8 @@ class ActiveLearningExperiment:
         strategy = str(self.active_cfg.get("strategy", "comal")).lower()
         labeled_mask = np.zeros(len(self.records), dtype=bool)
         labeled_mask[np.asarray(labeled, dtype=np.int64)] = True
+        # Fixed each round; concatenate once instead of rebuilding val+test indices.
+        eval_indices = np.concatenate([validation_indices, test_indices])
         for round_index in range(rounds):
             round_start = time.perf_counter()
             # Shallow-copy only the training dict when overriding incremental epochs.
@@ -187,7 +189,6 @@ class ActiveLearningExperiment:
                     if pool_size < unlabeled.size
                     else unlabeled
                 )
-            eval_indices = np.concatenate([validation_indices, test_indices])
             split = int(validation_indices.size)
             labeled_array = np.asarray(labeled, dtype=np.int64)
             labeled_tensors: dict[str, torch.Tensor] | None = None
