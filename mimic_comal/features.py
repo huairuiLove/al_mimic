@@ -249,7 +249,12 @@ def build_features(
         "output_dir": str(output),
         **extra,
     }
-    metadata_path.write_text(json.dumps(metadata, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+    try:
+        import orjson
+
+        metadata_path.write_bytes(orjson.dumps(metadata, option=orjson.OPT_INDENT_2) + b"\n")
+    except ImportError:  # pragma: no cover
+        metadata_path.write_text(json.dumps(metadata, indent=2, allow_nan=False) + "\n", encoding="utf-8")
     return metadata | {"cached": False}
 
 
