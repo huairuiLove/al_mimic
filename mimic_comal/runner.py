@@ -172,7 +172,13 @@ class ActiveLearningExperiment:
         labeled_mask[np.asarray(labeled, dtype=np.int64)] = True
         # Fixed each round; concatenate once instead of rebuilding val+test indices.
         eval_indices = np.concatenate([validation_indices, test_indices])
-        warm_resident_matrices(self.features, self.labels, self.device, self.training_cfg)
+        warm_resident_matrices(
+            self.features,
+            self.labels,
+            self.device,
+            self.training_cfg,
+            indices=eval_indices,
+        )
         copy_stream = torch.cuda.Stream(device=self.device) if self.device.type == "cuda" else None
         for round_index in range(rounds):
             round_start = time.perf_counter()
