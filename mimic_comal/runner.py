@@ -34,7 +34,14 @@ from .training import (
 
 def _write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value, indent=2, ensure_ascii=False, allow_nan=False) + "\n", encoding="utf-8")
+    try:
+        import orjson
+
+        path.write_bytes(orjson.dumps(value, option=orjson.OPT_INDENT_2) + b"\n")
+    except ImportError:  # pragma: no cover
+        path.write_text(
+            json.dumps(value, indent=2, ensure_ascii=False, allow_nan=False) + "\n", encoding="utf-8"
+        )
 
 
 def _async_to_host(
