@@ -127,13 +127,20 @@ class ActiveLearningExperiment:
     def _save_checkpoint(self, trained: TrainedRound, round_index: int) -> None:
         checkpoint_dir = self.output_dir / "checkpoints"
         checkpoint_dir.mkdir(exist_ok=True)
+        classifier_host = {
+            key: _async_to_host(value.detach(), None)
+            for key, value in trained.classifier.state_dict().items()
+        }
+        comal_host = {
+            key: _async_to_host(value.detach(), None) for key, value in trained.comal.state_dict().items()
+        }
+        if self.device.type == "cuda":
+            torch.cuda.current_stream(self.device).synchronize()
         torch.save(
             {
                 "round": round_index,
-                "classifier": {
-                    key: value.detach().cpu() for key, value in trained.classifier.state_dict().items()
-                },
-                "comal": {key: value.detach().cpu() for key, value in trained.comal.state_dict().items()},
+                "classifier": {key: value for key, value in classifier_host.items()},
+                "comal": {key: value for key, value in comal_host.items()},
                 "label_names": self.label_names,
                 "feature_dim": int(self.features.shape[1]),
             },
