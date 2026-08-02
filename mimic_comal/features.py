@@ -134,13 +134,17 @@ def _bert_features(records: list[MIMICRecord], cfg: dict[str, Any]) -> tuple[np.
 
     def tokenize(start: int) -> dict[str, torch.Tensor]:
         texts = [record.text for record in records[start : start + batch_size]]
-        return tokenizer(
+        batch = tokenizer(
             texts,
             return_tensors="pt",
             truncation=True,
             padding=True,
             max_length=max_length,
         )
+        # Pin on the tokenize worker so H2D can be truly async with the encode stream.
+        if device.type == "cuda":
+            batch = {key: value.pin_memory() for key, value in batch.items()}
+        return batch
 
     starts = list(range(0, len(records), batch_size))
     # Preallocate host buffer; avoids repeated concatenate + dtype casts.
