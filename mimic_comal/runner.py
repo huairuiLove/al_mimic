@@ -18,7 +18,6 @@ from .features import load_features
 from .integrity import assert_original_unchanged
 from .model import (
     comal_acquisition_scores,
-    own_prototype_similarity,
     paper_comal_acquisition_scores,
     positive_similarity_thresholds,
 )
@@ -202,7 +201,8 @@ class ActiveLearningExperiment:
                     fused_indices,
                     self.config,
                     self.device,
-                    return_latents=True,
+                    # Own-prototype scores are the similarity diagonal; skip latent buffers.
+                    return_latents=False,
                 )
                 eval_end = int(eval_indices.size)
                 labeled_end = eval_end + int(labeled_array.size)
@@ -277,21 +277,20 @@ class ActiveLearningExperiment:
                         assert labeled_tensors is not None
                         expected_cardinality = labeled_tensors["labels"].sum(dim=1).mean()
                         prototypes = trained.comal.prototypes.detach()
-                        labeled_own = own_prototype_similarity(
-                            labeled_tensors["latents"], prototypes, int(labeled_tensors["labels"].shape[1])
-                        )
-                        pool_own = own_prototype_similarity(
-                            pool_tensors["latents"], prototypes, int(pool_tensors["probabilities"].shape[1])
-                        )
+                        num_labels = int(labeled_tensors["labels"].shape[1])
+                        label_index = torch.arange(num_labels, device=self.device)
+                        # Diagonal of [N,L,L+1] matches own_prototype_similarity without re-GEMM.
+                        labeled_own = labeled_tensors["prototype_similarities"][:, label_index, label_index]
+                        pool_own = pool_tensors["prototype_similarities"][:, label_index, label_index]
                         thresholds = positive_similarity_thresholds(
-                            labeled_tensors["latents"],
+                            None,
                             labeled_tensors["labels"],
                             prototypes,
                             own_similarity=labeled_own,
                         )
                         parts = paper_comal_acquisition_scores(
                             pool_tensors["probabilities"],
-                            pool_tensors["latents"],
+                            None,
                             prototypes,
                             thresholds,
                             expected_cardinality=expected_cardinality,

@@ -188,7 +188,7 @@ def own_prototype_similarity(
 
 @torch.inference_mode()
 def positive_similarity_thresholds(
-    latent_features: torch.Tensor,
+    latent_features: torch.Tensor | None,
     labels: torch.Tensor,
     prototypes: torch.Tensor,
     *,
@@ -196,6 +196,8 @@ def positive_similarity_thresholds(
 ) -> torch.Tensor:
     """Midpoint of labeled positive min/max similarity from original CoMAL."""
     if own_similarity is None:
+        if latent_features is None:
+            raise ValueError("latent_features or own_similarity is required")
         own_similarity = own_prototype_similarity(latent_features, prototypes, int(labels.shape[1]))
     positive_mask = labels >= 0.5
     # Vectorized per-label min/max over masked positions; empty labels stay 0.
@@ -213,7 +215,7 @@ def positive_similarity_thresholds(
 @torch.inference_mode()
 def paper_comal_acquisition_scores(
     probabilities: torch.Tensor,
-    latent_features: torch.Tensor,
+    latent_features: torch.Tensor | None,
     prototypes: torch.Tensor,
     positive_thresholds: torch.Tensor,
     *,
@@ -222,6 +224,8 @@ def paper_comal_acquisition_scores(
 ) -> PaperAcquisitionComponents:
     """CoMAL score from ``selection_methods.query_samples`` in the release."""
     if own_similarity is None:
+        if latent_features is None:
+            raise ValueError("latent_features or own_similarity is required")
         own_similarity = own_prototype_similarity(
             latent_features, prototypes, int(probabilities.shape[1])
         )
