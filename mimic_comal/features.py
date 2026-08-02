@@ -30,7 +30,12 @@ def _fingerprint(records: list[MIMICRecord], cfg: dict[str, Any]) -> str:
             chunk.clear()
     if chunk:
         update("".join(chunk).encode())
-    update(json.dumps(cfg, sort_keys=True).encode())
+    try:
+        import orjson
+
+        update(orjson.dumps(cfg, option=orjson.OPT_SORT_KEYS))
+    except ImportError:  # pragma: no cover
+        update(json.dumps(cfg, sort_keys=True).encode())
     return digest.hexdigest()
 
 
