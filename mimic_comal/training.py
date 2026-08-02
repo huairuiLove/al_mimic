@@ -91,13 +91,20 @@ def clear_device_matrix_cache() -> None:
 
 
 def warm_resident_matrices(
-    features: np.ndarray, labels: np.ndarray, device: torch.device, training: dict[str, Any]
+    features: np.ndarray,
+    labels: np.ndarray,
+    device: torch.device,
+    training: dict[str, Any],
+    *,
+    indices: np.ndarray | None = None,
 ) -> None:
     """Upload feature/label tables once before the first timed AL round."""
     if not _use_gpu_resident(device, training):
         return
     _to_device_matrix(features, device)
     _to_device_matrix(labels, device)
+    if indices is not None:
+        _to_device_index(indices, device)
 
 
 def _to_device_index(values: np.ndarray, device: torch.device) -> torch.Tensor:
@@ -576,12 +583,12 @@ def _refresh_prototypes_from_cached(
         stop = min(start + eval_batch_size, count)
         fused = cached_features[start:stop]
         targets = cached_labels[start:stop]
-        latent = F.normalize(
-            comal(fused, compute_similarities=False, compute_reconstruction=False)[
-                "latent_features"
-            ].float(),
-            dim=-1,
-        )
+        latent_features = comal(fused, compute_similarities=False, compute_reconstruction=False)[
+            "latent_features"
+        ]
+        if latent_features.dtype != torch.float32:
+            latent_features = latent_features.float()
+        latent = F.normalize(latent_features, dim=-1)
         if latents is not None:
             latents[start:stop] = latent
         negative = 1.0 - targets
@@ -595,7 +602,10 @@ def _refresh_prototypes_from_cached(
     if latents is None:
         return cached_features.new_zeros((0, num_labels))
     # Own-sims must use the refreshed prototypes, not the pre-update buffers.
-    return torch.einsum("nld,ld->nl", latents, comal.prototypes[:-1].float())
+    prototypes = comal.prototypes[:-1]
+    if prototypes.dtype != torch.float32:
+        prototypes = prototypes.float()
+    return torch.einsum("nld,ld->nl", latents, prototypes)
 
 
 @torch.inference_mode()
@@ -621,12 +631,12 @@ def _refresh_prototypes_tensors(
         inputs = selected_features[start:stop]
         targets = selected_labels[start:stop]
         fused = classifier(inputs)["features"]
-        latent = F.normalize(
-            comal(fused, compute_similarities=False, compute_reconstruction=False)[
-                "latent_features"
-            ].float(),
-            dim=-1,
-        )
+        latent_features = comal(fused, compute_similarities=False, compute_reconstruction=False)[
+            "latent_features"
+        ]
+        if latent_features.dtype != torch.float32:
+            latent_features = latent_features.float()
+        latent = F.normalize(latent_features, dim=-1)
         negative = 1.0 - targets
         sums[:-1] += torch.einsum("bl,bld->ld", targets, latent)
         counts[:-1] += targets.sum(dim=0)
@@ -673,12 +683,12 @@ def refresh_prototypes(
         inputs = batch["features"].to(device, non_blocking=True)
         targets = batch["labels"].to(device, non_blocking=True)
         fused = classifier(inputs)["features"]
-        latent = F.normalize(
-            comal(fused, compute_similarities=False, compute_reconstruction=False)[
-                "latent_features"
-            ].float(),
-            dim=-1,
-        )
+        latent_features = comal(fused, compute_similarities=False, compute_reconstruction=False)[
+            "latent_features"
+        ]
+        if latent_features.dtype != torch.float32:
+            latent_features = latent_features.float()
+        latent = F.normalize(latent_features, dim=-1)
         negative = 1.0 - targets
         sums[:-1] += torch.einsum("bl,bld->ld", targets, latent)
         counts[:-1] += targets.sum(dim=0)
