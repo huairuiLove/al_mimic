@@ -310,9 +310,12 @@ def train_round(
     timings: dict[str, float] = {}
     batch_size = int(training.get("batch_size", 512))
     grad_clip = float(training.get("gradient_clip", 5.0))
+    # Clipping every step forces a device sync; interval>1 amortizes that cost.
+    grad_clip_interval = max(1, int(training.get("gradient_clip_interval", 1)))
     start = time.perf_counter()
     classifier.train()
     classifier_epoch_losses: list[torch.Tensor] = []
+    global_step = 0
     if resident:
         assert labeled_features is not None and labeled_targets is not None
         for _ in range(int(training.get("epochs", 20))):
@@ -324,7 +327,8 @@ def train_round(
                     output = classifier(inputs)
                     loss = criterion(output["logits"], targets)
                 loss.backward()
-                if grad_clip > 0:
+                global_step += 1
+                if grad_clip > 0 and global_step % grad_clip_interval == 0:
                     torch.nn.utils.clip_grad_norm_(classifier.parameters(), grad_clip)
                 optimizer.step()
                 epoch_loss = epoch_loss + loss.detach()
@@ -350,7 +354,8 @@ def train_round(
                     output = classifier(inputs)
                     loss = criterion(output["logits"], targets)
                 loss.backward()
-                if grad_clip > 0:
+                global_step += 1
+                if grad_clip > 0 and global_step % grad_clip_interval == 0:
                     torch.nn.utils.clip_grad_norm_(classifier.parameters(), grad_clip)
                 optimizer.step()
                 losses.append(loss.detach())
@@ -398,6 +403,7 @@ def train_round(
         temperature = float(comal_cfg.get("temperature", 0.07))
         anchor_chunk = int(comal_cfg.get("anchor_chunk_size", 1024))
         comal_epoch_losses: list[torch.Tensor] = []
+        comal_step = 0
         for _ in range(int(training.get("comal_epochs", 10))):
             epoch_loss = cached_features.new_zeros(())
             steps = 0
@@ -416,7 +422,8 @@ def train_round(
                     reconstruction_bce = criterion(output["reconstructed_logits"], targets)
                     loss = contrastive + recon_w * reconstruction + clf_w * reconstruction_bce
                 loss.backward()
-                if grad_clip > 0:
+                comal_step += 1
+                if grad_clip > 0 and comal_step % grad_clip_interval == 0:
                     torch.nn.utils.clip_grad_norm_(comal.parameters(), grad_clip)
                 optimizer_comal.step()
                 epoch_loss = epoch_loss + loss.detach()
@@ -444,6 +451,7 @@ def train_round(
         clf_w = float(comal_cfg.get("classification_weight", 0.5))
         temperature = float(comal_cfg.get("temperature", 0.07))
         anchor_chunk = int(comal_cfg.get("anchor_chunk_size", 1024))
+        comal_step = 0
         for _ in range(int(training.get("comal_epochs", 10))):
             losses = []
             for batch in comal_loader:
@@ -465,7 +473,8 @@ def train_round(
                     reconstruction_bce = criterion(output["reconstructed_logits"], targets)
                     loss = contrastive + recon_w * reconstruction + clf_w * reconstruction_bce
                 loss.backward()
-                if grad_clip > 0:
+                comal_step += 1
+                if grad_clip > 0 and comal_step % grad_clip_interval == 0:
                     torch.nn.utils.clip_grad_norm_(comal.parameters(), grad_clip)
                 optimizer_comal.step()
                 losses.append(loss.detach())
