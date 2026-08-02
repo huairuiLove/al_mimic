@@ -126,7 +126,7 @@ def _shuffled_slices(
     labels: torch.Tensor,
     batch_size: int,
 ) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
-    """Permute once, then emit contiguous row slices (faster than scattered index_select)."""
+    """Shuffle via index batches without cloning the full feature/label tables."""
     count = int(features.shape[0])
     if count == 0:
         return
@@ -134,11 +134,10 @@ def _shuffled_slices(
         yield features, labels
         return
     perm = torch.randperm(count, device=features.device)
-    ordered_x = features[perm]
-    ordered_y = labels[perm]
     for start in range(0, count, batch_size):
         stop = min(start + batch_size, count)
-        yield ordered_x[start:stop], ordered_y[start:stop]
+        batch_index = perm[start:stop]
+        yield features.index_select(0, batch_index), labels.index_select(0, batch_index)
 
 
 def _autocast(device: torch.device, precision: str):
