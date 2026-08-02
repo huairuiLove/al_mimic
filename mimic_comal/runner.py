@@ -245,7 +245,8 @@ class ActiveLearningExperiment:
                 similarity_mode="full" if not will_query else "own_bg",
             )
             # Kick off pinned D2H on a side stream before acquisition predict.
-            host_keys = ["indices", "labels", "probabilities"]
+            # Indices are unused on host (metrics/diagnostics/npz only need labels/probs/sims).
+            host_keys = ["labels", "probabilities"]
             if not will_query:
                 host_keys.append("prototype_similarities")
             validation_host = {
