@@ -1,0 +1,47 @@
+extends: mimic_comal.yaml
+
+# Tuned for this host: NVIDIA A800-SXM4-80GB + cgroup CPU quota of 18 cores.
+# Physical topology may report 144 logical CPUs; oversubscribing past the quota
+# only thrash-schedules and lowers sustained throughput.
+
+experiment:
+  name: mimic_iii_comal_a800
+
+dataset:
+  feature_dir: prepared/mimic_iii/features_bert
+
+features:
+  encoder: bert
+  model_path: CoMAL-main/bert/bert-base-uncased
+  local_files_only: true
+  max_length: 256
+  # Inference-only BF16 encode on 80GB; raise in steps of 32 if util is still low.
+  batch_size: 384
+  precision: bf16
+  device: cuda
+
+training:
+  device: cuda
+  # A800 executes FP32 matmuls through TF32. BF16 is reserved for one-time BERT encoding.
+  precision: fp32
+  allow_tf32: true
+  cudnn_benchmark: true
+  gpu_resident_features: true
+  # Keep the whole 51k embedding table on GPU (~150 MiB at 768-d) and index in-place.
+  batch_size: 16384
+  eval_batch_size: 32768
+  # Contrastive cost grows with (batch * labels)^2; chunked anchors keep this safe on 80GB.
+  comal_batch_size: 96
+  # Resident tensors remove DataLoader from the hot path; workers would only steal the 18-core quota.
+  num_workers: 0
+  persistent_workers: false
+  prefetch_factor: 2
+  pin_memory: true
+  cpu_threads: 18
+  interop_threads: 2
+
+comal:
+  anchor_chunk_size: 2048
+
+active_learning:
+  candidate_size: 40960
