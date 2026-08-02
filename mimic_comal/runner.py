@@ -224,6 +224,7 @@ class ActiveLearningExperiment:
                 eval_tensors = {name: value[:eval_end] for name, value in fused.items()}
                 pool_tensors = {name: value[eval_end:] for name, value in fused.items()}
             else:
+                # Final round: similarities cover diagnostics; skip latent buffers.
                 eval_tensors = predict_tensors(
                     trained,
                     self.features,
@@ -231,7 +232,7 @@ class ActiveLearningExperiment:
                     eval_indices,
                     self.config,
                     self.device,
-                    return_latents=True,
+                    return_latents=False,
                 )
             metric_keys = ("indices", "labels", "probabilities", "prototype_similarities")
             # Overlap host copies; one sync before .numpy().
