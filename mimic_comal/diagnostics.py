@@ -117,11 +117,18 @@ def build_round_diagnostics(
     positives = labels.sum(axis=0)
     rare_threshold = max(5, int(np.quantile(positives, 0.25)))
     rare: dict[str, Any] = {}
-    for index, name in enumerate(label_names):
-        if positives[index] <= rare_threshold and np.unique(labels[:, index]).size == 2:
-            rare[name] = {
+    # One sklearn call over the rare multi-class columns instead of a Python loop.
+    usable = (positives <= rare_threshold) & (labels.max(axis=0) != labels.min(axis=0))
+    rare_indices = np.flatnonzero(usable)
+    if rare_indices.size:
+        scores = average_precision_score(
+            labels[:, rare_indices], probabilities[:, rare_indices], average=None
+        )
+        scores = np.atleast_1d(np.asarray(scores, dtype=np.float64))
+        for offset, index in enumerate(rare_indices):
+            rare[label_names[int(index)]] = {
                 "positives": int(positives[index]),
-                "auprc": float(average_precision_score(labels[:, index], probabilities[:, index])),
+                "auprc": float(scores[offset]),
             }
     report["rare_label_diagnostics"] = {"threshold": rare_threshold, "labels": rare}
     return report
