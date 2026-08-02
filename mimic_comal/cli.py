@@ -7,12 +7,7 @@ import json
 from pathlib import Path
 
 from .config import load_config
-from .data import audit_records, load_records, prepare_mimic
-from .features import build_features
-from .integrity import assert_original_unchanged
-from .runner import ActiveLearningExperiment
 from .runtime import configure_runtime, hardware_report
-from .visualization import explore_dataset, visualize_experiment
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -52,6 +47,9 @@ def _apply_overrides(config: dict, args: argparse.Namespace) -> None:
 
 
 def _validate(config: dict) -> dict:
+    from .data import audit_records, load_records
+    from .integrity import assert_original_unchanged
+
     prepared = Path(config.get("dataset", {}).get("prepared_dir", "prepared/mimic_iii"))
     records = load_records(prepared)
     labels = tuple(json.loads((prepared / "labels.json").read_text(encoding="utf-8"))["labels"])
@@ -73,25 +71,40 @@ def main() -> None:
     _apply_overrides(config, args)
     configure_runtime(config)
     command = args.command
-    if command == "prepare":
+    if command == "hardware":
+        result = hardware_report(config)
+    elif command == "prepare":
+        from .data import prepare_mimic
+
         result = prepare_mimic(config)
     elif command == "validate-data":
         result = _validate(config)
     elif command == "explore":
+        from .visualization import explore_dataset
+
         result = explore_dataset(config)
     elif command == "features":
+        from .features import build_features
+
         result = build_features(config)
     elif command == "active":
+        from .runner import ActiveLearningExperiment
+
         result = ActiveLearningExperiment(config).run()
     elif command == "visualize":
+        from .visualization import visualize_experiment
+
         experiment = config.get("experiment", {})
         directory = args.experiment_dir or str(
             Path(experiment.get("output_root", "experiments")) / str(experiment.get("name", "mimic_comal"))
         )
         result = visualize_experiment(directory)
-    elif command == "hardware":
-        result = hardware_report(config)
     else:
+        from .data import prepare_mimic
+        from .features import build_features
+        from .runner import ActiveLearningExperiment
+        from .visualization import explore_dataset, visualize_experiment
+
         result = {"prepare": prepare_mimic(config)}
         result["validation"] = _validate(config)
         result["exploration"] = explore_dataset(config)

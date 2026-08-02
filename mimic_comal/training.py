@@ -23,9 +23,11 @@ def label_matrix(records: list[MIMICRecord], label_names: tuple[str, ...]) -> np
     positions = {label: index for index, label in enumerate(label_names)}
     values = np.zeros((len(records), len(label_names)), dtype=np.float32)
     for row, record in enumerate(records):
-        for label in record.labels:
-            if label in positions:
-                values[row, positions[label]] = 1.0
+        if not record.labels:
+            continue
+        columns = [positions[label] for label in record.labels if label in positions]
+        if columns:
+            values[row, columns] = 1.0
     return values
 
 
@@ -78,22 +80,28 @@ def _use_gpu_resident(device: torch.device, training: dict[str, Any]) -> bool:
 _DEVICE_MATRIX_CACHE: dict[tuple[int, int, str, str], torch.Tensor] = {}
 
 
+def clear_device_matrix_cache() -> None:
+    _DEVICE_MATRIX_CACHE.clear()
+
+
 def _to_device_matrix(
     values: np.ndarray, device: torch.device, *, dtype: torch.dtype = torch.float32
 ) -> torch.Tensor:
-    cache_key = (id(values), values.shape[0], str(device), str(dtype))
+    cache_key = (id(values), int(values.shape[0]), str(device), str(dtype))
     cached = _DEVICE_MATRIX_CACHE.get(cache_key)
-    if cached is not None and cached.device == device:
+    if cached is not None and cached.device == device and cached.shape[0] == values.shape[0]:
         return cached
     array = np.asarray(values)
-    if array.dtype != np.float32:
-        array = array.astype(np.float32, copy=False)
-    tensor = torch.from_numpy(np.ascontiguousarray(array))
-    tensor = tensor.to(device=device, dtype=dtype, non_blocking=True)
+    if not array.flags["C_CONTIGUOUS"] or array.dtype != np.float32:
+        array = np.ascontiguousarray(array, dtype=np.float32)
+    host = torch.from_numpy(array)
     if device.type == "cuda":
+        host = host.pin_memory()
+        tensor = host.to(device=device, dtype=dtype, non_blocking=True)
         torch.cuda.current_stream().synchronize()
         _DEVICE_MATRIX_CACHE[cache_key] = tensor
-    return tensor
+        return tensor
+    return host.to(dtype=dtype)
 
 
 def _index_batches(
@@ -118,7 +126,8 @@ def _autocast(device: torch.device, precision: str):
 
 def _pos_weight(labels: np.ndarray | torch.Tensor, indices: np.ndarray | torch.Tensor, maximum: float) -> torch.Tensor:
     if isinstance(labels, torch.Tensor):
-        selected = labels.index_select(0, indices if isinstance(indices, torch.Tensor) else torch.as_tensor(indices))
+        index_tensor = indices if isinstance(indices, torch.Tensor) else torch.as_tensor(indices, device=labels.device)
+        selected = labels.index_select(0, index_tensor)
         positives = selected.sum(dim=0)
         negatives = selected.shape[0] - positives
         weights = negatives / positives.clamp_min(1.0)
@@ -127,6 +136,18 @@ def _pos_weight(labels: np.ndarray | torch.Tensor, indices: np.ndarray | torch.T
     positives = selected.sum(axis=0)
     negatives = len(selected) - positives
     return torch.from_numpy(np.clip(negatives / np.maximum(positives, 1.0), 1.0, maximum).astype(np.float32))
+
+
+def _maybe_compile(module: nn.Module, enabled: bool) -> nn.Module:
+    if not enabled or not hasattr(torch, "compile"):
+        return module
+    try:
+        return torch.compile(module, mode="max-autotune-no-cudagraphs")  # type: ignore[return-value]
+    except Exception:
+        try:
+            return torch.compile(module, mode="reduce-overhead")  # type: ignore[return-value]
+        except Exception:
+            return module
 
 
 @dataclass
@@ -142,6 +163,7 @@ def build_modules(
 ) -> tuple[TextMLPClassifier, CoMALModule]:
     model_cfg = config.get("model", {})
     comal_cfg = config.get("comal", {})
+    training = config.get("training", {})
     hidden = tuple(int(value) for value in model_cfg.get("hidden_dims", [512, 256]))
     if len(hidden) != 2:
         raise ValueError("model.hidden_dims must contain exactly two dimensions")
@@ -154,7 +176,25 @@ def build_modules(
         int(comal_cfg.get("label_dim", 64)),
         int(comal_cfg.get("prototype_dim", 64)),
     ).to(device)
+    if device.type == "cuda" and bool(training.get("torch_compile", False)):
+        classifier = _maybe_compile(classifier, True)  # type: ignore[assignment]
+        comal = _maybe_compile(comal, True)  # type: ignore[assignment]
     return classifier, comal
+
+
+@torch.inference_mode()
+def _cache_classifier_features(
+    classifier: TextMLPClassifier,
+    feature_tensor: torch.Tensor,
+    index_tensor: torch.Tensor,
+    eval_batch_size: int,
+) -> torch.Tensor:
+    """Frozen-classifier features for the labeled pool; avoids re-encoding each CoMAL step."""
+    chunks: list[torch.Tensor] = []
+    classifier.eval()
+    for batch_index in _index_batches(index_tensor, eval_batch_size, shuffle=False):
+        chunks.append(classifier(feature_tensor.index_select(0, batch_index))["features"])
+    return torch.cat(chunks, dim=0) if chunks else feature_tensor.new_zeros((0, classifier.feature_dim))
 
 
 def train_round(
@@ -179,10 +219,14 @@ def train_round(
         raise ValueError("training.precision must be bf16, fp16, or fp32")
 
     resident = _use_gpu_resident(device, training)
+    labeled_features: torch.Tensor | None = None
+    labeled_targets: torch.Tensor | None = None
     if resident:
         feature_tensor = _to_device_matrix(features, device)
         label_tensor = _to_device_matrix(labels, device)
         index_tensor = torch.as_tensor(indices, device=device, dtype=torch.long)
+        labeled_features = feature_tensor.index_select(0, index_tensor).contiguous()
+        labeled_targets = label_tensor.index_select(0, index_tensor).contiguous()
         criterion = nn.BCEWithLogitsLoss(
             pos_weight=_pos_weight(label_tensor, index_tensor, float(training.get("maximum_pos_weight", 20)))
         )
@@ -194,32 +238,56 @@ def train_round(
             pos_weight=_pos_weight(labels, indices, float(training.get("maximum_pos_weight", 20))).to(device)
         )
 
-    optimizer = AdamW(
-        classifier.parameters(),
-        lr=float(training.get("learning_rate", 1e-3)),
-        weight_decay=float(training.get("weight_decay", 1e-4)),
-    )
+    optimizer_kwargs: dict[str, Any] = {
+        "lr": float(training.get("learning_rate", 1e-3)),
+        "weight_decay": float(training.get("weight_decay", 1e-4)),
+    }
+    if device.type == "cuda" and bool(training.get("fused_optimizer", True)):
+        optimizer_kwargs["fused"] = True
+    else:
+        optimizer_kwargs["foreach"] = True
+    try:
+        optimizer = AdamW(classifier.parameters(), **optimizer_kwargs)
+    except (TypeError, RuntimeError):
+        optimizer_kwargs.pop("fused", None)
+        optimizer_kwargs.pop("foreach", None)
+        optimizer = AdamW(classifier.parameters(), **optimizer_kwargs)
     history: dict[str, list[float]] = {"classifier_loss": [], "comal_loss": []}
     timings: dict[str, float] = {}
     batch_size = int(training.get("batch_size", 512))
+    grad_clip = float(training.get("gradient_clip", 5.0))
     start = time.perf_counter()
     classifier.train()
     if resident:
-        assert feature_tensor is not None and label_tensor is not None and index_tensor is not None
+        assert labeled_features is not None and labeled_targets is not None
+        local_indices = torch.arange(labeled_features.shape[0], device=device, dtype=torch.long)
+        full_batch = batch_size >= int(labeled_features.shape[0])
         for _ in range(int(training.get("epochs", 20))):
-            losses: list[float] = []
-            for batch_index in _index_batches(index_tensor, batch_size, shuffle=True):
-                inputs = feature_tensor.index_select(0, batch_index)
-                targets = label_tensor.index_select(0, batch_index)
+            if full_batch:
                 optimizer.zero_grad(set_to_none=True)
                 with _autocast(device, precision):
-                    output = classifier(inputs)
-                    loss = criterion(output["logits"], targets)
+                    output = classifier(labeled_features)
+                    loss = criterion(output["logits"], labeled_targets)
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(classifier.parameters(), float(training.get("gradient_clip", 5.0)))
+                torch.nn.utils.clip_grad_norm_(classifier.parameters(), grad_clip)
                 optimizer.step()
-                losses.append(float(loss.detach()))
-            history["classifier_loss"].append(float(np.mean(losses)))
+                history["classifier_loss"].append(float(loss.detach().item()))
+            else:
+                epoch_loss = labeled_features.new_zeros(())
+                steps = 0
+                for batch_index in _index_batches(local_indices, batch_size, shuffle=True):
+                    inputs = labeled_features.index_select(0, batch_index)
+                    targets = labeled_targets.index_select(0, batch_index)
+                    optimizer.zero_grad(set_to_none=True)
+                    with _autocast(device, precision):
+                        output = classifier(inputs)
+                        loss = criterion(output["logits"], targets)
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(classifier.parameters(), grad_clip)
+                    optimizer.step()
+                    epoch_loss = epoch_loss + loss.detach()
+                    steps += 1
+                history["classifier_loss"].append(float(epoch_loss.item() / max(steps, 1)))
     else:
         classifier_loader = build_loader(
             features,
@@ -239,7 +307,7 @@ def train_round(
                     output = classifier(inputs)
                     loss = criterion(output["logits"], targets)
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(classifier.parameters(), float(training.get("gradient_clip", 5.0)))
+                torch.nn.utils.clip_grad_norm_(classifier.parameters(), grad_clip)
                 optimizer.step()
                 losses.append(float(loss.detach().cpu()))
             history["classifier_loss"].append(float(np.mean(losses)))
@@ -252,35 +320,49 @@ def train_round(
     for parameter in classifier.parameters():
         parameter.requires_grad_(False)
     comal_cfg = config.get("comal", {})
-    optimizer_comal = AdamW(
-        comal.parameters(),
-        lr=float(comal_cfg.get("learning_rate", 1e-3)),
-        weight_decay=float(training.get("weight_decay", 1e-4)),
-    )
+    try:
+        optimizer_comal = AdamW(
+            comal.parameters(),
+            lr=float(comal_cfg.get("learning_rate", 1e-3)),
+            weight_decay=float(training.get("weight_decay", 1e-4)),
+            fused=bool(device.type == "cuda" and training.get("fused_optimizer", True)),
+        )
+    except TypeError:
+        optimizer_comal = AdamW(
+            comal.parameters(),
+            lr=float(comal_cfg.get("learning_rate", 1e-3)),
+            weight_decay=float(training.get("weight_decay", 1e-4)),
+        )
     comal_batch_size = int(training.get("comal_batch_size", 32))
     start = time.perf_counter()
     comal.train()
     if resident:
-        assert feature_tensor is not None and label_tensor is not None and index_tensor is not None
+        assert labeled_features is not None and labeled_targets is not None
+        # Classifier is frozen: encode labeled pool once, then train CoMAL on cached fused features.
+        cached_features = _cache_classifier_features(
+            classifier,
+            labeled_features,
+            torch.arange(labeled_features.shape[0], device=device, dtype=torch.long),
+            int(training.get("eval_batch_size", 1024)),
+        )
+        cached_labels = labeled_targets
+        local_indices = torch.arange(cached_features.shape[0], device=device, dtype=torch.long)
         for _ in range(int(training.get("comal_epochs", 10))):
-            losses = []
-            for batch_index in _index_batches(index_tensor, comal_batch_size, shuffle=True):
-                inputs = feature_tensor.index_select(0, batch_index)
-                targets = label_tensor.index_select(0, batch_index)
+            epoch_loss = cached_features.new_zeros(())
+            steps = 0
+            for batch_index in _index_batches(local_indices, comal_batch_size, shuffle=True):
+                fused = cached_features.index_select(0, batch_index)
+                targets = cached_labels.index_select(0, batch_index)
                 optimizer_comal.zero_grad(set_to_none=True)
-                with torch.no_grad():
-                    classifier_output = classifier(inputs)
                 with _autocast(device, precision):
-                    output = comal(classifier_output["features"].detach())
+                    output = comal(fused)
                     contrastive = supervised_contrastive_loss(
                         output["latent_features"],
                         targets,
                         temperature=float(comal_cfg.get("temperature", 0.07)),
                         anchor_chunk_size=int(comal_cfg.get("anchor_chunk_size", 1024)),
                     )
-                    reconstruction = F.mse_loss(
-                        output["reconstructed_features"], classifier_output["features"].detach()
-                    )
+                    reconstruction = F.mse_loss(output["reconstructed_features"], fused)
                     reconstruction_bce = criterion(output["reconstructed_logits"], targets)
                     loss = (
                         contrastive
@@ -288,10 +370,11 @@ def train_round(
                         + float(comal_cfg.get("classification_weight", 0.5)) * reconstruction_bce
                     )
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(comal.parameters(), float(training.get("gradient_clip", 5.0)))
+                torch.nn.utils.clip_grad_norm_(comal.parameters(), grad_clip)
                 optimizer_comal.step()
-                losses.append(float(loss.detach()))
-            history["comal_loss"].append(float(np.mean(losses)))
+                epoch_loss = epoch_loss + loss.detach()
+                steps += 1
+            history["comal_loss"].append(float(epoch_loss.item() / max(steps, 1)))
     else:
         comal_loader = build_loader(
             features,
@@ -309,17 +392,16 @@ def train_round(
                 optimizer_comal.zero_grad(set_to_none=True)
                 with torch.no_grad():
                     classifier_output = classifier(inputs)
+                fused = classifier_output["features"].detach()
                 with _autocast(device, precision):
-                    output = comal(classifier_output["features"].detach())
+                    output = comal(fused)
                     contrastive = supervised_contrastive_loss(
                         output["latent_features"],
                         targets,
                         temperature=float(comal_cfg.get("temperature", 0.07)),
                         anchor_chunk_size=int(comal_cfg.get("anchor_chunk_size", 1024)),
                     )
-                    reconstruction = F.mse_loss(
-                        output["reconstructed_features"], classifier_output["features"].detach()
-                    )
+                    reconstruction = F.mse_loss(output["reconstructed_features"], fused)
                     reconstruction_bce = criterion(output["reconstructed_logits"], targets)
                     loss = (
                         contrastive
@@ -327,7 +409,7 @@ def train_round(
                         + float(comal_cfg.get("classification_weight", 0.5)) * reconstruction_bce
                     )
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(comal.parameters(), float(training.get("gradient_clip", 5.0)))
+                torch.nn.utils.clip_grad_norm_(comal.parameters(), grad_clip)
                 optimizer_comal.step()
                 losses.append(float(loss.detach().cpu()))
             history["comal_loss"].append(float(np.mean(losses)))
@@ -341,7 +423,7 @@ def train_round(
             comal,
             feature_tensor,
             label_tensor,
-            torch.as_tensor(indices, device=device, dtype=torch.long),
+            index_tensor if index_tensor is not None else torch.as_tensor(indices, device=device, dtype=torch.long),
             int(training.get("eval_batch_size", 1024)),
         )
     else:
@@ -421,6 +503,89 @@ def refresh_prototypes(
 
 
 @torch.inference_mode()
+def predict_tensors(
+    trained: TrainedRound,
+    features: np.ndarray,
+    labels: np.ndarray,
+    indices: Iterable[int],
+    config: dict[str, Any],
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    """GPU-resident prediction path used by acquisition and evaluation."""
+    training = config.get("training", {})
+    index_array = np.asarray(list(indices), dtype=np.int64)
+    trained.classifier.eval()
+    trained.comal.eval()
+    num_labels = int(labels.shape[1])
+    prototype_dim = int(trained.comal.prototype_dim)
+    eval_batch = int(training.get("eval_batch_size", 1024))
+    if _use_gpu_resident(device, training) or device.type == "cuda":
+        feature_tensor = _to_device_matrix(features, device)
+        label_tensor = _to_device_matrix(labels, device)
+        index_tensor = torch.as_tensor(index_array, device=device, dtype=torch.long)
+        count = int(index_tensor.numel())
+        out_indices = torch.empty(count, dtype=torch.long, device=device)
+        out_labels = torch.empty(count, num_labels, dtype=label_tensor.dtype, device=device)
+        out_probs = torch.empty(count, num_labels, dtype=torch.float32, device=device)
+        out_latents = torch.empty(count, num_labels, prototype_dim, dtype=torch.float32, device=device)
+        out_similarities = torch.empty(
+            count, num_labels, num_labels + 1, dtype=torch.float32, device=device
+        )
+        cursor = 0
+        for batch_index in _index_batches(index_tensor, eval_batch, shuffle=False):
+            width = int(batch_index.numel())
+            inputs = feature_tensor.index_select(0, batch_index)
+            output = trained.classifier(inputs)
+            comal_output = trained.comal(output["features"])
+            out_indices[cursor : cursor + width] = batch_index
+            out_labels[cursor : cursor + width] = label_tensor.index_select(0, batch_index)
+            out_probs[cursor : cursor + width] = torch.sigmoid(output["logits"])
+            out_latents[cursor : cursor + width] = comal_output["latent_features"].float()
+            out_similarities[cursor : cursor + width] = comal_output["prototype_similarities"].float()
+            cursor += width
+        return {
+            "indices": out_indices,
+            "labels": out_labels,
+            "probabilities": out_probs,
+            "latents": out_latents,
+            "prototype_similarities": out_similarities,
+        }
+    loader = build_loader(
+        features,
+        labels,
+        index_array,
+        batch_size=eval_batch,
+        shuffle=False,
+        training=training,
+    )
+    index_parts = []
+    label_parts = []
+    prob_parts = []
+    latent_parts = []
+    similarity_parts = []
+    for batch in loader:
+        inputs = batch["features"].to(device, non_blocking=True)
+        output = trained.classifier(inputs)
+        comal_output = trained.comal(output["features"])
+        index_parts.append(batch["index"].to(device))
+        label_parts.append(batch["labels"].to(device))
+        prob_parts.append(torch.sigmoid(output["logits"]))
+        latent_parts.append(comal_output["latent_features"].float())
+        similarity_parts.append(comal_output["prototype_similarities"].float())
+    return {
+        "indices": torch.cat(index_parts) if index_parts else torch.empty(0, dtype=torch.long, device=device),
+        "labels": torch.cat(label_parts) if label_parts else torch.empty(0, num_labels, device=device),
+        "probabilities": torch.cat(prob_parts) if prob_parts else torch.empty(0, num_labels, device=device),
+        "latents": torch.cat(latent_parts)
+        if latent_parts
+        else torch.empty(0, num_labels, prototype_dim, device=device),
+        "prototype_similarities": torch.cat(similarity_parts)
+        if similarity_parts
+        else torch.empty(0, num_labels, num_labels + 1, device=device),
+    }
+
+
+@torch.inference_mode()
 def predict(
     trained: TrainedRound,
     features: np.ndarray,
@@ -429,43 +594,8 @@ def predict(
     config: dict[str, Any],
     device: torch.device,
 ) -> dict[str, np.ndarray]:
-    training = config.get("training", {})
-    index_array = np.asarray(list(indices), dtype=np.int64)
-    trained.classifier.eval()
-    trained.comal.eval()
-    values: dict[str, list[np.ndarray]] = {"indices": [], "labels": [], "probabilities": [], "latents": []}
-    if _use_gpu_resident(device, training):
-        feature_tensor = _to_device_matrix(features, device)
-        label_tensor = _to_device_matrix(labels, device)
-        index_tensor = torch.as_tensor(index_array, device=device, dtype=torch.long)
-        for batch_index in _index_batches(
-            index_tensor, int(training.get("eval_batch_size", 1024)), shuffle=False
-        ):
-            inputs = feature_tensor.index_select(0, batch_index)
-            output = trained.classifier(inputs)
-            comal_output = trained.comal(output["features"])
-            values["indices"].append(batch_index.detach().cpu().numpy())
-            values["labels"].append(label_tensor.index_select(0, batch_index).detach().cpu().numpy())
-            values["probabilities"].append(torch.sigmoid(output["logits"]).detach().cpu().numpy())
-            values["latents"].append(comal_output["latent_features"].float().detach().cpu().numpy())
-    else:
-        loader = build_loader(
-            features,
-            labels,
-            index_array,
-            batch_size=int(training.get("eval_batch_size", 1024)),
-            shuffle=False,
-            training=training,
-        )
-        for batch in loader:
-            inputs = batch["features"].to(device, non_blocking=True)
-            output = trained.classifier(inputs)
-            comal_output = trained.comal(output["features"])
-            values["indices"].append(batch["index"].numpy())
-            values["labels"].append(batch["labels"].numpy())
-            values["probabilities"].append(torch.sigmoid(output["logits"]).cpu().numpy())
-            values["latents"].append(comal_output["latent_features"].float().cpu().numpy())
-    return {name: np.concatenate(parts, axis=0) if parts else np.empty(0) for name, parts in values.items()}
+    tensors = predict_tensors(trained, features, labels, indices, config, device)
+    return {name: value.detach().cpu().numpy() for name, value in tensors.items()}
 
 
 def evaluate(

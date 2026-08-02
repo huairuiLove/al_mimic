@@ -17,6 +17,8 @@ from .training import label_matrix
 
 
 COLORS = ("#287271", "#d9895b", "#5b6f9c", "#b35c44")
+# Diagnostics plots prioritize throughput over print DPI.
+_SAVE_DPI = 140
 
 
 def _write_json(path: Path, payload: Any) -> None:
@@ -44,7 +46,7 @@ def explore_dataset(config: dict[str, Any], output_dir: str | Path | None = None
     axis.grid(axis="x", alpha=0.2)
     fig.tight_layout()
     files["label_prevalence"] = "label_prevalence.png"
-    fig.savefig(output / files["label_prevalence"], dpi=180)
+    fig.savefig(output / files["label_prevalence"], dpi=_SAVE_DPI)
     plt.close(fig)
 
     cardinality = labels.sum(axis=1).astype(int)
@@ -55,7 +57,7 @@ def explore_dataset(config: dict[str, Any], output_dir: str | Path | None = None
     axis.grid(axis="y", alpha=0.2)
     fig.tight_layout()
     files["cardinality"] = "label_cardinality.png"
-    fig.savefig(output / files["cardinality"], dpi=180)
+    fig.savefig(output / files["cardinality"], dpi=_SAVE_DPI)
     plt.close(fig)
 
     top = np.argsort(-positives)[: min(25, len(label_names))]
@@ -71,7 +73,7 @@ def explore_dataset(config: dict[str, Any], output_dir: str | Path | None = None
     fig.colorbar(image, ax=axis, label="cosine")
     fig.tight_layout()
     files["cooccurrence"] = "label_cooccurrence.png"
-    fig.savefig(output / files["cooccurrence"], dpi=180)
+    fig.savefig(output / files["cooccurrence"], dpi=_SAVE_DPI)
     plt.close(fig)
 
     batches = np.asarray([4, 8, 16, 32, 64, 128])
@@ -86,7 +88,7 @@ def explore_dataset(config: dict[str, Any], output_dir: str | Path | None = None
     axis.legend()
     fig.tight_layout()
     files["method_scaling"] = "comal_memory_scaling.png"
-    fig.savefig(output / files["method_scaling"], dpi=180)
+    fig.savefig(output / files["method_scaling"], dpi=_SAVE_DPI)
     plt.close(fig)
 
     audit = audit_records(records, label_names)
@@ -140,7 +142,7 @@ def visualize_experiment(experiment_dir: str | Path, output_dir: str | Path | No
         axes[index].legend()
     fig.tight_layout()
     files["learning_curve"] = "learning_curves.png"
-    fig.savefig(output / files["learning_curve"], dpi=180)
+    fig.savefig(output / files["learning_curve"], dpi=_SAVE_DPI)
     plt.close(fig)
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.4))
@@ -155,7 +157,7 @@ def visualize_experiment(experiment_dir: str | Path, output_dir: str | Path | No
         axes[1].legend(ncol=2)
     fig.tight_layout()
     files["losses"] = "training_losses.png"
-    fig.savefig(output / files["losses"], dpi=180)
+    fig.savefig(output / files["losses"], dpi=_SAVE_DPI)
     plt.close(fig)
 
     classifier_time = [record["timing"]["classifier_training_sec"] for record in records]
@@ -168,7 +170,7 @@ def visualize_experiment(experiment_dir: str | Path, output_dir: str | Path | No
     axis.grid(axis="y", alpha=0.2)
     fig.tight_layout()
     files["timing"] = "round_timing.png"
-    fig.savefig(output / files["timing"], dpi=180)
+    fig.savefig(output / files["timing"], dpi=_SAVE_DPI)
     plt.close(fig)
 
     test_labels = prediction["test_labels"]
@@ -192,7 +194,7 @@ def visualize_experiment(experiment_dir: str | Path, output_dir: str | Path | No
     axis.grid(axis="x", alpha=0.2)
     fig.tight_layout()
     files["per_label"] = "test_per_label_auprc.png"
-    fig.savefig(output / files["per_label"], dpi=180)
+    fig.savefig(output / files["per_label"], dpi=_SAVE_DPI)
     plt.close(fig)
 
     report = {"experiment": str(experiment), "output_dir": str(output), "files": files}
@@ -220,7 +222,7 @@ def compare_experiments(
     fig.tight_layout()
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output, dpi=180)
+    fig.savefig(output, dpi=_SAVE_DPI)
     plt.close(fig)
     report = {"figure": str(output), "curves": curves}
     _write_json(output.with_suffix(".json"), report)

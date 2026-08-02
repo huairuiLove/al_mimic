@@ -19,6 +19,8 @@ def test_comal_shapes_and_loss_are_finite() -> None:
     loss = supervised_contrastive_loss(output["latent_features"], labels, anchor_chunk_size=7)
     assert output["latent_features"].shape == (8, 4, 5)
     assert output["reconstructed_logits"].shape == (8, 4)
+    assert output["prototype_similarities"].shape == (8, 4, 5)
+    assert torch.isfinite(output["prototype_similarities"]).all()
     assert torch.isfinite(loss)
 
 

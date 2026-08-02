@@ -14,14 +14,15 @@ class TextMLPClassifier(nn.Module):
 
     def __init__(self, input_dim: int, num_labels: int, hidden_dims: tuple[int, int], dropout: float) -> None:
         super().__init__()
+        drop: nn.Module = nn.Identity() if float(dropout) <= 0.0 else nn.Dropout(dropout)
         self.backbone = nn.Sequential(
             nn.LayerNorm(input_dim),
             nn.Linear(input_dim, hidden_dims[0]),
             nn.GELU(),
-            nn.Dropout(dropout),
+            drop,
             nn.Linear(hidden_dims[0], hidden_dims[1]),
             nn.GELU(),
-            nn.Dropout(dropout),
+            nn.Identity() if float(dropout) <= 0.0 else nn.Dropout(dropout),
         )
         self.classifier = nn.Linear(hidden_dims[1], num_labels)
         self.feature_dim = hidden_dims[1]
@@ -70,6 +71,7 @@ class CoMALModule(nn.Module):
         decoded = self.from_latent(latent).reshape(batch, -1)
         reconstructed = self.aggregate(decoded)
         reconstructed_logits = self.reconstruction_classifier(reconstructed)
+        # Prototype similarities are part of the evaluation surface; always compute.
         similarities = F.normalize(latent, dim=-1) @ self.prototypes.T
         return {
             "latent_features": latent,
@@ -85,6 +87,34 @@ class CoMALModule(nn.Module):
         self.prototype_counts.copy_(counts)
 
 
+def _contrastive_chunk(
+    flat: torch.Tensor,
+    class_ids: torch.Tensor,
+    start: int,
+    stop: int,
+    temperature: float,
+) -> tuple[torch.Tensor, int]:
+    chunk = flat[start:stop]
+    logits = (chunk @ flat.T).div_(temperature)
+    logits = logits - logits.max(dim=1, keepdim=True).values.detach()
+    positive = class_ids[start:stop, None].eq(class_ids[None, :])
+    eye = torch.arange(stop - start, device=flat.device)
+    self_columns = start + eye
+    positive = positive.clone()
+    positive[eye, self_columns] = False
+    valid = torch.ones_like(positive)
+    valid[eye, self_columns] = False
+    denom = torch.logsumexp(logits.masked_fill(~valid, -torch.inf), dim=1, keepdim=True)
+    log_prob = logits - denom
+    counts = positive.sum(dim=1)
+    active = counts > 0
+    if not active.any():
+        return flat.new_zeros(()), 0
+    per_anchor = -(log_prob.masked_fill(~positive, 0).sum(dim=1) / counts.clamp_min(1))
+    selected = per_anchor[active]
+    return selected.sum(), int(selected.numel())
+
+
 def supervised_contrastive_loss(
     features: torch.Tensor,
     labels: torch.Tensor,
@@ -95,28 +125,26 @@ def supervised_contrastive_loss(
     """Memory-bounded CoMAL positive/shared-negative contrastive loss."""
     if features.ndim != 3 or labels.shape != features.shape[:2]:
         raise ValueError("expected latent features [B,L,D] and labels [B,L]")
-    batch_size, num_labels, feature_dim = features.shape
-    flat = F.normalize(features, dim=-1).reshape(batch_size * num_labels, feature_dim)
+    batch_size, num_labels, _feature_dim = features.shape
+    flat = F.normalize(features, dim=-1).reshape(batch_size * num_labels, features.shape[-1])
     label_ids = torch.arange(num_labels, device=labels.device).expand(batch_size, -1)
     class_ids = torch.where(labels >= 0.5, label_ids, num_labels).reshape(-1)
     total = flat.shape[0]
-    losses: list[torch.Tensor] = []
-    for start in range(0, total, anchor_chunk_size):
-        stop = min(start + anchor_chunk_size, total)
-        logits = flat[start:stop] @ flat.T / max(temperature, 1e-6)
-        logits = logits - logits.max(dim=1, keepdim=True).values.detach()
-        positive = class_ids[start:stop, None].eq(class_ids[None, :])
-        rows = torch.arange(stop - start, device=features.device)
-        columns = torch.arange(start, stop, device=features.device)
-        valid = torch.ones_like(positive, dtype=torch.bool)
-        valid[rows, columns] = False
-        positive &= valid
-        log_prob = logits - torch.logsumexp(logits.masked_fill(~valid, -torch.inf), dim=1, keepdim=True)
-        counts = positive.sum(dim=1)
-        per_anchor = -(log_prob.masked_fill(~positive, 0).sum(dim=1) / counts.clamp_min(1))
-        losses.append(per_anchor[counts > 0])
-    valid_losses = [value for value in losses if value.numel()]
-    return torch.cat(valid_losses).mean() if valid_losses else features.sum() * 0
+    temperature = max(float(temperature), 1e-6)
+    # Prefer one full pairwise GEMM when it fits; chunking is only a memory guard.
+    bytes_needed = total * total * flat.element_size()
+    max_full_bytes = 2 * 1024**3 if flat.is_cuda else 512 * 1024**2
+    step = total if bytes_needed <= max_full_bytes else max(1, int(anchor_chunk_size))
+    loss_sum = flat.new_zeros(())
+    loss_count = 0
+    for start in range(0, total, step):
+        stop = min(start + step, total)
+        part_sum, part_count = _contrastive_chunk(flat, class_ids, start, stop, temperature)
+        loss_sum = loss_sum + part_sum
+        loss_count += part_count
+    if loss_count == 0:
+        return features.sum() * 0
+    return loss_sum / loss_count
 
 
 @dataclass(frozen=True)
@@ -147,10 +175,16 @@ def positive_similarity_thresholds(
         F.normalize(latent_features.float(), dim=-1),
         F.normalize(prototypes[: labels.shape[1]].float(), dim=-1),
     )
+    positive_mask = labels >= 0.5
+    # Vectorized per-label min/max over masked positions; empty labels stay 0.
+    large = torch.finfo(own_similarity.dtype).max
+    masked_min = own_similarity.masked_fill(~positive_mask, large)
+    masked_max = own_similarity.masked_fill(~positive_mask, -large)
+    minima = masked_min.min(dim=0).values
+    maxima = masked_max.max(dim=0).values
+    has_positive = positive_mask.any(dim=0)
     thresholds = torch.zeros(labels.shape[1], dtype=own_similarity.dtype, device=own_similarity.device)
-    for label_index in range(labels.shape[1]):
-        values = own_similarity[labels[:, label_index] >= 0.5, label_index]
-        thresholds[label_index] = (values.min() + values.max()) * 0.5 if values.numel() else 0.0
+    thresholds = torch.where(has_positive, (minima + maxima) * 0.5, thresholds)
     return thresholds
 
 

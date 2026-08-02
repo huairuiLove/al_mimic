@@ -21,7 +21,8 @@ from .model import (
     paper_comal_acquisition_scores,
     positive_similarity_thresholds,
 )
-from .training import TrainedRound, evaluate, label_matrix, predict, train_round
+from .metrics import multilabel_metrics
+from .training import TrainedRound, label_matrix, predict_tensors, train_round
 
 
 def _write_json(path: Path, value: Any) -> None:
@@ -41,11 +42,12 @@ def _summary(values: np.ndarray) -> dict[str, float]:
 def _initial_indices(train_indices: np.ndarray, labels: np.ndarray, size: int, seed: int) -> list[int]:
     rng = random.Random(seed)
     selected: set[int] = set()
+    train_labels = labels[train_indices]
     # Match the original well-init option by seeding every supported label.
     for label in range(labels.shape[1]):
-        candidates = [int(index) for index in train_indices if labels[index, label] >= 0.5]
-        if candidates:
-            selected.add(rng.choice(candidates))
+        hits = train_indices[train_labels[:, label] >= 0.5]
+        if hits.size:
+            selected.add(int(hits[rng.randrange(int(hits.size))]))
     remaining = [int(index) for index in train_indices if int(index) not in selected]
     rng.shuffle(remaining)
     selected.update(remaining[: max(0, size - len(selected))])
@@ -108,6 +110,8 @@ class ActiveLearningExperiment:
         torch.manual_seed(self.seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(self.seed)
+            # Avoid allocator sync storms across many short AL rounds.
+            torch.cuda.empty_cache()
         train_indices = np.asarray(
             [index for index, record in enumerate(self.records) if record.split == "train"], dtype=np.int64
         )
@@ -129,6 +133,8 @@ class ActiveLearningExperiment:
         rounds = max(1, int(self.active_cfg.get("rounds", 5)))
         query_size = int(self.active_cfg.get("query_size", 1000))
         strategy = str(self.active_cfg.get("strategy", "comal")).lower()
+        labeled_mask = np.zeros(len(self.records), dtype=bool)
+        labeled_mask[np.asarray(labeled, dtype=np.int64)] = True
         for round_index in range(rounds):
             round_start = time.perf_counter()
             round_config = deepcopy(self.config)
@@ -149,13 +155,23 @@ class ActiveLearningExperiment:
                 self.device,
                 previous=previous,
             )
-            validation_metrics, validation_prediction = evaluate(
-                trained, self.features, self.labels, validation_indices, self.config, self.device
+            # One fused forward over val+test cuts a full resident scan per round.
+            eval_indices = np.concatenate([validation_indices, test_indices])
+            eval_tensors = predict_tensors(
+                trained, self.features, self.labels, eval_indices, self.config, self.device
             )
-            test_metrics, test_prediction = evaluate(
-                trained, self.features, self.labels, test_indices, self.config, self.device
+            eval_np = {name: value.detach().cpu().numpy() for name, value in eval_tensors.items()}
+            split = int(validation_indices.size)
+            validation_prediction = {name: value[:split] for name, value in eval_np.items()}
+            test_prediction = {name: value[split:] for name, value in eval_np.items()}
+            threshold = float(self.training_cfg.get("threshold", 0.5))
+            validation_metrics = multilabel_metrics(
+                validation_prediction["labels"], validation_prediction["probabilities"], threshold
             )
-            unlabeled = np.asarray(sorted(set(train_indices.tolist()) - set(labeled)), dtype=np.int64)
+            test_metrics = multilabel_metrics(
+                test_prediction["labels"], test_prediction["probabilities"], threshold
+            )
+            unlabeled = train_indices[~labeled_mask[train_indices]]
             queries: list[int] = []
             acquisition: dict[str, Any] = {}
             diagnostics_prediction = validation_prediction
@@ -169,31 +185,41 @@ class ActiveLearningExperiment:
                     if pool_size < unlabeled.size
                     else unlabeled
                 )
-                pool = predict(trained, self.features, self.labels, candidates, self.config, self.device)
+                score_tensor: torch.Tensor | None = None
                 if strategy == "random":
+                    pool_tensors = predict_tensors(
+                        trained, self.features, self.labels, candidates, self.config, self.device
+                    )
                     scores = rng.random(len(candidates))
                     components = {"combined": scores}
+                    pool = {name: value.detach().cpu().numpy() for name, value in pool_tensors.items()}
                 elif strategy == "comal":
                     expected_cardinality = float(self.labels[np.asarray(labeled)].sum(axis=1).mean())
                     cfg = self.config.get("acquisition", {})
                     formula = str(cfg.get("formula", "paper")).lower()
                     if formula == "paper":
-                        labeled_prediction = predict(
+                        # Fuse labeled+candidate encode into one resident scan, then split.
+                        labeled_array = np.asarray(labeled, dtype=np.int64)
+                        fused_indices = np.concatenate([labeled_array, candidates])
+                        fused = predict_tensors(
                             trained,
                             self.features,
                             self.labels,
-                            labeled,
+                            fused_indices,
                             self.config,
                             self.device,
                         )
+                        labeled_count = int(labeled_array.size)
+                        labeled_tensors = {name: value[:labeled_count] for name, value in fused.items()}
+                        pool_tensors = {name: value[labeled_count:] for name, value in fused.items()}
                         thresholds = positive_similarity_thresholds(
-                            torch.as_tensor(labeled_prediction["latents"], device=self.device),
-                            torch.as_tensor(labeled_prediction["labels"], device=self.device),
+                            labeled_tensors["latents"],
+                            labeled_tensors["labels"],
                             trained.comal.prototypes.detach(),
                         )
                         parts = paper_comal_acquisition_scores(
-                            torch.as_tensor(pool["probabilities"], device=self.device),
-                            torch.as_tensor(pool["latents"], device=self.device),
+                            pool_tensors["probabilities"],
+                            pool_tensors["latents"],
                             trained.comal.prototypes.detach(),
                             thresholds,
                             expected_cardinality=expected_cardinality,
@@ -205,9 +231,12 @@ class ActiveLearningExperiment:
                             "combined",
                         )
                     elif formula == "weighted":
+                        pool_tensors = predict_tensors(
+                            trained, self.features, self.labels, candidates, self.config, self.device
+                        )
                         parts = comal_acquisition_scores(
-                            torch.as_tensor(pool["probabilities"], device=self.device),
-                            torch.as_tensor(pool["latents"], device=self.device),
+                            pool_tensors["probabilities"],
+                            pool_tensors["latents"],
                             trained.comal.prototypes.detach(),
                             expected_cardinality=expected_cardinality,
                             uncertainty_weight=float(cfg.get("uncertainty_weight", 0.5)),
@@ -222,14 +251,27 @@ class ActiveLearningExperiment:
                         )
                     else:
                         raise ValueError("acquisition.formula must be paper or weighted")
+                    score_tensor = parts.combined.detach()
                     components = {
                         name: getattr(parts, name).detach().cpu().numpy() for name in component_names
                     }
                     scores = components["combined"]
+                    pool = {name: value.detach().cpu().numpy() for name, value in pool_tensors.items()}
                 else:
                     raise ValueError("active_learning.strategy must be comal or random")
                 count = min(query_size, len(candidates))
-                positions = np.argsort(-scores, kind="stable")[:count]
+                if score_tensor is not None and count < int(score_tensor.numel()):
+                    # Device top-k then stable reorder of the shortlist only.
+                    top_values, top_positions = torch.topk(score_tensor, k=count, largest=True, sorted=False)
+                    order = torch.argsort(top_values, descending=True, stable=True)
+                    positions = top_positions[order].detach().cpu().numpy()
+                else:
+                    score_array = np.asarray(scores)
+                    if count < score_array.size:
+                        part = np.argpartition(-score_array, count - 1)[:count]
+                        positions = part[np.argsort(-score_array[part], kind="stable")]
+                    else:
+                        positions = np.argsort(-score_array, kind="stable")
                 queries = [int(value) for value in pool["indices"][positions]]
                 acquisition = {
                     "candidate_count": int(len(candidates)),
@@ -248,6 +290,7 @@ class ActiveLearningExperiment:
                 trained.comal.prototypes,
                 self.label_names,
                 acquisition_scores=diagnostic_scores,
+                prototype_similarities=diagnostics_prediction.get("prototype_similarities"),
             )
             diagnostics["oracle_audit"] = {
                 "uses_withheld_labels": True,
@@ -272,6 +315,8 @@ class ActiveLearningExperiment:
                 "acquisition": acquisition,
             }
             records.append(record)
+            if queries:
+                labeled_mask[np.asarray(queries, dtype=np.int64)] = True
             labeled.extend(queries)
             labeled = sorted(set(labeled))
             previous = trained if bool(self.training_cfg.get("inherit_across_rounds", False)) else None

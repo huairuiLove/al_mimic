@@ -51,6 +51,8 @@ training:
   allow_tf32: true
   cudnn_benchmark: true
   gpu_resident_features: true
+  fused_optimizer: true
+  torch_compile: false
   batch_size: 1024
   comal_batch_size: 32
   eval_batch_size: 2048

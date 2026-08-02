@@ -17,7 +17,14 @@ def source_integrity(root: str | Path = ".") -> dict[str, Any]:
     actual: dict[str, str | None] = {}
     for relative_path in baseline:
         path = root / relative_path
-        actual[relative_path] = hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+        if not path.is_file():
+            actual[relative_path] = None
+            continue
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        actual[relative_path] = digest.hexdigest()
     unexpected = sorted(
         str(path.relative_to(root))
         for path in (root / "CoMAL-main").glob("*.py")
@@ -37,10 +44,18 @@ def source_integrity(root: str | Path = ".") -> dict[str, Any]:
     }
 
 
+_INTEGRITY_CACHE: dict[str, dict[str, Any]] = {}
+
+
 def assert_original_unchanged(root: str | Path = ".") -> dict[str, Any]:
+    key = str(Path(root).resolve())
+    cached = _INTEGRITY_CACHE.get(key)
+    if cached is not None:
+        return cached
     report = source_integrity(root)
     if not report["verified"]:
         raise RuntimeError(
             "CoMAL-main integrity check failed; restore upstream files and edit only the adapter"
         )
+    _INTEGRITY_CACHE[key] = report
     return report

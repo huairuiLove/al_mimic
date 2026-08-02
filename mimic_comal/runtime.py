@@ -77,7 +77,12 @@ def configure_runtime(config: dict[str, Any]) -> None:
         pass
 
     allow_tf32 = bool(training.get("allow_tf32", True))
+    try:
+        torch.backends.opt_einsum.enabled = True
+    except Exception:
+        pass
     if torch.cuda.is_available():
+        torch.backends.cudnn.enabled = True
         torch.backends.cuda.matmul.allow_tf32 = allow_tf32
         torch.backends.cudnn.allow_tf32 = allow_tf32
         torch.backends.cudnn.benchmark = bool(training.get("cudnn_benchmark", True))
@@ -89,6 +94,13 @@ def configure_runtime(config: dict[str, Any]) -> None:
         # Prefer max clocks when the driver exposes persistence/boost paths.
         try:
             torch.cuda.set_per_process_memory_fraction(1.0)
+        except Exception:
+            pass
+        # Enable Flash/mem-efficient SDPA kernels when available (BERT encode path).
+        try:
+            torch.backends.cuda.enable_flash_sdp(True)
+            torch.backends.cuda.enable_mem_efficient_sdp(True)
+            torch.backends.cuda.enable_math_sdp(True)
         except Exception:
             pass
 

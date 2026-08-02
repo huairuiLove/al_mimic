@@ -13,6 +13,7 @@ import hashlib
 import json
 import re
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -20,7 +21,7 @@ from typing import Any, Iterable
 from .config import require_paths
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class MIMICRecord:
     row_index: int
     hadm_id: str
@@ -31,8 +32,13 @@ class MIMICRecord:
 
 
 def _read_rows(path: Path) -> Iterable[list[str]]:
-    opener = gzip.open if path.suffix == ".gz" else open
-    with opener(path, "rt", encoding="utf-8", errors="replace", newline="") as handle:
+    # 1 MiB text buffer keeps NOTEEVENTS.csv.gz decode from syscall-thrashing the 18-core quota.
+    if path.suffix == ".gz":
+        handle = gzip.open(path, "rt", encoding="utf-8", errors="replace", newline="")
+    else:
+        handle = open(path, "rt", encoding="utf-8", errors="replace", newline="", buffering=1024 * 1024)
+    with handle:
+        # csv.reader over a buffered TextIO-like stream; avoid per-row Python wrapping.
         yield from csv.reader(handle)
 
 
@@ -148,15 +154,25 @@ def prepare_mimic(config: dict[str, Any], output_dir: str | Path | None = None) 
     max_records = prep_cfg.get("max_records")
     max_records = int(max_records) if max_records else None
     admissions = _admission_map(paths["admissions"], max_records)
-    diagnosis = _diagnosis_map(paths["diagnoses"], admissions, int(prep_cfg.get("code_prefix_length", 3)))
     categories = {str(value) for value in prep_cfg.get("note_categories", ["Discharge summary"])}
-    notes = _note_map(
-        paths["notes"],
-        admissions,
-        categories,
-        int(prep_cfg.get("max_text_chars", 12000)),
-        int(prep_cfg.get("max_notes_per_admission", 4)),
-    )
+    # DIAGNOSES and NOTEEVENTS are independent once admissions are known; overlap their I/O.
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        diagnosis_future = pool.submit(
+            _diagnosis_map,
+            paths["diagnoses"],
+            admissions,
+            int(prep_cfg.get("code_prefix_length", 3)),
+        )
+        notes_future = pool.submit(
+            _note_map,
+            paths["notes"],
+            admissions,
+            categories,
+            int(prep_cfg.get("max_text_chars", 12000)),
+            int(prep_cfg.get("max_notes_per_admission", 4)),
+        )
+        diagnosis = diagnosis_future.result()
+        notes = notes_future.result()
     candidates: list[tuple[str, str, str, set[str]]] = []
     for hadm, subject in admissions.items():
         if hadm in notes and diagnosis.get(hadm):
@@ -230,9 +246,10 @@ def load_records(prepared_dir: str | Path) -> list[MIMICRecord]:
     if not path.is_file():
         raise FileNotFoundError(f"prepared records not found: {path}; run `prepare` first")
     records: list[MIMICRecord] = []
-    with path.open(encoding="utf-8") as handle:
-        for line in handle:
-            payload = json.loads(line)
+    # Large buffered reads keep the 18-core host in sequential decode instead of syscall chatter.
+    with path.open("rb", buffering=1024 * 1024) as handle:
+        for raw in handle:
+            payload = json.loads(raw)
             records.append(
                 MIMICRecord(
                     int(payload["row_index"]),
@@ -250,22 +267,27 @@ def audit_records(records: list[MIMICRecord], labels: tuple[str, ...]) -> dict[s
     label_set = set(labels)
     result: dict[str, Any] = {"records": len(records), "labels": len(labels), "splits": {}}
     groups: dict[str, set[str]] = {}
+    # Single pass over records instead of three list comprehensions.
+    split_records: dict[str, list[MIMICRecord]] = {"train": [], "validation": [], "test": []}
+    coverage = Counter()
+    for record in records:
+        split_records.setdefault(record.split, []).append(record)
+        coverage.update(record.labels)
     for split in ("train", "validation", "test"):
-        subset = [record for record in records if record.split == split]
+        subset = split_records.get(split, [])
         counts = Counter(label for record in subset for label in record.labels)
+        subjects = {record.subject_id for record in subset}
         result["splits"][split] = {
             "records": len(subset),
-            "subjects": len({record.subject_id for record in subset}),
+            "subjects": len(subjects),
             "positive_counts": {label: int(counts.get(label, 0)) for label in labels},
             "cardinality_mean": sum(len(record.labels) for record in subset) / max(len(subset), 1),
         }
-        groups[split] = {record.subject_id for record in subset}
+        groups[split] = subjects
     result["group_leakage"] = bool(
         groups["train"] & groups["validation"]
         or groups["train"] & groups["test"]
         or groups["validation"] & groups["test"]
     )
-    result["label_coverage"] = {
-        label: int(sum(label in record.labels for record in records)) for label in label_set
-    }
+    result["label_coverage"] = {label: int(coverage.get(label, 0)) for label in label_set}
     return result

@@ -12,15 +12,20 @@ from sklearn.metrics import average_precision_score, roc_auc_score
 
 
 def expected_calibration_error(labels: np.ndarray, probabilities: np.ndarray, bins: int = 15) -> float:
-    truth = labels.reshape(-1)
-    confidence = probabilities.reshape(-1)
+    truth = np.asarray(labels, dtype=np.float64).reshape(-1)
+    confidence = np.asarray(probabilities, dtype=np.float64).reshape(-1)
+    # Vectorized ECE: one digitize pass instead of a Python bin loop.
     edges = np.linspace(0.0, 1.0, bins + 1)
-    error = 0.0
-    for lower, upper in zip(edges[:-1], edges[1:]):
-        mask = (confidence >= lower) & (confidence < upper if upper < 1 else confidence <= upper)
-        if mask.any():
-            error += float(mask.mean()) * abs(float(confidence[mask].mean()) - float(truth[mask].mean()))
-    return error
+    bin_ids = np.clip(np.digitize(confidence, edges[1:-1], right=False), 0, bins - 1)
+    counts = np.bincount(bin_ids, minlength=bins).astype(np.float64)
+    conf_sums = np.bincount(bin_ids, weights=confidence, minlength=bins)
+    truth_sums = np.bincount(bin_ids, weights=truth, minlength=bins)
+    active = counts > 0
+    if not np.any(active):
+        return 0.0
+    weights = counts[active] / confidence.size
+    gaps = np.abs(conf_sums[active] / counts[active] - truth_sums[active] / counts[active])
+    return float(np.sum(weights * gaps))
 
 
 def build_round_diagnostics(
@@ -31,12 +36,41 @@ def build_round_diagnostics(
     label_names: tuple[str, ...],
     *,
     acquisition_scores: np.ndarray | None = None,
+    prototype_similarities: np.ndarray | torch.Tensor | None = None,
 ) -> dict[str, Any]:
     """Check prototype behavior, calibration, and score usefulness."""
-    latent = F.normalize(torch.from_numpy(latents).float(), dim=-1)
-    proto = F.normalize(prototypes.detach().cpu().float(), dim=-1)
-    positive_similarity = torch.einsum("nld,ld->nl", latent, proto[:-1]).numpy()
-    background_similarity = torch.einsum("nld,d->nl", latent, proto[-1]).numpy()
+    labels = np.asarray(labels)
+    probabilities = np.asarray(probabilities)
+    if prototype_similarities is not None:
+        # Prefer model-emitted similarities (evaluation metric), shape [N, L, L+1] or [N, L+1].
+        sims = (
+            prototype_similarities.detach().float().cpu().numpy()
+            if isinstance(prototype_similarities, torch.Tensor)
+            else np.asarray(prototype_similarities)
+        )
+        if sims.ndim == 3:
+            # [N, L, L+1] -> own-label diagonal for positives/negatives, last column background.
+            index = np.arange(sims.shape[1])
+            positive_similarity = sims[:, index, index]
+            background_similarity = sims[:, :, -1]
+        else:
+            # Fallback: if only pooled [N, L+1], reconstruct via latents below.
+            positive_similarity = None
+            background_similarity = None
+    else:
+        positive_similarity = None
+        background_similarity = None
+    if positive_similarity is None or background_similarity is None:
+        if isinstance(latents, torch.Tensor):
+            latent = F.normalize(latents.detach().float(), dim=-1)
+            proto = F.normalize(prototypes.detach().to(device=latent.device).float(), dim=-1)
+            positive_similarity = torch.einsum("nld,ld->nl", latent, proto[:-1]).detach().cpu().numpy()
+            background_similarity = torch.einsum("nld,d->nl", latent, proto[-1]).detach().cpu().numpy()
+        else:
+            latent = F.normalize(torch.as_tensor(latents).float(), dim=-1)
+            proto = F.normalize(prototypes.detach().cpu().float(), dim=-1)
+            positive_similarity = torch.einsum("nld,ld->nl", latent, proto[:-1]).numpy()
+            background_similarity = torch.einsum("nld,d->nl", latent, proto[-1]).numpy()
     pos_mask = labels >= 0.5
     neg_mask = ~pos_mask
     errors = np.not_equal(probabilities >= 0.5, labels >= 0.5).mean(axis=1)
@@ -57,6 +91,8 @@ def build_round_diagnostics(
             )
             if pos_mask.any()
             else None,
+            "mean_prototype_similarity": float(np.asarray(positive_similarity).mean()),
+            "mean_background_similarity": float(np.asarray(background_similarity).mean()),
         },
         "calibration": {
             "ece": expected_calibration_error(labels, probabilities),

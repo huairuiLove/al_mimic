@@ -16,9 +16,12 @@ features:
   local_files_only: true
   max_length: 256
   # Inference-only BF16 encode on 80GB; raise in steps of 32 if util is still low.
-  batch_size: 384
+  batch_size: 480
   precision: bf16
   device: cuda
+  svd_n_iter: 7
+  transform_batch_size: 8192
+  joblib_compress: 1
 
 training:
   device: cuda
@@ -27,11 +30,13 @@ training:
   allow_tf32: true
   cudnn_benchmark: true
   gpu_resident_features: true
+  fused_optimizer: true
+  torch_compile: false
   # Keep the whole 51k embedding table on GPU (~150 MiB at 768-d) and index in-place.
   batch_size: 16384
   eval_batch_size: 32768
   # Contrastive cost grows with (batch * labels)^2; chunked anchors keep this safe on 80GB.
-  comal_batch_size: 96
+  comal_batch_size: 160
   # Resident tensors remove DataLoader from the hot path; workers would only steal the 18-core quota.
   num_workers: 0
   persistent_workers: false
@@ -41,7 +46,7 @@ training:
   interop_threads: 2
 
 comal:
-  anchor_chunk_size: 2048
+  anchor_chunk_size: 4096
 
 active_learning:
-  candidate_size: 40960
+  candidate_size: 49152
