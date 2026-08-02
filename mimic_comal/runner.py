@@ -22,7 +22,13 @@ from .model import (
     positive_similarity_thresholds,
 )
 from .metrics import multilabel_metrics
-from .training import TrainedRound, label_matrix, predict_tensors, train_round
+from .training import (
+    TrainedRound,
+    _prototype_similarity_metrics,
+    label_matrix,
+    predict_tensors,
+    train_round,
+)
 
 
 def _write_json(path: Path, value: Any) -> None:
@@ -171,6 +177,18 @@ class ActiveLearningExperiment:
             test_metrics = multilabel_metrics(
                 test_prediction["labels"], test_prediction["probabilities"], threshold
             )
+            if "prototype_similarities" in validation_prediction:
+                validation_metrics.update(
+                    _prototype_similarity_metrics(
+                        validation_prediction["labels"], validation_prediction["prototype_similarities"]
+                    )
+                )
+            if "prototype_similarities" in test_prediction:
+                test_metrics.update(
+                    _prototype_similarity_metrics(
+                        test_prediction["labels"], test_prediction["prototype_similarities"]
+                    )
+                )
             unlabeled = train_indices[~labeled_mask[train_indices]]
             queries: list[int] = []
             acquisition: dict[str, Any] = {}
@@ -325,8 +343,10 @@ class ActiveLearningExperiment:
             self.output_dir / "final_predictions.npz",
             validation_labels=validation_prediction["labels"],
             validation_probabilities=validation_prediction["probabilities"],
+            validation_prototype_similarities=validation_prediction.get("prototype_similarities"),
             test_labels=test_prediction["labels"],
             test_probabilities=test_prediction["probabilities"],
+            test_prototype_similarities=test_prediction.get("prototype_similarities"),
         )
         state = {
             "format_version": 1,

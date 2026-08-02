@@ -598,6 +598,33 @@ def predict(
     return {name: value.detach().cpu().numpy() for name, value in tensors.items()}
 
 
+def _prototype_similarity_metrics(
+    labels: np.ndarray, prototype_similarities: np.ndarray
+) -> dict[str, float | None]:
+    """Evaluation metrics derived from CoMAL prototype similarities [N, L, L+1]."""
+    sims = np.asarray(prototype_similarities)
+    if sims.ndim != 3 or sims.shape[0] == 0:
+        return {
+            "prototype_positive_own_similarity": None,
+            "prototype_negative_own_similarity": None,
+            "prototype_background_similarity": None,
+            "prototype_positive_vs_background_margin": None,
+        }
+    index = np.arange(sims.shape[1])
+    own = sims[:, index, index]
+    background = sims[:, :, -1]
+    pos_mask = np.asarray(labels) >= 0.5
+    neg_mask = ~pos_mask
+    return {
+        "prototype_positive_own_similarity": float(own[pos_mask].mean()) if pos_mask.any() else None,
+        "prototype_negative_own_similarity": float(own[neg_mask].mean()) if neg_mask.any() else None,
+        "prototype_background_similarity": float(background.mean()),
+        "prototype_positive_vs_background_margin": float((own - background)[pos_mask].mean())
+        if pos_mask.any()
+        else None,
+    }
+
+
 def evaluate(
     trained: TrainedRound,
     features: np.ndarray,
@@ -612,4 +639,8 @@ def evaluate(
         predictions["probabilities"],
         float(config.get("training", {}).get("threshold", 0.5)),
     )
+    if "prototype_similarities" in predictions:
+        metrics.update(
+            _prototype_similarity_metrics(predictions["labels"], predictions["prototype_similarities"])
+        )
     return metrics, predictions
