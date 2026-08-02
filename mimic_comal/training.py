@@ -190,11 +190,19 @@ def _cache_classifier_features(
     eval_batch_size: int,
 ) -> torch.Tensor:
     """Frozen-classifier features for the labeled pool; avoids re-encoding each CoMAL step."""
-    chunks: list[torch.Tensor] = []
     classifier.eval()
+    count = int(index_tensor.numel())
+    if count == 0:
+        return feature_tensor.new_zeros((0, classifier.feature_dim))
+    if count <= eval_batch_size:
+        return classifier(feature_tensor.index_select(0, index_tensor))["features"]
+    out = feature_tensor.new_empty((count, classifier.feature_dim))
+    cursor = 0
     for batch_index in _index_batches(index_tensor, eval_batch_size, shuffle=False):
-        chunks.append(classifier(feature_tensor.index_select(0, batch_index))["features"])
-    return torch.cat(chunks, dim=0) if chunks else feature_tensor.new_zeros((0, classifier.feature_dim))
+        width = int(batch_index.numel())
+        out[cursor : cursor + width] = classifier(feature_tensor.index_select(0, batch_index))["features"]
+        cursor += width
+    return out
 
 
 def train_round(

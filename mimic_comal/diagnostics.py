@@ -123,9 +123,10 @@ def build_round_diagnostics(
 
 def acquisition_summary(components: dict[str, np.ndarray], selected_positions: np.ndarray) -> dict[str, Any]:
     summary: dict[str, Any] = {}
-    selected_set = set(int(value) for value in selected_positions)
+    selected_positions = np.asarray(selected_positions, dtype=np.int64)
     for name, values in components.items():
-        selected = np.asarray([value for index, value in enumerate(values) if index in selected_set])
+        values = np.asarray(values)
+        selected = values[selected_positions] if selected_positions.size else values[:0]
         summary[name] = {
             "pool_mean": float(np.mean(values)),
             "pool_std": float(np.std(values)),
