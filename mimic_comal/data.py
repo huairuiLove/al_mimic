@@ -239,9 +239,17 @@ def prepare_mimic(config: dict[str, Any], output_dir: str | Path | None = None) 
             )
             for index, record in enumerate(ordered)
         ]
-    with (output / "records.jsonl").open("w", encoding="utf-8") as handle:
-        for record in records:
-            handle.write(json.dumps(asdict(record), ensure_ascii=False) + "\n")
+    try:
+        import orjson
+
+        with (output / "records.jsonl").open("wb") as handle:
+            for record in records:
+                handle.write(orjson.dumps(asdict(record)))
+                handle.write(b"\n")
+    except ImportError:  # pragma: no cover
+        with (output / "records.jsonl").open("w", encoding="utf-8") as handle:
+            for record in records:
+                handle.write(json.dumps(asdict(record), ensure_ascii=False) + "\n")
     audit = audit_records(records, tuple(labels))
     _write_json(output / "labels.json", {"labels": labels, "frequencies": dict(frequencies)})
     _write_json(output / "audit.json", audit)
