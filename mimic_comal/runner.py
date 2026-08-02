@@ -171,7 +171,7 @@ class ActiveLearningExperiment:
             # Fuse eval with acquisition pools into one resident scan when possible.
             fuse_mode = "none"
             if will_query and strategy == "comal" and formula == "paper":
-                fuse_mode = "paper"  # val+test+labeled+candidates
+                fuse_mode = "paper"
             elif will_query and strategy == "comal" and formula == "weighted":
                 fuse_mode = "weighted"  # val+test+candidates
             elif will_query and strategy == "random":
@@ -192,47 +192,43 @@ class ActiveLearningExperiment:
             labeled_array = np.asarray(labeled, dtype=np.int64)
             labeled_tensors: dict[str, torch.Tensor] | None = None
             pool_tensors: dict[str, torch.Tensor] | None = None
+            # Eval always keeps full [N,L,L+1] similarities for metrics / final npz.
+            eval_tensors = predict_tensors(
+                trained,
+                self.features,
+                self.labels,
+                eval_indices,
+                self.config,
+                self.device,
+                return_latents=False,
+                similarity_mode="full",
+            )
             if fuse_mode == "paper":
-                fused_indices = np.concatenate([eval_indices, labeled_array, candidates])
-                fused = predict_tensors(
+                # Acquisition only needs own/background sims — skip the L×(L+1) GEMM.
+                acq_indices = np.concatenate([labeled_array, candidates])
+                acq = predict_tensors(
                     trained,
                     self.features,
                     self.labels,
-                    fused_indices,
+                    acq_indices,
                     self.config,
                     self.device,
-                    # Own-prototype scores are the similarity diagonal; skip latent buffers.
                     return_latents=False,
+                    similarity_mode="own_bg",
                 )
-                eval_end = int(eval_indices.size)
-                labeled_end = eval_end + int(labeled_array.size)
-                eval_tensors = {name: value[:eval_end] for name, value in fused.items()}
-                labeled_tensors = {name: value[eval_end:labeled_end] for name, value in fused.items()}
-                pool_tensors = {name: value[labeled_end:] for name, value in fused.items()}
+                labeled_count = int(labeled_array.size)
+                labeled_tensors = {name: value[:labeled_count] for name, value in acq.items()}
+                pool_tensors = {name: value[labeled_count:] for name, value in acq.items()}
             elif fuse_mode in {"weighted", "random"}:
-                fused_indices = np.concatenate([eval_indices, candidates])
-                fused = predict_tensors(
+                pool_tensors = predict_tensors(
                     trained,
                     self.features,
                     self.labels,
-                    fused_indices,
+                    candidates,
                     self.config,
                     self.device,
                     return_latents=fuse_mode == "weighted",
-                )
-                eval_end = int(eval_indices.size)
-                eval_tensors = {name: value[:eval_end] for name, value in fused.items()}
-                pool_tensors = {name: value[eval_end:] for name, value in fused.items()}
-            else:
-                # Final round: similarities cover diagnostics; skip latent buffers.
-                eval_tensors = predict_tensors(
-                    trained,
-                    self.features,
-                    self.labels,
-                    eval_indices,
-                    self.config,
-                    self.device,
-                    return_latents=False,
+                    similarity_mode="full" if fuse_mode == "weighted" else "own_bg",
                 )
             metric_keys = ("indices", "labels", "probabilities", "prototype_similarities")
             # Overlap host copies; one sync before .numpy().
@@ -277,11 +273,16 @@ class ActiveLearningExperiment:
                         assert labeled_tensors is not None
                         expected_cardinality = labeled_tensors["labels"].sum(dim=1).mean()
                         prototypes = trained.comal.prototypes.detach()
-                        num_labels = int(labeled_tensors["labels"].shape[1])
-                        label_index = torch.arange(num_labels, device=self.device)
-                        # Diagonal of [N,L,L+1] matches own_prototype_similarity without re-GEMM.
-                        labeled_own = labeled_tensors["prototype_similarities"][:, label_index, label_index]
-                        pool_own = pool_tensors["prototype_similarities"][:, label_index, label_index]
+                        labeled_sims = labeled_tensors["prototype_similarities"]
+                        pool_sims = pool_tensors["prototype_similarities"]
+                        if labeled_sims.shape[-1] == 2:
+                            labeled_own = labeled_sims[..., 0]
+                            pool_own = pool_sims[..., 0]
+                        else:
+                            num_labels = int(labeled_tensors["labels"].shape[1])
+                            label_index = torch.arange(num_labels, device=self.device)
+                            labeled_own = labeled_sims[:, label_index, label_index]
+                            pool_own = pool_sims[:, label_index, label_index]
                         thresholds = positive_similarity_thresholds(
                             None,
                             labeled_tensors["labels"],
@@ -331,15 +332,16 @@ class ActiveLearningExperiment:
                 else:
                     raise ValueError("active_learning.strategy must be comal or random")
                 # Pool diagnostics only need own/background sims, not the full L×(L+1) cube.
-                num_labels = int(pool_tensors["probabilities"].shape[1])
-                label_index = torch.arange(num_labels, device=self.device)
-                compact_sims = torch.stack(
-                    (
-                        pool_tensors["prototype_similarities"][:, label_index, label_index],
-                        pool_tensors["prototype_similarities"][:, :, -1],
-                    ),
-                    dim=-1,
-                )
+                pool_sims = pool_tensors["prototype_similarities"]
+                if pool_sims.shape[-1] == 2:
+                    compact_sims = pool_sims
+                else:
+                    num_labels = int(pool_tensors["probabilities"].shape[1])
+                    label_index = torch.arange(num_labels, device=self.device)
+                    compact_sims = torch.stack(
+                        (pool_sims[:, label_index, label_index], pool_sims[:, :, -1]),
+                        dim=-1,
+                    )
                 host = {
                     "indices": pool_tensors["indices"].detach().to("cpu", non_blocking=True),
                     "labels": pool_tensors["labels"].detach().to("cpu", non_blocking=True),

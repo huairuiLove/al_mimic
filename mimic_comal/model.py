@@ -69,7 +69,7 @@ class CoMALModule(nn.Module):
         self,
         features: torch.Tensor,
         *,
-        compute_similarities: bool = True,
+        compute_similarities: bool | str = True,
         compute_reconstruction: bool = True,
     ) -> dict[str, torch.Tensor]:
         batch = features.shape[0]
@@ -82,9 +82,16 @@ class CoMALModule(nn.Module):
             reconstructed = self.aggregate(decoded)
             result["reconstructed_features"] = reconstructed
             result["reconstructed_logits"] = self.reconstruction_classifier(reconstructed)
-        # Evaluation must always request similarities (default True). Training loss may skip.
-        if compute_similarities:
+        # similarity modes: True/"full" -> [N,L,L+1]; "own_bg" -> [N,L,2]; False/"none" -> omit.
+        if compute_similarities is True or compute_similarities == "full":
             result["prototype_similarities"] = F.normalize(latent, dim=-1) @ self.prototypes.T
+        elif compute_similarities == "own_bg":
+            normalized = F.normalize(latent, dim=-1)
+            own = torch.einsum("nld,ld->nl", normalized, self.prototypes[:-1])
+            background = torch.einsum("nld,d->nl", normalized, self.prototypes[-1])
+            result["prototype_similarities"] = torch.stack((own, background), dim=-1)
+        elif compute_similarities not in {False, "none"}:
+            raise ValueError("compute_similarities must be True/'full', 'own_bg', or False/'none'")
         return result
 
     @torch.no_grad()

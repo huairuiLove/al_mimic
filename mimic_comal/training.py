@@ -623,8 +623,15 @@ def predict_tensors(
     device: torch.device,
     *,
     return_latents: bool = True,
+    similarity_mode: str = "full",
 ) -> dict[str, torch.Tensor]:
-    """GPU-resident prediction path used by acquisition and evaluation."""
+    """GPU-resident prediction path used by acquisition and evaluation.
+
+    ``similarity_mode`` is ``full`` ([N,L,L+1]) for eval metrics or ``own_bg``
+    ([N,L,2]) for cheaper acquisition-only scans.
+    """
+    if similarity_mode not in {"full", "own_bg"}:
+        raise ValueError("similarity_mode must be 'full' or 'own_bg'")
     training = config.get("training", {})
     index_array = np.asarray(indices, dtype=np.int64)
     trained.classifier.eval()
@@ -632,6 +639,7 @@ def predict_tensors(
     num_labels = int(labels.shape[1])
     prototype_dim = int(trained.comal.prototype_dim)
     eval_batch = int(training.get("eval_batch_size", 1024))
+    sim_width = num_labels + 1 if similarity_mode == "full" else 2
     if _use_gpu_resident(device, training) or device.type == "cuda":
         feature_tensor = _to_device_matrix(features, device)
         label_tensor = _to_device_matrix(labels, device)
@@ -646,9 +654,7 @@ def predict_tensors(
             if return_latents
             else None
         )
-        out_similarities = torch.empty(
-            count, num_labels, num_labels + 1, dtype=torch.float32, device=device
-        )
+        out_similarities = torch.empty(count, num_labels, sim_width, dtype=torch.float32, device=device)
 
         def _write(start: int, stop: int, output: dict[str, torch.Tensor], comal_output: dict[str, torch.Tensor]) -> None:
             out_probs[start:stop] = torch.sigmoid(output["logits"])
@@ -658,13 +664,21 @@ def predict_tensors(
 
         if count <= eval_batch:
             output = trained.classifier(selected_features)
-            comal_output = trained.comal(output["features"], compute_reconstruction=False)
+            comal_output = trained.comal(
+                output["features"],
+                compute_reconstruction=False,
+                compute_similarities=similarity_mode,
+            )
             _write(0, count, output, comal_output)
         else:
             for start in range(0, count, eval_batch):
                 stop = min(start + eval_batch, count)
                 output = trained.classifier(selected_features[start:stop])
-                comal_output = trained.comal(output["features"], compute_reconstruction=False)
+                comal_output = trained.comal(
+                    output["features"],
+                    compute_reconstruction=False,
+                    compute_similarities=similarity_mode,
+                )
                 _write(start, stop, output, comal_output)
         result = {
             "indices": index_tensor,
@@ -691,7 +705,11 @@ def predict_tensors(
     for batch in loader:
         inputs = batch["features"].to(device, non_blocking=True)
         output = trained.classifier(inputs)
-        comal_output = trained.comal(output["features"], compute_reconstruction=False)
+        comal_output = trained.comal(
+            output["features"],
+            compute_reconstruction=False,
+            compute_similarities=similarity_mode,
+        )
         index_parts.append(batch["index"].to(device))
         label_parts.append(batch["labels"].to(device))
         prob_parts.append(torch.sigmoid(output["logits"]))
@@ -704,7 +722,7 @@ def predict_tensors(
         "probabilities": torch.cat(prob_parts) if prob_parts else torch.empty(0, num_labels, device=device),
         "prototype_similarities": torch.cat(similarity_parts)
         if similarity_parts
-        else torch.empty(0, num_labels, num_labels + 1, device=device),
+        else torch.empty(0, num_labels, sim_width, device=device),
     }
     if return_latents:
         result["latents"] = (
