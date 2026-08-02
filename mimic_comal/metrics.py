@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 import numpy as np
-from sklearn.metrics import average_precision_score, f1_score, precision_score, recall_score, roc_auc_score
+from sklearn.metrics import average_precision_score, f1_score, roc_auc_score
 
 
 def _safe_macro_auprc(labels: np.ndarray, probabilities: np.ndarray) -> tuple[float, list[float | None]]:
@@ -33,13 +33,26 @@ def multilabel_metrics(
     probabilities = np.asarray(probabilities, dtype=np.float32)
     predictions = probabilities >= threshold
     macro_auprc, per_label = _safe_macro_auprc(labels, probabilities)
+    # Micro P/R/F1 from one confusion pass instead of three sklearn rescans.
+    pred_bool = predictions.astype(bool, copy=False)
+    label_bool = labels.astype(bool, copy=False)
+    tp = float(np.logical_and(pred_bool, label_bool).sum())
+    fp = float(np.logical_and(pred_bool, ~label_bool).sum())
+    fn = float(np.logical_and(~pred_bool, label_bool).sum())
+    precision_micro = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall_micro = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1_micro = (
+        2.0 * precision_micro * recall_micro / (precision_micro + recall_micro)
+        if (precision_micro + recall_micro) > 0
+        else 0.0
+    )
     metrics: dict[str, Any] = {
         "auprc_micro": float(average_precision_score(labels, probabilities, average="micro")),
         "auprc_macro": macro_auprc,
-        "f1_micro": float(f1_score(labels, predictions, average="micro", zero_division=0)),
+        "f1_micro": f1_micro,
         "f1_macro": float(f1_score(labels, predictions, average="macro", zero_division=0)),
-        "precision_micro": float(precision_score(labels, predictions, average="micro", zero_division=0)),
-        "recall_micro": float(recall_score(labels, predictions, average="micro", zero_division=0)),
+        "precision_micro": precision_micro,
+        "recall_micro": recall_micro,
         "per_label_auprc": per_label,
     }
     try:
