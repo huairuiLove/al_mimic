@@ -707,10 +707,19 @@ def predict_tensors(
         out_similarities = torch.empty(count, num_labels, sim_width, dtype=torch.float32, device=device)
 
         def _write(start: int, stop: int, output: dict[str, torch.Tensor], comal_output: dict[str, torch.Tensor]) -> None:
-            out_probs[start:stop] = torch.sigmoid(output["logits"])
-            out_similarities[start:stop] = comal_output["prototype_similarities"].float()
+            # Write through into preallocated buffers to avoid temporary activations.
+            torch.sigmoid(output["logits"], out=out_probs[start:stop])
+            sims = comal_output["prototype_similarities"]
+            if sims.dtype == out_similarities.dtype:
+                out_similarities[start:stop].copy_(sims)
+            else:
+                out_similarities[start:stop] = sims.to(dtype=out_similarities.dtype)
             if out_latents is not None:
-                out_latents[start:stop] = comal_output["latent_features"].float()
+                latents = comal_output["latent_features"]
+                if latents.dtype == out_latents.dtype:
+                    out_latents[start:stop].copy_(latents)
+                else:
+                    out_latents[start:stop] = latents.to(dtype=out_latents.dtype)
 
         if count <= eval_batch:
             output = trained.classifier(selected_features)
