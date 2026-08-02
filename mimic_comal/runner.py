@@ -275,9 +275,7 @@ class ActiveLearningExperiment:
                 elif strategy == "comal":
                     if formula == "paper":
                         assert labeled_tensors is not None
-                        expected_cardinality = float(
-                            labeled_tensors["labels"].sum(dim=1).mean().item()
-                        )
+                        expected_cardinality = labeled_tensors["labels"].sum(dim=1).mean()
                         prototypes = trained.comal.prototypes.detach()
                         labeled_own = own_prototype_similarity(
                             labeled_tensors["latents"], prototypes, int(labeled_tensors["labels"].shape[1])

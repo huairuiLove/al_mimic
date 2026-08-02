@@ -217,7 +217,7 @@ def paper_comal_acquisition_scores(
     prototypes: torch.Tensor,
     positive_thresholds: torch.Tensor,
     *,
-    expected_cardinality: float,
+    expected_cardinality: float | torch.Tensor,
     own_similarity: torch.Tensor | None = None,
 ) -> PaperAcquisitionComponents:
     """CoMAL score from ``selection_methods.query_samples`` in the release."""
@@ -227,6 +227,7 @@ def paper_comal_acquisition_scores(
         )
     prototype_positive = own_similarity > positive_thresholds[None, :]
     prototype_positive_count = prototype_positive.sum(dim=1).float()
+    # Keep expected_cardinality on-device when passed as a tensor to avoid a mid-pipeline sync.
     cardinality_mismatch = (prototype_positive_count - expected_cardinality).abs()
     classifier_positive = probabilities >= 0.5
     positive_evidence = (classifier_positive.float() * ((own_similarity + 1.0) * 0.5).clamp_min(1e-10)).sum(
@@ -248,7 +249,7 @@ def comal_acquisition_scores(
     latent_features: torch.Tensor,
     prototypes: torch.Tensor,
     *,
-    expected_cardinality: float,
+    expected_cardinality: float | torch.Tensor,
     uncertainty_weight: float = 0.5,
     prototype_weight: float = 0.35,
     cardinality_weight: float = 0.15,
@@ -264,9 +265,8 @@ def comal_acquisition_scores(
     ).clamp_min(1)
     prototype_novelty = ((1.0 - selected_similarity) * 0.5).clamp(0, 1)
     predicted_cardinality = probabilities.sum(dim=1)
-    cardinality_mismatch = (predicted_cardinality - expected_cardinality).abs() / max(
-        float(probabilities.shape[1]), 1.0
-    )
+    label_scale = max(float(probabilities.shape[1]), 1.0)
+    cardinality_mismatch = (predicted_cardinality - expected_cardinality).abs() / label_scale
     combined = (
         uncertainty_weight * uncertainty
         + prototype_weight * prototype_novelty
