@@ -416,8 +416,8 @@ class ActiveLearningExperiment:
                         (pool_sims[:, label_index, label_index], pool_sims[:, :, -1]),
                         dim=-1,
                     )
+                # Pool row order matches `candidates`; skip indices D2H and gather queries on host.
                 host = {
-                    "indices": _async_to_host(pool_tensors["indices"], copy_stream),
                     "labels": _async_to_host(pool_tensors["labels"], copy_stream),
                     "probabilities": _async_to_host(pool_tensors["probabilities"], copy_stream),
                     "prototype_similarities": _async_to_host(compact_sims, copy_stream),
@@ -448,7 +448,7 @@ class ActiveLearningExperiment:
                         positions = part[np.argsort(-score_array[part], kind="stable")]
                     else:
                         positions = np.argsort(-score_array, kind="stable")
-                queries = [int(value) for value in pool["indices"][positions]]
+                queries = [int(value) for value in candidates[np.asarray(positions, dtype=np.int64)]]
                 acquisition = {
                     "candidate_count": int(len(candidates)),
                     "query_count": count,
