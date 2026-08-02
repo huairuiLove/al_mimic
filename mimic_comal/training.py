@@ -866,12 +866,14 @@ def prototype_similarity_metrics_torch(
         own = sims[:, index, index]
         background = sims[:, :, -1]
     pos_mask = labels >= 0.5
-    neg_mask = ~pos_mask
-    pos_count = pos_mask.sum()
-    neg_count = neg_mask.sum()
-    pos_own = own.masked_select(pos_mask).sum()
-    neg_own = own.masked_select(neg_mask).sum()
-    pos_margin = (own - background).masked_select(pos_mask).sum()
+    # Masked mul+sum avoids compacting gathers from masked_select on large eval tensors.
+    pos = pos_mask.to(dtype=own.dtype)
+    neg = 1.0 - pos
+    pos_count = pos.sum()
+    neg_count = neg.sum()
+    pos_own = (own * pos).sum()
+    neg_own = (own * neg).sum()
+    pos_margin = ((own - background) * pos).sum()
     bg_mean = background.mean()
     packed = torch.stack(
         (
