@@ -512,7 +512,10 @@ def _refresh_prototypes_from_cached(
         targets = cached_labels[start:stop]
         # Prototype refresh only needs latents; skip similarity GEMM.
         latent = F.normalize(
-            comal(fused, compute_similarities=False)["latent_features"].float(), dim=-1
+            comal(fused, compute_similarities=False, compute_reconstruction=False)[
+                "latent_features"
+            ].float(),
+            dim=-1,
         )
         negative = 1.0 - targets
         sums[:-1] += torch.einsum("bl,bld->ld", targets, latent)
@@ -546,7 +549,10 @@ def _refresh_prototypes_tensors(
         targets = selected_labels[start:stop]
         fused = classifier(inputs)["features"]
         latent = F.normalize(
-            comal(fused, compute_similarities=False)["latent_features"].float(), dim=-1
+            comal(fused, compute_similarities=False, compute_reconstruction=False)[
+                "latent_features"
+            ].float(),
+            dim=-1,
         )
         negative = 1.0 - targets
         sums[:-1] += torch.einsum("bl,bld->ld", targets, latent)
@@ -595,7 +601,10 @@ def refresh_prototypes(
         targets = batch["labels"].to(device, non_blocking=True)
         fused = classifier(inputs)["features"]
         latent = F.normalize(
-            comal(fused, compute_similarities=False)["latent_features"].float(), dim=-1
+            comal(fused, compute_similarities=False, compute_reconstruction=False)[
+                "latent_features"
+            ].float(),
+            dim=-1,
         )
         negative = 1.0 - targets
         sums[:-1] += torch.einsum("bl,bld->ld", targets, latent)
@@ -650,13 +659,13 @@ def predict_tensors(
 
         if count <= eval_batch:
             output = trained.classifier(selected_features)
-            comal_output = trained.comal(output["features"])
+            comal_output = trained.comal(output["features"], compute_reconstruction=False)
             _write(0, count, output, comal_output)
         else:
             for start in range(0, count, eval_batch):
                 stop = min(start + eval_batch, count)
                 output = trained.classifier(selected_features[start:stop])
-                comal_output = trained.comal(output["features"])
+                comal_output = trained.comal(output["features"], compute_reconstruction=False)
                 _write(start, stop, output, comal_output)
         result = {
             "indices": index_tensor,
@@ -683,7 +692,7 @@ def predict_tensors(
     for batch in loader:
         inputs = batch["features"].to(device, non_blocking=True)
         output = trained.classifier(inputs)
-        comal_output = trained.comal(output["features"])
+        comal_output = trained.comal(output["features"], compute_reconstruction=False)
         index_parts.append(batch["index"].to(device))
         label_parts.append(batch["labels"].to(device))
         prob_parts.append(torch.sigmoid(output["logits"]))

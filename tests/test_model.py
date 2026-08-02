@@ -22,6 +22,9 @@ def test_comal_shapes_and_loss_are_finite() -> None:
     assert output["prototype_similarities"].shape == (8, 4, 5)
     assert torch.isfinite(output["prototype_similarities"]).all()
     assert torch.isfinite(loss)
+    latent_only = module(torch.randn(8, 12), compute_reconstruction=False, compute_similarities=True)
+    assert "reconstructed_logits" not in latent_only
+    assert latent_only["prototype_similarities"].shape == (8, 4, 5)
 
 
 def test_acquisition_components_have_one_score_per_sample() -> None:

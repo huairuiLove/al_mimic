@@ -65,18 +65,23 @@ class CoMALModule(nn.Module):
             nn.init.xavier_uniform_(module.weight)
             nn.init.zeros_(module.bias)
 
-    def forward(self, features: torch.Tensor, *, compute_similarities: bool = True) -> dict[str, torch.Tensor]:
+    def forward(
+        self,
+        features: torch.Tensor,
+        *,
+        compute_similarities: bool = True,
+        compute_reconstruction: bool = True,
+    ) -> dict[str, torch.Tensor]:
         batch = features.shape[0]
         label_features = self.to_label(features).view(batch, self.num_labels, -1)
         latent = self.to_latent(label_features)
-        decoded = self.from_latent(latent).view(batch, -1)
-        reconstructed = self.aggregate(decoded)
-        reconstructed_logits = self.reconstruction_classifier(reconstructed)
-        result = {
-            "latent_features": latent,
-            "reconstructed_features": reconstructed,
-            "reconstructed_logits": reconstructed_logits,
-        }
+        result: dict[str, torch.Tensor] = {"latent_features": latent}
+        # Train needs the decoder; predict / prototype refresh only need latents (+ optional sims).
+        if compute_reconstruction:
+            decoded = self.from_latent(latent).view(batch, -1)
+            reconstructed = self.aggregate(decoded)
+            result["reconstructed_features"] = reconstructed
+            result["reconstructed_logits"] = self.reconstruction_classifier(reconstructed)
         # Evaluation must always request similarities (default True). Training loss may skip.
         if compute_similarities:
             result["prototype_similarities"] = F.normalize(latent, dim=-1) @ self.prototypes.T
