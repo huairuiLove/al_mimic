@@ -90,7 +90,8 @@ class CoMALModule(nn.Module):
         elif compute_similarities == "own_bg":
             normalized = F.normalize(latent, dim=-1)
             own = torch.einsum("nld,ld->nl", normalized, self.prototypes[:-1])
-            background = torch.einsum("nld,d->nl", normalized, self.prototypes[-1])
+            # [N,L,D] @ [D] -> [N,L]; cheaper than a second einsum over a trailing singleton.
+            background = normalized.matmul(self.prototypes[-1])
             result["prototype_similarities"] = torch.stack((own, background), dim=-1)
         elif compute_similarities not in {False, "none"}:
             raise ValueError("compute_similarities must be True/'full', 'own_bg', or False/'none'")
