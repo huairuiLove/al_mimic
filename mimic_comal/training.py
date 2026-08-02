@@ -380,7 +380,8 @@ def train_round(
         torch.cuda.synchronize(device)
     timings["classifier_training_sec"] = time.perf_counter() - start
     if classifier_epoch_losses:
-        history["classifier_loss"] = torch.stack(classifier_epoch_losses).detach().cpu().tolist()
+        # Barrier already completed; scalarize without an extra stack + D2H of the stack.
+        history["classifier_loss"] = [float(loss.detach()) for loss in classifier_epoch_losses]
 
     # The original implementation freezes the classifier before training CoMAL.
     classifier.eval()
@@ -505,7 +506,7 @@ def train_round(
         torch.cuda.synchronize(device)
     timings["comal_training_sec"] = time.perf_counter() - start
     if comal_epoch_losses:
-        history["comal_loss"] = torch.stack(comal_epoch_losses).detach().cpu().tolist()
+        history["comal_loss"] = [float(loss.detach()) for loss in comal_epoch_losses]
     if not prototypes_from_cache:
         if resident:
             assert feature_tensor is not None and label_tensor is not None
