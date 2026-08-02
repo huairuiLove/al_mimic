@@ -431,6 +431,15 @@ class ActiveLearningExperiment:
                     "probabilities": _async_to_host(pool_tensors["probabilities"], copy_stream),
                     "prototype_similarities": _async_to_host(compact_sims, copy_stream),
                 }
+                count = min(query_size, len(candidates))
+                ranked_host: torch.Tensor | None = None
+                if score_tensor is not None and count < int(score_tensor.numel()):
+                    # Top-k on the compute stream while pool/component D2H runs on copy_stream.
+                    top_values, top_positions = torch.topk(
+                        score_tensor, k=count, largest=True, sorted=False
+                    )
+                    order = torch.argsort(top_values, descending=True, stable=True)
+                    ranked_host = _async_to_host(top_positions[order], copy_stream)
                 if copy_stream is not None:
                     copy_stream.synchronize()
                 elif self.device.type == "cuda":
@@ -439,12 +448,8 @@ class ActiveLearningExperiment:
                 if strategy == "comal":
                     components = {name: value.numpy() for name, value in component_host.items()}
                     scores = components["combined"]
-                count = min(query_size, len(candidates))
-                if score_tensor is not None and count < int(score_tensor.numel()):
-                    # Device top-k then stable reorder of the shortlist only.
-                    top_values, top_positions = torch.topk(score_tensor, k=count, largest=True, sorted=False)
-                    order = torch.argsort(top_values, descending=True, stable=True)
-                    positions = top_positions[order].detach().cpu().numpy()
+                if ranked_host is not None:
+                    positions = ranked_host.numpy()
                 else:
                     score_array = np.asarray(scores)
                     if count < score_array.size:
