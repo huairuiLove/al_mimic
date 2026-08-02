@@ -64,21 +64,22 @@ class CoMALModule(nn.Module):
             nn.init.xavier_uniform_(module.weight)
             nn.init.zeros_(module.bias)
 
-    def forward(self, features: torch.Tensor) -> dict[str, torch.Tensor]:
+    def forward(self, features: torch.Tensor, *, compute_similarities: bool = True) -> dict[str, torch.Tensor]:
         batch = features.shape[0]
         label_features = self.to_label(features).view(batch, self.num_labels, -1)
         latent = self.to_latent(label_features)
         decoded = self.from_latent(latent).reshape(batch, -1)
         reconstructed = self.aggregate(decoded)
         reconstructed_logits = self.reconstruction_classifier(reconstructed)
-        # Prototype similarities are part of the evaluation surface; always compute.
-        similarities = F.normalize(latent, dim=-1) @ self.prototypes.T
-        return {
+        result = {
             "latent_features": latent,
             "reconstructed_features": reconstructed,
             "reconstructed_logits": reconstructed_logits,
-            "prototype_similarities": similarities,
         }
+        # Evaluation must always request similarities (default True). Training loss may skip.
+        if compute_similarities:
+            result["prototype_similarities"] = F.normalize(latent, dim=-1) @ self.prototypes.T
+        return result
 
     @torch.no_grad()
     def set_prototypes(self, sums: torch.Tensor, counts: torch.Tensor) -> None:

@@ -24,9 +24,9 @@ from .model import (
 from .metrics import multilabel_metrics
 from .training import (
     TrainedRound,
-    _prototype_similarity_metrics,
     label_matrix,
     predict_tensors,
+    prototype_similarity_metrics,
     train_round,
 )
 
@@ -179,13 +179,13 @@ class ActiveLearningExperiment:
             )
             if "prototype_similarities" in validation_prediction:
                 validation_metrics.update(
-                    _prototype_similarity_metrics(
+                    prototype_similarity_metrics(
                         validation_prediction["labels"], validation_prediction["prototype_similarities"]
                     )
                 )
             if "prototype_similarities" in test_prediction:
                 test_metrics.update(
-                    _prototype_similarity_metrics(
+                    prototype_similarity_metrics(
                         test_prediction["labels"], test_prediction["prototype_similarities"]
                     )
                 )
@@ -339,15 +339,19 @@ class ActiveLearningExperiment:
             labeled = sorted(set(labeled))
             previous = trained if bool(self.training_cfg.get("inherit_across_rounds", False)) else None
         self._save_checkpoint(trained, rounds - 1)
-        np.savez_compressed(
-            self.output_dir / "final_predictions.npz",
-            validation_labels=validation_prediction["labels"],
-            validation_probabilities=validation_prediction["probabilities"],
-            validation_prototype_similarities=validation_prediction.get("prototype_similarities"),
-            test_labels=test_prediction["labels"],
-            test_probabilities=test_prediction["probabilities"],
-            test_prototype_similarities=test_prediction.get("prototype_similarities"),
-        )
+        prediction_payload = {
+            "validation_labels": validation_prediction["labels"],
+            "validation_probabilities": validation_prediction["probabilities"],
+            "test_labels": test_prediction["labels"],
+            "test_probabilities": test_prediction["probabilities"],
+        }
+        if validation_prediction.get("prototype_similarities") is not None:
+            prediction_payload["validation_prototype_similarities"] = validation_prediction[
+                "prototype_similarities"
+            ]
+        if test_prediction.get("prototype_similarities") is not None:
+            prediction_payload["test_prototype_similarities"] = test_prediction["prototype_similarities"]
+        np.savez_compressed(self.output_dir / "final_predictions.npz", **prediction_payload)
         state = {
             "format_version": 1,
             "strategy": strategy,

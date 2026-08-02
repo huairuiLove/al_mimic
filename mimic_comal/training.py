@@ -355,7 +355,8 @@ def train_round(
                 targets = cached_labels.index_select(0, batch_index)
                 optimizer_comal.zero_grad(set_to_none=True)
                 with _autocast(device, precision):
-                    output = comal(fused)
+                    # Skip similarity matmul in the train loss path only; eval always computes it.
+                    output = comal(fused, compute_similarities=False)
                     contrastive = supervised_contrastive_loss(
                         output["latent_features"],
                         targets,
@@ -394,7 +395,7 @@ def train_round(
                     classifier_output = classifier(inputs)
                 fused = classifier_output["features"].detach()
                 with _autocast(device, precision):
-                    output = comal(fused)
+                    output = comal(fused, compute_similarities=False)
                     contrastive = supervised_contrastive_loss(
                         output["latent_features"],
                         targets,
@@ -598,7 +599,7 @@ def predict(
     return {name: value.detach().cpu().numpy() for name, value in tensors.items()}
 
 
-def _prototype_similarity_metrics(
+def prototype_similarity_metrics(
     labels: np.ndarray, prototype_similarities: np.ndarray
 ) -> dict[str, float | None]:
     """Evaluation metrics derived from CoMAL prototype similarities [N, L, L+1]."""
@@ -641,6 +642,6 @@ def evaluate(
     )
     if "prototype_similarities" in predictions:
         metrics.update(
-            _prototype_similarity_metrics(predictions["labels"], predictions["prototype_similarities"])
+            prototype_similarity_metrics(predictions["labels"], predictions["prototype_similarities"])
         )
     return metrics, predictions
