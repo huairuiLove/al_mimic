@@ -88,6 +88,16 @@ def clear_device_matrix_cache() -> None:
     _DEVICE_MATRIX_CACHE.clear()
 
 
+def warm_resident_matrices(
+    features: np.ndarray, labels: np.ndarray, device: torch.device, training: dict[str, Any]
+) -> None:
+    """Upload feature/label tables once before the first timed AL round."""
+    if not _use_gpu_resident(device, training):
+        return
+    _to_device_matrix(features, device)
+    _to_device_matrix(labels, device)
+
+
 def _to_device_matrix(
     values: np.ndarray, device: torch.device, *, dtype: torch.dtype = torch.float32
 ) -> torch.Tensor:
