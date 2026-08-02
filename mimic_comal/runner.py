@@ -230,8 +230,8 @@ class ActiveLearningExperiment:
                     candidates,
                     self.config,
                     self.device,
-                    return_latents=fuse_mode == "weighted",
-                    similarity_mode="full" if fuse_mode == "weighted" else "own_bg",
+                    return_latents=False,
+                    similarity_mode="own_bg",
                 )
             # Prototype similarity metrics stay on-device; only D2H sims on the final round for npz.
             validation_metrics = {}
@@ -318,14 +318,17 @@ class ActiveLearningExperiment:
                         expected_cardinality = float(
                             self.labels[np.asarray(labeled)].sum(axis=1).mean()
                         )
+                        pool_sims = pool_tensors["prototype_similarities"]
+                        pool_own = pool_sims[..., 0] if pool_sims.shape[-1] == 2 else None
                         parts = comal_acquisition_scores(
                             pool_tensors["probabilities"],
-                            pool_tensors["latents"],
+                            None,
                             trained.comal.prototypes.detach(),
                             expected_cardinality=expected_cardinality,
                             uncertainty_weight=float(cfg.get("uncertainty_weight", 0.5)),
                             prototype_weight=float(cfg.get("prototype_weight", 0.35)),
                             cardinality_weight=float(cfg.get("cardinality_weight", 0.15)),
+                            own_similarity=pool_own,
                         )
                         component_names = (
                             "uncertainty",

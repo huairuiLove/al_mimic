@@ -265,17 +265,23 @@ def paper_comal_acquisition_scores(
 @torch.inference_mode()
 def comal_acquisition_scores(
     probabilities: torch.Tensor,
-    latent_features: torch.Tensor,
+    latent_features: torch.Tensor | None,
     prototypes: torch.Tensor,
     *,
     expected_cardinality: float | torch.Tensor,
     uncertainty_weight: float = 0.5,
     prototype_weight: float = 0.35,
     cardinality_weight: float = 0.15,
+    own_similarity: torch.Tensor | None = None,
 ) -> AcquisitionComponents:
     """Rank uncertain notes whose predicted positives are far from prototypes."""
     uncertainty = (1.0 - (2.0 * probabilities - 1.0).abs()).mean(dim=1)
-    similarity = own_prototype_similarity(latent_features, prototypes, int(probabilities.shape[1]))
+    if own_similarity is None:
+        if latent_features is None:
+            raise ValueError("latent_features or own_similarity is required")
+        similarity = own_prototype_similarity(latent_features, prototypes, int(probabilities.shape[1]))
+    else:
+        similarity = own_similarity
     predicted_positive = probabilities.ge(0.5)
     fallback = probabilities.argmax(dim=1, keepdim=True)
     predicted_positive = predicted_positive.scatter(1, fallback, True)
