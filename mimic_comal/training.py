@@ -82,10 +82,12 @@ def _use_gpu_resident(device: torch.device, training: dict[str, Any]) -> bool:
 
 
 _DEVICE_MATRIX_CACHE: dict[tuple[int, int, str, str], torch.Tensor] = {}
+_DEVICE_INDEX_CACHE: dict[tuple[int, int, str], torch.Tensor] = {}
 
 
 def clear_device_matrix_cache() -> None:
     _DEVICE_MATRIX_CACHE.clear()
+    _DEVICE_INDEX_CACHE.clear()
 
 
 def warm_resident_matrices(
@@ -96,6 +98,26 @@ def warm_resident_matrices(
         return
     _to_device_matrix(features, device)
     _to_device_matrix(labels, device)
+
+
+def _to_device_index(values: np.ndarray, device: torch.device) -> torch.Tensor:
+    """Cache fixed index arrays (e.g. eval_indices) across AL rounds."""
+    array = np.asarray(values, dtype=np.int64)
+    if not array.flags["C_CONTIGUOUS"]:
+        array = np.ascontiguousarray(array)
+    cache_key = (id(values), int(array.shape[0]), str(device))
+    cached = _DEVICE_INDEX_CACHE.get(cache_key)
+    if cached is not None and cached.device == device and cached.numel() == array.shape[0]:
+        return cached
+    if device.type == "cuda":
+        host = torch.from_numpy(array)
+        if not host.is_pinned():
+            host = host.pin_memory()
+        tensor = host.to(device=device, dtype=torch.long, non_blocking=True)
+        torch.cuda.current_stream().synchronize()
+        _DEVICE_INDEX_CACHE[cache_key] = tensor
+        return tensor
+    return torch.from_numpy(array)
 
 
 def _to_device_matrix(
@@ -695,7 +717,9 @@ def predict_tensors(
     if _use_gpu_resident(device, training) or device.type == "cuda":
         feature_tensor = _to_device_matrix(features, device)
         label_tensor = _to_device_matrix(labels, device)
-        index_tensor = torch.as_tensor(index_array, device=device, dtype=torch.long)
+        # Reuse the caller's ndarray id when possible so fixed eval indices stay cached.
+        index_source = indices if isinstance(indices, np.ndarray) else index_array
+        index_tensor = _to_device_index(index_source, device)
         count = int(index_tensor.numel())
         # One gather makes subsequent batching contiguous (far cheaper than scattered selects).
         selected_features = feature_tensor.index_select(0, index_tensor)
