@@ -330,11 +330,21 @@ class ActiveLearningExperiment:
                     }
                 else:
                     raise ValueError("active_learning.strategy must be comal or random")
-                # Similarities already carry prototype diagnostics; skip latent D2H.
+                # Pool diagnostics only need own/background sims, not the full L×(L+1) cube.
+                num_labels = int(pool_tensors["probabilities"].shape[1])
+                label_index = torch.arange(num_labels, device=self.device)
+                compact_sims = torch.stack(
+                    (
+                        pool_tensors["prototype_similarities"][:, label_index, label_index],
+                        pool_tensors["prototype_similarities"][:, :, -1],
+                    ),
+                    dim=-1,
+                )
                 host = {
-                    name: value.detach().to("cpu", non_blocking=True)
-                    for name, value in pool_tensors.items()
-                    if name != "latents"
+                    "indices": pool_tensors["indices"].detach().to("cpu", non_blocking=True),
+                    "labels": pool_tensors["labels"].detach().to("cpu", non_blocking=True),
+                    "probabilities": pool_tensors["probabilities"].detach().to("cpu", non_blocking=True),
+                    "prototype_similarities": compact_sims.detach().to("cpu", non_blocking=True),
                 }
                 if self.device.type == "cuda":
                     torch.cuda.current_stream(self.device).synchronize()

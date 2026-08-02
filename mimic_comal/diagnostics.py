@@ -48,7 +48,11 @@ def build_round_diagnostics(
             if isinstance(prototype_similarities, torch.Tensor)
             else np.asarray(prototype_similarities)
         )
-        if sims.ndim == 3:
+        if sims.ndim == 3 and sims.shape[-1] == 2:
+            # Compact acquisition diagnostics payload: [N, L, 2] = (own, background).
+            positive_similarity = sims[:, :, 0]
+            background_similarity = sims[:, :, 1]
+        elif sims.ndim == 3:
             # [N, L, L+1] -> own-label diagonal for positives/negatives, last column background.
             index = np.arange(sims.shape[1])
             positive_similarity = sims[:, index, index]
