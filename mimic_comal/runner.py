@@ -443,7 +443,8 @@ class ActiveLearningExperiment:
             ]
         if test_prediction.get("prototype_similarities") is not None:
             prediction_payload["test_prototype_similarities"] = test_prediction["prototype_similarities"]
-        np.savez_compressed(self.output_dir / "final_predictions.npz", **prediction_payload)
+        # Uncompressed npz is much faster to write; size is modest for MIMIC splits.
+        np.savez(self.output_dir / "final_predictions.npz", **prediction_payload)
         state = {
             "format_version": 1,
             "strategy": strategy,
