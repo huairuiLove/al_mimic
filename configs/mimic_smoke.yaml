@@ -1,4 +1,4 @@
-extends: mimic_comal.yaml
+extends: mimic_a800_144c.yaml
 
 experiment:
   name: mimic_iii_smoke
@@ -20,7 +20,10 @@ features:
   ngram_range: [1, 1]
 
 model:
-  hidden_dims: [64, 32]
+  fusion_dim: 32
+  num_heads: 4
+  measurement_layers: 1
+  fusion_layers: 1
 
 comal:
   label_dim: 8
@@ -29,6 +32,9 @@ comal:
 
 training:
   device: cpu
+  precision: fp32
+  gpu_resident_features: false
+  fused_optimizer: false
   batch_size: 64
   comal_batch_size: 8
   eval_batch_size: 128
@@ -43,4 +49,3 @@ active_learning:
   query_size: 20
   candidate_size: 100
   rounds: 2
-

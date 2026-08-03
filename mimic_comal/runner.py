@@ -44,9 +44,7 @@ def _write_json(path: Path, value: Any) -> None:
         )
 
 
-def _async_to_host(
-    tensor: torch.Tensor, copy_stream: torch.cuda.Stream | None
-) -> torch.Tensor:
+def _async_to_host(tensor: torch.Tensor, copy_stream: torch.cuda.Stream | None) -> torch.Tensor:
     """D2H into pinned memory; optional side stream enables compute overlap."""
     if tensor.device.type != "cuda":
         return tensor.detach().cpu()
@@ -106,6 +104,12 @@ class ActiveLearningExperiment:
         labels_payload = json.loads((self.prepared_dir / "labels.json").read_text(encoding="utf-8"))
         self.label_names = tuple(labels_payload["labels"])
         self.labels = label_matrix(self.records, self.label_names)
+        metadata_path = self.feature_dir / "metadata.json"
+        self.feature_metadata = (
+            json.loads(metadata_path.read_text(encoding="utf-8")) if metadata_path.is_file() else {}
+        )
+        if str(config.get("model", {}).get("architecture", "")) == "multimodal_transformer_scratch":
+            config["_feature_metadata"] = self.feature_metadata
         self.features = load_features(
             self.feature_dir,
             len(self.records),
@@ -143,6 +147,9 @@ class ActiveLearningExperiment:
                 "comal": {key: value for key, value in comal_host.items()},
                 "label_names": self.label_names,
                 "feature_dim": int(self.features.shape[1]),
+                "model_initialization": "random",
+                "pretrained_weights": False,
+                "feature_modalities": self.feature_metadata.get("modalities", []),
             },
             checkpoint_dir / "final.pt",
         )
@@ -252,9 +259,7 @@ class ActiveLearningExperiment:
             validation_host = {
                 name: _async_to_host(eval_tensors[name][:split], copy_stream) for name in host_keys
             }
-            test_host = {
-                name: _async_to_host(eval_tensors[name][split:], copy_stream) for name in host_keys
-            }
+            test_host = {name: _async_to_host(eval_tensors[name][split:], copy_stream) for name in host_keys}
             cached_labeled_own = trained.labeled_own_similarity
             cached_labeled_labels = trained.labeled_labels
             if fuse_mode == "paper":
@@ -376,9 +381,7 @@ class ActiveLearningExperiment:
                         elif labeled_tensors is not None:
                             expected_cardinality = labeled_tensors["labels"].sum(dim=1).mean()
                         else:
-                            expected_cardinality = float(
-                                self.labels[np.asarray(labeled)].sum(axis=1).mean()
-                            )
+                            expected_cardinality = float(self.labels[np.asarray(labeled)].sum(axis=1).mean())
                         pool_sims = pool_tensors["prototype_similarities"]
                         pool_own = pool_sims[..., 0] if pool_sims.shape[-1] == 2 else None
                         parts = comal_acquisition_scores(
@@ -427,9 +430,7 @@ class ActiveLearningExperiment:
                 ranked_host: torch.Tensor | None = None
                 if score_tensor is not None and count < int(score_tensor.numel()):
                     # Top-k on the compute stream while pool/component D2H runs on copy_stream.
-                    top_values, top_positions = torch.topk(
-                        score_tensor, k=count, largest=True, sorted=False
-                    )
+                    top_values, top_positions = torch.topk(score_tensor, k=count, largest=True, sorted=False)
                     order = torch.argsort(top_values, descending=True, stable=True)
                     ranked_host = _async_to_host(top_positions[order], copy_stream)
                 if copy_stream is not None:
@@ -475,9 +476,7 @@ class ActiveLearningExperiment:
                 )
             )
             test_metrics.update(
-                multilabel_metrics(
-                    test_prediction["labels"], test_prediction["probabilities"], threshold
-                )
+                multilabel_metrics(test_prediction["labels"], test_prediction["probabilities"], threshold)
             )
             if not will_query:
                 # Final / no-query rounds diagnose on validation; similarities already suffice.

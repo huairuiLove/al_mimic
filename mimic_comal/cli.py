@@ -16,7 +16,7 @@ def build_parser() -> argparse.ArgumentParser:
         "command",
         choices=("prepare", "validate-data", "explore", "features", "active", "visualize", "hardware", "all"),
     )
-    parser.add_argument("--config", default="configs/mimic_comal.yaml")
+    parser.add_argument("--config", default="configs/mimic_a800_144c.yaml")
     parser.add_argument("--name", help="override experiment.name")
     parser.add_argument("--output-root", help="override experiment.output_root")
     parser.add_argument("--device", help="override training.device")

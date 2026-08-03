@@ -27,11 +27,34 @@ def test_synthetic_active_learning_run(tmp_path) -> None:
             handle.write(json.dumps(asdict(record)) + "\n")
     (prepared / "labels.json").write_text(json.dumps({"labels": labels}))
     rng = np.random.default_rng(3)
-    np.save(features_dir / "features.npy", rng.normal(size=(len(records), 12)).astype(np.float16))
+    np.save(features_dir / "features.npy", rng.normal(size=(len(records), 30)).astype(np.float16))
+    (features_dir / "metadata.json").write_text(
+        json.dumps(
+            {
+                "encoder": "multimodal_scratch",
+                "initialization": "random",
+                "pretrained_weights": False,
+                "modalities": [
+                    {"name": "clinical_note", "start": 0, "stop": 6, "shape": [6]},
+                    {"name": "icu_measurements", "start": 6, "stop": 22, "shape": [4, 4]},
+                    {"name": "demographics", "start": 22, "stop": 30, "shape": [8]},
+                ],
+            }
+        )
+    )
     config = {
         "dataset": {"prepared_dir": str(prepared), "feature_dir": str(features_dir)},
         "experiment": {"name": "test", "output_root": str(output)},
-        "model": {"hidden_dims": [16, 8], "dropout": 0.0},
+        "features": {"encoder": "multimodal_scratch"},
+        "model": {
+            "architecture": "multimodal_transformer_scratch",
+            "initialization": "random",
+            "fusion_dim": 16,
+            "num_heads": 4,
+            "measurement_layers": 1,
+            "fusion_layers": 1,
+            "dropout": 0.0,
+        },
         "comal": {"label_dim": 4, "prototype_dim": 4, "anchor_chunk_size": 16},
         "training": {
             "device": "cpu",

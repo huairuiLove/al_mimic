@@ -16,7 +16,9 @@ from torch.utils.data import DataLoader, Dataset
 
 from .data import MIMICRecord
 from .metrics import multilabel_metrics
-from .model import CoMALModule, TextMLPClassifier, supervised_contrastive_loss
+from .model import CoMALModule, MultimodalFusionClassifier, TextMLPClassifier, supervised_contrastive_loss
+
+Classifier = TextMLPClassifier | MultimodalFusionClassifier
 
 
 def label_matrix(records: list[MIMICRecord], label_names: tuple[str, ...]) -> np.ndarray:
@@ -188,9 +190,13 @@ def _autocast(device: torch.device, precision: str):
     return torch.autocast(device_type="cuda", dtype=dtype)
 
 
-def _pos_weight(labels: np.ndarray | torch.Tensor, indices: np.ndarray | torch.Tensor, maximum: float) -> torch.Tensor:
+def _pos_weight(
+    labels: np.ndarray | torch.Tensor, indices: np.ndarray | torch.Tensor, maximum: float
+) -> torch.Tensor:
     if isinstance(labels, torch.Tensor):
-        index_tensor = indices if isinstance(indices, torch.Tensor) else torch.as_tensor(indices, device=labels.device)
+        index_tensor = (
+            indices if isinstance(indices, torch.Tensor) else torch.as_tensor(indices, device=labels.device)
+        )
         selected = labels.index_select(0, index_tensor)
         positives = selected.sum(dim=0)
         negatives = selected.shape[0] - positives
@@ -220,7 +226,7 @@ def _maybe_compile(module: nn.Module, enabled: bool) -> nn.Module:
 
 @dataclass
 class TrainedRound:
-    classifier: TextMLPClassifier
+    classifier: Classifier
     comal: CoMALModule
     history: dict[str, list[float]]
     timings: dict[str, float]
@@ -231,16 +237,36 @@ class TrainedRound:
 
 def build_modules(
     input_dim: int, num_labels: int, config: dict[str, Any], device: torch.device
-) -> tuple[TextMLPClassifier, CoMALModule]:
+) -> tuple[Classifier, CoMALModule]:
     model_cfg = config.get("model", {})
     comal_cfg = config.get("comal", {})
     training = config.get("training", {})
-    hidden = tuple(int(value) for value in model_cfg.get("hidden_dims", [512, 256]))
-    if len(hidden) != 2:
-        raise ValueError("model.hidden_dims must contain exactly two dimensions")
-    classifier = TextMLPClassifier(input_dim, num_labels, hidden, float(model_cfg.get("dropout", 0.2))).to(
-        device
-    )
+    architecture = str(model_cfg.get("architecture", "cached_text_mlp3")).lower()
+    if architecture == "multimodal_transformer_scratch":
+        metadata = config.get("_feature_metadata", {})
+        if metadata.get("pretrained_weights") is not False or metadata.get("initialization") != "random":
+            raise ValueError(
+                "multimodal features must declare random initialization and no pretrained weights"
+            )
+        classifier: Classifier = MultimodalFusionClassifier(
+            input_dim,
+            num_labels,
+            list(metadata.get("modalities", [])),
+            hidden_dim=int(model_cfg.get("fusion_dim", 256)),
+            num_heads=int(model_cfg.get("num_heads", 8)),
+            measurement_layers=int(model_cfg.get("measurement_layers", 2)),
+            fusion_layers=int(model_cfg.get("fusion_layers", 2)),
+            dropout=float(model_cfg.get("dropout", 0.1)),
+        ).to(device)
+    elif architecture == "cached_text_mlp3":
+        hidden = tuple(int(value) for value in model_cfg.get("hidden_dims", [512, 256]))
+        if len(hidden) != 2:
+            raise ValueError("model.hidden_dims must contain exactly two dimensions")
+        classifier = TextMLPClassifier(
+            input_dim, num_labels, hidden, float(model_cfg.get("dropout", 0.2))
+        ).to(device)
+    else:
+        raise ValueError("model.architecture must be multimodal_transformer_scratch or cached_text_mlp3")
     comal = CoMALModule(
         classifier.feature_dim,
         num_labels,
@@ -255,7 +281,7 @@ def build_modules(
 
 @torch.inference_mode()
 def _cache_classifier_features(
-    classifier: TextMLPClassifier,
+    classifier: Classifier,
     feature_tensor: torch.Tensor,
     index_tensor: torch.Tensor | None,
     eval_batch_size: int,
@@ -544,7 +570,9 @@ def train_round(
                 comal,
                 feature_tensor,
                 label_tensor,
-                index_tensor if index_tensor is not None else torch.as_tensor(indices, device=device, dtype=torch.long),
+                index_tensor
+                if index_tensor is not None
+                else torch.as_tensor(indices, device=device, dtype=torch.long),
                 int(training.get("eval_batch_size", 1024)),
             )
         else:
@@ -610,7 +638,7 @@ def _refresh_prototypes_from_cached(
 
 @torch.inference_mode()
 def _refresh_prototypes_tensors(
-    classifier: TextMLPClassifier,
+    classifier: Classifier,
     comal: CoMALModule,
     feature_tensor: torch.Tensor,
     label_tensor: torch.Tensor,
@@ -647,7 +675,7 @@ def _refresh_prototypes_tensors(
 
 @torch.inference_mode()
 def refresh_prototypes(
-    classifier: TextMLPClassifier,
+    classifier: Classifier,
     comal: CoMALModule,
     features: np.ndarray,
     labels: np.ndarray,
@@ -742,7 +770,9 @@ def predict_tensors(
         )
         out_similarities = torch.empty(count, num_labels, sim_width, dtype=torch.float32, device=device)
 
-        def _write(start: int, stop: int, output: dict[str, torch.Tensor], comal_output: dict[str, torch.Tensor]) -> None:
+        def _write(
+            start: int, stop: int, output: dict[str, torch.Tensor], comal_output: dict[str, torch.Tensor]
+        ) -> None:
             # Write through into preallocated buffers to avoid temporary activations.
             torch.sigmoid(output["logits"], out=out_probs[start:stop])
             sims = comal_output["prototype_similarities"]

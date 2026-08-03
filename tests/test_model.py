@@ -4,11 +4,36 @@ import torch
 
 from mimic_comal.model import (
     CoMALModule,
+    MultimodalFusionClassifier,
     comal_acquisition_scores,
     paper_comal_acquisition_scores,
     positive_similarity_thresholds,
     supervised_contrastive_loss,
 )
+
+
+def test_scratch_multimodal_classifier_shapes() -> None:
+    layout = [
+        {"name": "clinical_note", "start": 0, "stop": 6, "shape": [6]},
+        {"name": "icu_measurements", "start": 6, "stop": 22, "shape": [4, 4]},
+        {"name": "demographics", "start": 22, "stop": 30, "shape": [8]},
+    ]
+    torch.manual_seed(3)
+    model = MultimodalFusionClassifier(
+        30,
+        5,
+        layout,
+        hidden_dim=16,
+        num_heads=4,
+        measurement_layers=1,
+        fusion_layers=1,
+        dropout=0.0,
+    )
+    result = model(torch.randn(7, 30))
+    assert result["features"].shape == (7, 16)
+    assert result["logits"].shape == (7, 5)
+    assert all(parameter.requires_grad for parameter in model.parameters())
+    assert torch.isfinite(result["logits"]).all()
 
 
 def test_comal_shapes_and_loss_are_finite() -> None:

@@ -1,8 +1,0 @@
-extends: mimic_comal.yaml
-
-experiment:
-  name: mimic_iii_random
-
-active_learning:
-  strategy: random
-

@@ -35,6 +35,123 @@ class TextMLPClassifier(nn.Module):
         return {"logits": self.classifier(fused), "features": fused}
 
 
+class MultimodalFusionClassifier(nn.Module):
+    """Scratch encoders for notes, ICU measurements, and demographics.
+
+    The measurement Transformer and late modality Transformer mirror the
+    encoder/fusion pattern in ``multimodal-clinical-pretraining``. Cached inputs
+    contain no learned neural representations; every parameter here is newly
+    initialized for the active-learning run.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        num_labels: int,
+        modalities: list[dict[str, object]],
+        *,
+        hidden_dim: int = 256,
+        num_heads: int = 8,
+        measurement_layers: int = 2,
+        fusion_layers: int = 2,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        by_name = {str(item["name"]): item for item in modalities}
+        required = {"clinical_note", "icu_measurements", "demographics"}
+        if set(by_name) != required:
+            raise ValueError(f"multimodal layout must contain exactly {sorted(required)}")
+        self.slices: dict[str, tuple[int, int]] = {}
+        for name, item in by_name.items():
+            start, stop = int(item["start"]), int(item["stop"])
+            if not 0 <= start < stop <= input_dim:
+                raise ValueError(f"invalid {name} feature slice [{start}, {stop})")
+            self.slices[name] = (start, stop)
+        measurement_shape = [int(value) for value in by_name["icu_measurements"]["shape"]]  # type: ignore[index]
+        if len(measurement_shape) != 2 or measurement_shape[0] * measurement_shape[1] != (
+            self.slices["icu_measurements"][1] - self.slices["icu_measurements"][0]
+        ):
+            raise ValueError("icu_measurements shape does not match its cached feature slice")
+        self.measurement_shape = (measurement_shape[0], measurement_shape[1])
+        if hidden_dim % num_heads:
+            raise ValueError("model.fusion_dim must be divisible by model.num_heads")
+
+        text_dim = self.slices["clinical_note"][1] - self.slices["clinical_note"][0]
+        static_dim = self.slices["demographics"][1] - self.slices["demographics"][0]
+        self.text_encoder = nn.Sequential(
+            nn.LayerNorm(text_dim),
+            nn.Linear(text_dim, hidden_dim),
+            nn.GELU(approximate="tanh"),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.measurement_projection = nn.Linear(self.measurement_shape[1], hidden_dim)
+        measurement_layer = nn.TransformerEncoderLayer(
+            hidden_dim,
+            num_heads,
+            dim_feedforward=hidden_dim * 4,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.measurement_encoder = nn.TransformerEncoder(
+            measurement_layer, measurement_layers, enable_nested_tensor=False
+        )
+        self.measurement_cls = nn.Parameter(torch.empty(1, 1, hidden_dim))
+        self.measurement_position = nn.Parameter(torch.empty(1, self.measurement_shape[0] + 1, hidden_dim))
+        self.static_encoder = nn.Sequential(
+            nn.LayerNorm(static_dim),
+            nn.Linear(static_dim, hidden_dim),
+            nn.GELU(approximate="tanh"),
+            nn.Dropout(dropout),
+        )
+        fusion_layer = nn.TransformerEncoderLayer(
+            hidden_dim,
+            num_heads,
+            dim_feedforward=hidden_dim * 4,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.fusion_encoder = nn.TransformerEncoder(fusion_layer, fusion_layers, enable_nested_tensor=False)
+        self.modality_embedding = nn.Parameter(torch.empty(1, 3, hidden_dim))
+        self.output_norm = nn.LayerNorm(hidden_dim)
+        self.classifier = nn.Linear(hidden_dim, num_labels)
+        self.feature_dim = hidden_dim
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+        nn.init.normal_(self.measurement_cls, std=0.02)
+        nn.init.normal_(self.measurement_position, std=0.02)
+        nn.init.normal_(self.modality_embedding, std=0.02)
+
+    def _select(self, features: torch.Tensor, name: str) -> torch.Tensor:
+        start, stop = self.slices[name]
+        return features[:, start:stop]
+
+    def forward(self, features: torch.Tensor) -> dict[str, torch.Tensor]:
+        inputs = features if features.dtype == torch.float32 else features.float()
+        text_token = self.text_encoder(self._select(inputs, "clinical_note"))
+        measurement = self._select(inputs, "icu_measurements").reshape(
+            -1, self.measurement_shape[0], self.measurement_shape[1]
+        )
+        measurement = self.measurement_projection(measurement)
+        cls = self.measurement_cls.expand(measurement.shape[0], -1, -1)
+        measurement = torch.cat((cls, measurement), dim=1) + self.measurement_position
+        measurement_token = self.measurement_encoder(measurement)[:, 0]
+        static_token = self.static_encoder(self._select(inputs, "demographics"))
+        tokens = torch.stack((text_token, measurement_token, static_token), dim=1)
+        fused = self.output_norm(self.fusion_encoder(tokens + self.modality_embedding).mean(dim=1))
+        return {"logits": self.classifier(fused), "features": fused}
+
+
 class CoMALModule(nn.Module):
     """Label-wise latent reconstruction module used by CoMAL.
 
@@ -244,9 +361,7 @@ def paper_comal_acquisition_scores(
     if own_similarity is None:
         if latent_features is None:
             raise ValueError("latent_features or own_similarity is required")
-        own_similarity = own_prototype_similarity(
-            latent_features, prototypes, int(probabilities.shape[1])
-        )
+        own_similarity = own_prototype_similarity(latent_features, prototypes, int(probabilities.shape[1]))
     prototype_positive = own_similarity > positive_thresholds[None, :]
     prototype_positive_count = prototype_positive.sum(dim=1).float()
     # Keep expected_cardinality on-device when passed as a tensor to avoid a mid-pipeline sync.

@@ -8,6 +8,29 @@ from typing import Any
 import yaml
 
 
+def _validate_scratch_multimodal(config: dict[str, Any]) -> None:
+    model = config.get("model", {})
+    if str(model.get("architecture", "")).lower() != "multimodal_transformer_scratch":
+        return
+    features = config.get("features", {})
+    if str(features.get("encoder", "")).lower() != "multimodal_scratch":
+        raise ValueError("scratch multimodal model requires features.encoder=multimodal_scratch")
+    if str(model.get("initialization", "")).lower() != "random":
+        raise ValueError("scratch multimodal model requires model.initialization=random")
+    forbidden = ("pretrained", "checkpoint", "model_path", "weights_path", "resume_from")
+
+    def visit(value: Any, prefix: str = "") -> None:
+        if not isinstance(value, dict):
+            return
+        for key, child in value.items():
+            path = f"{prefix}.{key}" if prefix else str(key)
+            if any(token in str(key).lower() for token in forbidden) and child not in (None, False, ""):
+                raise ValueError(f"pretrained/checkpoint input is forbidden for scratch training: {path}")
+            visit(child, path)
+
+    visit(config)
+
+
 def _merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
     result = dict(base)
     for key, value in override.items():
@@ -31,6 +54,7 @@ def load_config(path: str | Path) -> dict[str, Any]:
             parent_path = path.parent / parent_path
         config = _merge(load_config(parent_path), config)
     config["_config_path"] = str(path.resolve())
+    _validate_scratch_multimodal(config)
     return config
 
 
@@ -54,6 +78,32 @@ def require_paths(config: dict[str, Any]) -> dict[str, Path]:
     missing = [name for name, value in paths.items() if name != "root" and not value.is_file()]
     if missing:
         raise FileNotFoundError("missing MIMIC-III files: " + ", ".join(missing))
+    return paths
+
+
+def require_multimodal_paths(config: dict[str, Any]) -> dict[str, Path]:
+    """Resolve the additional raw tables required by the multimodal adapter."""
+    paths = require_paths(config)
+    dataset = config.get("dataset", {})
+    root = paths["root"]
+
+    def table_path(config_key: str, table_name: str) -> Path:
+        explicit = dataset.get(config_key)
+        if explicit:
+            return Path(explicit)
+        compressed = root / f"{table_name}.csv.gz"
+        return compressed if compressed.is_file() else root / f"{table_name}.csv"
+
+    paths.update(
+        {
+            "patients": table_path("patients", "PATIENTS"),
+            "icustays": table_path("icustays", "ICUSTAYS"),
+            "chartevents": table_path("chartevents", "CHARTEVENTS"),
+        }
+    )
+    missing = [name for name in ("patients", "icustays", "chartevents") if not paths[name].is_file()]
+    if missing:
+        raise FileNotFoundError("missing multimodal MIMIC-III files: " + ", ".join(missing))
     return paths
 
 

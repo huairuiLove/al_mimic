@@ -9,7 +9,6 @@ description = "Adapter-only CoMAL reproduction and diagnostics for MIMIC-III"
 requires-python = ">=3.10,<3.14"
 dependencies = [
   "torch>=2.1",
-  "transformers>=4.35",
   "numpy>=1.24",
   "scipy>=1.10",
   "scikit-learn>=1.3",

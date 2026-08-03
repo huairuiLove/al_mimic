@@ -65,8 +65,11 @@ def multilabel_metrics(
         metrics["auroc_macro"] = None
     label_sums = labels.sum(axis=1)
     max_k = min(5, labels.shape[1])
-    # One top-5 partition; slice prefixes for P@1/P@3/P@5.
+    # Partition finds the top set but does not order it. Sort that small set so
+    # prefix metrics (P@1/P@3) use the true highest-probability labels.
     top5 = np.argpartition(-probabilities, kth=max_k - 1, axis=1)[:, :max_k]
+    top5_probabilities = np.take_along_axis(probabilities, top5, axis=1)
+    top5 = np.take_along_axis(top5, np.argsort(-top5_probabilities, axis=1), axis=1)
     top5_labels = np.take_along_axis(labels, top5, axis=1)
     for k in (1, 3, 5):
         actual_k = min(k, labels.shape[1])

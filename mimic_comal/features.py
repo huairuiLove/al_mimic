@@ -1,4 +1,4 @@
-"""Leakage-safe text feature extraction and memory-mapped feature cache."""
+"""Leakage-safe scratch text and structured multimodal feature cache."""
 
 from __future__ import annotations
 
@@ -9,22 +9,21 @@ from typing import Any
 
 import joblib
 import numpy as np
-import torch
-import torch.nn.functional as F
-from tqdm import tqdm
-
 from .data import MIMICRecord, load_records
-from .runtime import effective_cpu_count
+from .config import require_multimodal_paths
+from .multimodal import build_structured_modalities
 
 
 def _fingerprint(records: list[MIMICRecord], cfg: dict[str, Any]) -> str:
-    # Keep sha256 so existing feature caches remain valid across adapter upgrades.
     digest = hashlib.sha256()
     update = digest.update
     # Batch the membership string to cut Python call overhead on 50k+ records.
     chunk: list[str] = []
     for index, record in enumerate(records):
-        chunk.append(f"{record.row_index}:{record.hadm_id}:{record.split}\n")
+        text_digest = hashlib.sha256(record.text.encode("utf-8")).hexdigest()
+        chunk.append(
+            f"{record.row_index}:{record.hadm_id}:{record.split}:{','.join(record.labels)}:{text_digest}\n"
+        )
         if (index & 1023) == 1023:
             update("".join(chunk).encode())
             chunk.clear()
@@ -94,125 +93,43 @@ def _tfidf_features(records: list[MIMICRecord], cfg: dict[str, Any]) -> tuple[np
     }
 
 
-def _bert_features(records: list[MIMICRecord], cfg: dict[str, Any]) -> tuple[np.ndarray, dict[str, Any]]:
-    from concurrent.futures import ThreadPoolExecutor
-
-    from transformers import AutoModel, AutoTokenizer
-
-    model_path = str(cfg.get("model_path", "CoMAL-main/bert/bert-base-uncased"))
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_path, local_files_only=bool(cfg.get("local_files_only", True))
-    )
-    model = AutoModel.from_pretrained(
-        model_path,
-        local_files_only=bool(cfg.get("local_files_only", True)),
-        output_attentions=False,
-        output_hidden_states=False,
-    )
-    device = torch.device(str(cfg.get("device", "cuda" if torch.cuda.is_available() else "cpu")))
-    model.to(device).eval()
-    model.requires_grad_(False)
-    if device.type == "cuda" and bool(cfg.get("torch_compile", False)) and hasattr(torch, "compile"):
-        try:
-            model = torch.compile(model, mode="reduce-overhead", dynamic=True)  # type: ignore[assignment]
-        except Exception:
-            pass
-    if device.type == "cuda":
-        torch.backends.cudnn.benchmark = True
-        # Prefer cudnn SDPA / flash paths for encoder self-attention.
-        try:
-            torch.backends.cuda.enable_flash_sdp(True)
-            torch.backends.cuda.enable_mem_efficient_sdp(True)
-        except Exception:
-            pass
-    batch_size = int(cfg.get("batch_size", 128))
-    max_length = int(cfg.get("max_length", 256))
-    precision = str(cfg.get("precision", "bf16")).lower()
-    if device.type != "cuda":
-        precision = "fp32"
-    autocast_dtype = torch.bfloat16 if precision == "bf16" else torch.float16
-    use_autocast = precision != "fp32" and device.type == "cuda"
-
-    # Prefer the fast tokenizer backend and keep a deep CPU tokenize queue.
-    # 18-core quota: 4 tokenizers leave headroom for gzip/Python while GPU encodes.
-    tokenize_workers = max(1, min(4, max(2, effective_cpu_count() // 4)))
-
-    def tokenize(start: int) -> dict[str, torch.Tensor]:
-        texts = [record.text for record in records[start : start + batch_size]]
-        batch = tokenizer(
-            texts,
-            return_tensors="pt",
-            truncation=True,
-            padding=True,
-            max_length=max_length,
-        )
-        # Pin on the tokenize worker so H2D can be truly async with the encode stream.
-        if device.type == "cuda":
-            batch = {key: value.pin_memory() for key, value in batch.items()}
-        return batch
-
-    starts = list(range(0, len(records), batch_size))
-    # Preallocate host buffer; avoids repeated concatenate + dtype casts.
-    feature_dim = int(getattr(model.config, "hidden_size", 768))
-    host_features = np.empty((len(records), feature_dim), dtype=np.float16)
-    copy_stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
-    # Double-buffer pinned host slots so D2H of batch N overlaps encode of batch N+1.
-    pin = device.type == "cuda"
-    host_slots = [
-        torch.empty((batch_size, feature_dim), dtype=torch.float16, pin_memory=pin),
-        torch.empty((batch_size, feature_dim), dtype=torch.float16, pin_memory=pin),
-    ]
-    # (slot, start, width, gpu_tensor_keepalive)
-    pending_copy: tuple[int, int, int, torch.Tensor] | None = None
-
-    def _flush_copy(slot: int, row_start: int, width: int, _keepalive: torch.Tensor) -> None:
-        if copy_stream is not None:
-            copy_stream.synchronize()
-        host_features[row_start : row_start + width] = host_slots[slot][:width].numpy()
-
-    with ThreadPoolExecutor(max_workers=tokenize_workers) as pool:
-        pending = [pool.submit(tokenize, start) for start in starts[:tokenize_workers]]
-        next_submit = len(pending)
-        for offset, start in enumerate(tqdm(starts, desc="encode MIMIC notes")):
-            batch = pending[offset].result() if offset < len(pending) else tokenize(start)
-            if next_submit < len(starts):
-                pending.append(pool.submit(tokenize, starts[next_submit]))
-                next_submit += 1
-            batch = {key: value.to(device, non_blocking=True) for key, value in batch.items()}
-            with torch.inference_mode():
-                if use_autocast:
-                    with torch.autocast(device_type="cuda", dtype=autocast_dtype):
-                        output = model(**batch)
-                else:
-                    output = model(**batch)
-                hidden = getattr(output, "pooler_output", None)
-                if hidden is None:
-                    hidden = output.last_hidden_state[:, 0]
-                hidden = F.normalize(hidden.float(), dim=1)
-            stop = min(start + batch_size, len(records))
-            width = stop - start
-            slot = offset & 1
-            # Wait only for the previous copy into this same slot (N-2), not the latest D2H.
-            if pending_copy is not None and pending_copy[0] == slot:
-                _flush_copy(*pending_copy)
-                pending_copy = None
-            host = host_slots[slot][:width]
-            if copy_stream is not None:
-                compute_stream = torch.cuda.current_stream(device)
-                copy_stream.wait_stream(compute_stream)
-                gpu_fp16 = hidden[:width].to(dtype=torch.float16)
-                with torch.cuda.stream(copy_stream):
-                    host.copy_(gpu_fp16, non_blocking=True)
-                pending_copy = (slot, start, width, gpu_fp16)
-            else:
-                host.copy_(hidden[:width].to(dtype=torch.float16))
-                host_features[start:stop] = host.numpy()
-        if pending_copy is not None:
-            _flush_copy(*pending_copy)
-    return host_features, {
-        "encoder": "bert",
-        "dimension": feature_dim,
-        "model_path": model_path,
+def _multimodal_features(
+    records: list[MIMICRecord], config: dict[str, Any], cfg: dict[str, Any]
+) -> tuple[np.ndarray, dict[str, Any]]:
+    text, text_metadata = _tfidf_features(records, cfg)
+    paths = require_multimodal_paths(config)
+    measurements, demographics, structured_metadata = build_structured_modalities(records, paths, cfg)
+    text_stop = int(text.shape[1])
+    measurement_stop = text_stop + int(measurements.shape[1])
+    values = np.concatenate((text.astype(np.float32), measurements, demographics), axis=1).astype(np.float16)
+    return values, {
+        "encoder": "multimodal_scratch",
+        "dimension": int(values.shape[1]),
+        "initialization": "random",
+        "pretrained_weights": False,
+        "modalities": [
+            {"name": "clinical_note", "start": 0, "stop": text_stop, "shape": [text_stop]},
+            {
+                "name": "icu_measurements",
+                "start": text_stop,
+                "stop": measurement_stop,
+                "shape": structured_metadata["measurement_shape"],
+            },
+            {
+                "name": "demographics",
+                "start": measurement_stop,
+                "stop": int(values.shape[1]),
+                "shape": [int(demographics.shape[1])],
+            },
+        ],
+        "text": {
+            "dimension": text_stop,
+            "vocabulary_size": text_metadata["vocabulary_size"],
+            "explained_variance": text_metadata["explained_variance"],
+        },
+        "structured": structured_metadata,
+        "vectorizer": text_metadata["vectorizer"],
+        "svd": text_metadata["svd"],
     }
 
 
@@ -225,14 +142,20 @@ def build_features(
     output.mkdir(parents=True, exist_ok=True)
     records = load_records(prepared)
     feature_cfg = config.get("features", {})
-    fingerprint = _fingerprint(records, feature_cfg)
+    fingerprint_cfg = dict(feature_cfg)
+    if str(feature_cfg.get("encoder", "multimodal_scratch")).lower() == "multimodal_scratch":
+        for name, path in require_multimodal_paths(config).items():
+            if name != "root":
+                stat = path.stat()
+                fingerprint_cfg[f"source_{name}"] = [str(path.resolve()), stat.st_size, stat.st_mtime_ns]
+    fingerprint = _fingerprint(records, fingerprint_cfg)
     metadata_path = output / "metadata.json"
     feature_path = output / "features.npy"
     if metadata_path.is_file() and feature_path.is_file():
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
         if metadata.get("fingerprint") == fingerprint:
             return metadata | {"output_dir": str(output), "cached": True}
-    encoder = str(feature_cfg.get("encoder", "tfidf")).lower()
+    encoder = str(feature_cfg.get("encoder", "multimodal_scratch")).lower()
     if encoder in {"tfidf", "tfidf_svd", "svd"}:
         values, extra = _tfidf_features(records, feature_cfg)
         # Persist sklearn objects separately; metadata remains JSON serializable.
@@ -241,13 +164,18 @@ def build_features(
             output / "tfidf.joblib",
             compress=int(feature_cfg.get("joblib_compress", 1)),
         )
-    elif encoder in {"bert", "bert-base-uncased"}:
-        values, extra = _bert_features(records, feature_cfg)
+    elif encoder == "multimodal_scratch":
+        values, extra = _multimodal_features(records, config, feature_cfg)
+        joblib.dump(
+            {"vectorizer": extra.pop("vectorizer"), "svd": extra.pop("svd")},
+            output / "text_tfidf.joblib",
+            compress=int(feature_cfg.get("joblib_compress", 1)),
+        )
     else:
-        raise ValueError("features.encoder must be tfidf or bert")
+        raise ValueError("features.encoder must be multimodal_scratch or tfidf")
     np.save(feature_path, values)
     metadata = {
-        "format_version": 1,
+        "format_version": 2,
         "fingerprint": fingerprint,
         "records": len(records),
         "dtype": str(values.dtype),
@@ -283,7 +211,9 @@ def load_features(
     if expected_encoder and metadata_path.is_file():
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
         actual = str(metadata.get("encoder", ""))
-        expected = "tfidf_svd" if expected_encoder.lower() in {"tfidf", "tfidf_svd", "svd"} else "bert"
+        expected = (
+            "tfidf_svd" if expected_encoder.lower() in {"tfidf", "tfidf_svd", "svd"} else "multimodal_scratch"
+        )
         if actual != expected:
             raise ValueError(
                 f"feature cache encoder={actual!r}, expected {expected!r}; run `features` with the selected config"
