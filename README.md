@@ -1,4 +1,4 @@
-# Multimodal CoMAL on MIMIC-III
+# CoMAL, MM-CoMAL and MoSAIC on MIMIC-III
 
 本仓库在 MIMIC-III 1.4 上进行多标签主动学习。当前默认输入包含三种模态：
 
@@ -19,6 +19,20 @@
 
 这里不是论文结果的逐项复现：论文研究 IHM/Phenotyping 和多模态预训练，本仓库研究 ICD-9 多标签
 主动学习。应用的是其编码/融合架构，保留当前 CoMAL 标签原型和查询流程。
+
+## 三种可复现方案
+
+三臂使用同一份 `prepared/mimic_iii`、同一特征缓存、数据划分、随机种子、初始标注集和预算：
+
+| 配置 | 方法 | 采集信号 |
+|---|---|---|
+| `configs/mimic_comal.yaml` | 纯 CoMAL | 发布代码的正原型证据乘基数失配 |
+| `configs/mimic_mm_comal.yaml` | MM-CoMAL | 四视图标签原型、逐模态可靠度与证据离散度 |
+| `configs/mimic_mosaic.yaml` | MoSAIC | Fisher c-最优价值的 8 联盟 Möbius 协同分解 |
+
+三臂限定在完备模态 ICU 队列：首个 ICU stay 的 48 小时窗口至少有 6 个有效测量分箱。
+`prepare` 会把门控前后的记录数、患者数、标签频次和平均标签基数写入 `audit.json` 与
+`manifest.json`。这是队列选择条件，不是输入特征。
 
 ## 从头训练保证
 
@@ -71,12 +85,32 @@ chmod +x scripts/*.sh
 ./scripts/run_a800.sh all
 ```
 
+一次运行三种方案并生成 `experiments/three_method_comparison.png`：
+
+```bash
+chmod +x scripts/run_three_methods.sh
+./scripts/run_three_methods.sh all
+```
+
+也可以只运行训练阶段；它会复用已经生成的共享数据和特征：
+
+```bash
+./scripts/run_three_methods.sh active
+```
+
 小规模 CPU 结构检查使用：
 
 ```bash
 python main.py all --config configs/mimic_smoke.yaml
+python main.py active --config configs/mimic_mm_comal_smoke.yaml
+python main.py active --config configs/mimic_mosaic_smoke.yaml
 pytest
 ```
+
+MM-CoMAL 每轮额外记录逐视图可靠度/权重与证据离散度。MoSAIC 记录筛选分支证书、联盟高阶项均值、
+线性化告警和实际 deflation 步数。正式 MoSAIC 配置精确枚举 3 个模态的全部 8 个联盟，每个联盟使用
+4 个独立伙伴；默认按该轮精算分数整批选取。`mosaic.deflation_steps > 0` 会对相应数量的批内选择执行
+Sherman-Morrison 更新并重算全格，适合小批量消融，但计算量会线性放大。
 
 首次 `features` 必须顺序扫描体积很大的 `CHARTEVENTS`，之后会复用带源文件指纹的缓存。A800 配置
 将数值缓存常驻显存，以 BF16 训练随机初始化的 Transformer，并使用 FP32/TF32 完成需要稳定性的

@@ -6,6 +6,8 @@ from mimic_comal.model import (
     CoMALModule,
     MultimodalFusionClassifier,
     comal_acquisition_scores,
+    estimate_mm_comal_statistics,
+    mm_comal_acquisition_scores,
     paper_comal_acquisition_scores,
     positive_similarity_thresholds,
     supervised_contrastive_loss,
@@ -29,9 +31,12 @@ def test_scratch_multimodal_classifier_shapes() -> None:
         fusion_layers=1,
         dropout=0.0,
     )
-    result = model(torch.randn(7, 30))
+    inputs = torch.randn(7, 30)
+    result = model(inputs, return_tokens=True)
     assert result["features"].shape == (7, 16)
     assert result["logits"].shape == (7, 5)
+    assert result["modality_tokens"].shape == (7, 3, 16)
+    assert torch.allclose(result["features"], model.fuse_from_tokens(result["modality_tokens"]))
     assert all(parameter.requires_grad for parameter in model.parameters())
     assert torch.isfinite(result["logits"]).all()
 
@@ -73,3 +78,49 @@ def test_acquisition_components_have_one_score_per_sample() -> None:
     )
     assert paper_scores.combined.shape == (9,)
     assert torch.isfinite(paper_scores.combined).all()
+
+
+def test_mm_comal_reduces_to_paper_score_at_alpha_zero() -> None:
+    torch.manual_seed(7)
+    sample_count, view_count, label_count = 11, 4, 3
+    probabilities = torch.rand(sample_count, label_count)
+    labels = (torch.rand(9, label_count) > 0.55).float()
+    labels[0] = 1.0
+    labeled_similarity = torch.rand(9, view_count, label_count) * 2.0 - 1.0
+    candidate_similarity = torch.rand(sample_count, view_count, label_count) * 2.0 - 1.0
+    statistics = estimate_mm_comal_statistics(
+        labeled_similarity,
+        labels,
+        threshold_estimator="midpoint",
+    )
+    expected_cardinality = labels.sum(dim=1).mean()
+    mm_scores = mm_comal_acquisition_scores(
+        probabilities,
+        candidate_similarity,
+        statistics,
+        expected_cardinality=expected_cardinality,
+        alpha=0.0,
+    )
+    paper_thresholds = positive_similarity_thresholds(
+        None,
+        labels,
+        torch.empty(label_count + 1, 1),
+        own_similarity=labeled_similarity[:, -1],
+    )
+    paper_scores = paper_comal_acquisition_scores(
+        probabilities,
+        None,
+        torch.empty(label_count + 1, 1),
+        paper_thresholds,
+        expected_cardinality=expected_cardinality,
+        own_similarity=candidate_similarity[:, -1],
+    )
+    assert torch.equal(mm_scores.combined, paper_scores.combined)
+
+
+def test_multiview_comal_shapes() -> None:
+    module = CoMALModule(12, 4, label_dim=6, prototype_dim=5, num_views=4)
+    output = module(torch.randn(8, 4, 12), compute_similarities="own_bg")
+    assert output["latent_features"].shape == (8, 4, 4, 5)
+    assert output["prototype_similarities"].shape == (8, 4, 4, 2)
+    assert output["reconstructed_features"].shape == (8, 12)

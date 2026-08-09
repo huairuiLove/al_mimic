@@ -4,12 +4,14 @@ import json
 from dataclasses import asdict
 
 import numpy as np
+import pytest
 
 from mimic_comal.data import MIMICRecord
 from mimic_comal.runner import ActiveLearningExperiment
 
 
-def test_synthetic_active_learning_run(tmp_path) -> None:
+@pytest.mark.parametrize("strategy", ["comal", "mm_comal", "mosaic"])
+def test_synthetic_active_learning_run(tmp_path, strategy: str) -> None:
     prepared = tmp_path / "prepared"
     features_dir = prepared / "features"
     output = tmp_path / "experiments"
@@ -44,7 +46,7 @@ def test_synthetic_active_learning_run(tmp_path) -> None:
     )
     config = {
         "dataset": {"prepared_dir": str(prepared), "feature_dir": str(features_dir)},
-        "experiment": {"name": "test", "output_root": str(output)},
+        "experiment": {"name": strategy, "output_root": str(output)},
         "features": {"encoder": "multimodal_scratch"},
         "model": {
             "architecture": "multimodal_transformer_scratch",
@@ -54,8 +56,14 @@ def test_synthetic_active_learning_run(tmp_path) -> None:
             "measurement_layers": 1,
             "fusion_layers": 1,
             "dropout": 0.0,
+            "modality_dropout": 0.1 if strategy != "comal" else 0.0,
         },
-        "comal": {"label_dim": 4, "prototype_dim": 4, "anchor_chunk_size": 16},
+        "comal": {
+            "label_dim": 4,
+            "prototype_dim": 4,
+            "anchor_chunk_size": 16,
+            "cross_modal_weight": 0.1,
+        },
         "training": {
             "device": "cpu",
             "precision": "fp32",
@@ -69,15 +77,35 @@ def test_synthetic_active_learning_run(tmp_path) -> None:
             "seed": 2,
         },
         "active_learning": {
-            "strategy": "comal",
+            "strategy": strategy,
             "initial_labeled": 8,
             "query_size": 3,
             "candidate_size": 12,
             "rounds": 2,
         },
+        "acquisition": {
+            "formula": "paper_mm" if strategy == "mm_comal" else "paper",
+            "mm": {
+                "alpha": 1.0,
+                "reliability_shrinkage": 2.0,
+                "threshold_shrinkage": 2.0,
+                "threshold_estimator": "shrunk",
+            },
+        },
+        "mosaic": {
+            "eta": 0.25,
+            "partners": 1,
+            "mixup_closure_samples": 4,
+            "workset_size": 6,
+            "synergy_workset_size": 4,
+            "damping": 0.1,
+            "fusion_batch_size": 32,
+            "value_batch_size": 32,
+            "deflation_steps": 1,
+        },
     }
     result = ActiveLearningExperiment(config).run()
-    experiment = output / "test"
+    experiment = output / strategy
     assert result["rounds"] == 2
     assert (experiment / "active_state.json").is_file()
     assert (experiment / "final_metrics.json").is_file()

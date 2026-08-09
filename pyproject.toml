@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "mimic-iii-comal"
 version = "0.1.0"
-description = "Adapter-only CoMAL reproduction and diagnostics for MIMIC-III"
+description = "CoMAL, MM-CoMAL, and MoSAIC active learning on MIMIC-III"
 requires-python = ">=3.10,<3.14"
 dependencies = [
   "torch>=2.1",
@@ -26,7 +26,7 @@ dev = ["pytest>=8.0", "ruff>=0.12"]
 mimic-comal = "mimic_comal.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["mimic_comal*"]
+include = ["mimic_comal*", "mosaic*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

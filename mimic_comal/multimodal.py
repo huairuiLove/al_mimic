@@ -171,6 +171,52 @@ def _measurement_lookup() -> dict[str, tuple[int, Callable[[float], float], floa
     return result
 
 
+def count_observed_measurement_bins(
+    records: list[MIMICRecord], paths: dict[str, Path], cfg: dict[str, Any]
+) -> np.ndarray:
+    """Count non-empty bins in each admission's first-ICU-stay measurement window."""
+    contexts = load_admission_contexts(records, paths)
+    row_by_hadm = {record.hadm_id: record.row_index for record in records}
+    window_hours = float(cfg.get("measurement_window_hours", 48))
+    bin_hours = float(cfg.get("measurement_bin_hours", 2))
+    if window_hours <= 0 or bin_hours <= 0 or window_hours % bin_hours != 0:
+        raise ValueError("measurement window and bin hours must be positive and evenly divisible")
+    time_bins = int(window_hours / bin_hours)
+    observed = np.zeros((len(records), time_bins), dtype=bool)
+    lookup = _measurement_lookup()
+    rows = _read_rows(paths["chartevents"])
+    positions = _columns(next(rows), ("HADM_ID", "ICUSTAY_ID", "ITEMID", "CHARTTIME", "VALUENUM"))
+    minimum_width = max(positions.values())
+    for row in tqdm(rows, desc="scan MIMIC-III cohort measurement bins", unit="rows"):
+        if len(row) <= minimum_width:
+            continue
+        item = lookup.get(row[positions["ITEMID"]])
+        hadm_id = row[positions["HADM_ID"]]
+        context = contexts.get(hadm_id)
+        if item is None or context is None or context.icu_start is None:
+            continue
+        stay_id = row[positions["ICUSTAY_ID"]]
+        if context.icu_stay_id and stay_id and stay_id != context.icu_stay_id:
+            continue
+        chart_time = _parse_time(row[positions["CHARTTIME"]])
+        if chart_time is None:
+            continue
+        elapsed = (chart_time - context.icu_start).total_seconds() / 3600.0
+        if elapsed < 0 or elapsed >= window_hours:
+            continue
+        try:
+            raw_value = float(row[positions["VALUENUM"]])
+        except ValueError:
+            continue
+        _variable, transform, minimum, maximum = item
+        value = transform(raw_value)
+        if not np.isfinite(value) or value < minimum or value > maximum:
+            continue
+        record_row = row_by_hadm[hadm_id]
+        observed[record_row, min(int(elapsed / bin_hours), time_bins - 1)] = True
+    return observed.sum(axis=1, dtype=np.int32)
+
+
 def build_structured_modalities(
     records: list[MIMICRecord], paths: dict[str, Path], cfg: dict[str, Any]
 ) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
@@ -221,6 +267,8 @@ def build_structured_modalities(
             counts[record_row, time_bin, variable] += 1
 
     observed = counts > 0
+    observed_bins = observed.any(axis=2).sum(axis=1)
+    observed_fraction_by_record = observed.mean(axis=(1, 2))
     values = np.divide(sums, counts, out=np.zeros_like(sums), where=observed)
     train_mask = np.fromiter((record.split == "train" for record in records), dtype=bool, count=len(records))
     means = np.zeros(variable_count, dtype=np.float64)
@@ -260,6 +308,8 @@ def build_structured_modalities(
             "measurement_window_hours": window_hours,
             "measurement_bin_hours": bin_hours,
             "measurement_observed_fraction": float(observed.mean()),
+            "measurement_observed_fraction_by_record": observed_fraction_by_record.tolist(),
+            "measurement_observed_bins_by_record": observed_bins.tolist(),
             "measurement_train_mean": means.tolist(),
             "measurement_train_std": stds.tolist(),
             "static_names": [

@@ -1,0 +1,25 @@
+extends: mimic_comal.yaml
+
+experiment:
+  name: mimic_iii_mm_comal
+
+model:
+  modality_dropout: 0.15
+
+comal:
+  cross_modal_weight: 0.15
+  anchor_chunk_size: 1024
+
+active_learning:
+  strategy: mm_comal
+
+acquisition:
+  formula: paper_mm
+  mm:
+    alpha: 1.0
+    reliability_shrinkage: 10.0
+    threshold_shrinkage: 10.0
+    threshold_estimator: shrunk
+    include_fused_in_weights: false
+    equal_weights: false
+    dispersion: weighted_mad

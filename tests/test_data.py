@@ -5,7 +5,7 @@ import csv
 import numpy as np
 
 from mimic_comal.data import MIMICRecord, audit_records
-from mimic_comal.multimodal import build_structured_modalities
+from mimic_comal.multimodal import build_structured_modalities, count_observed_measurement_bins
 
 
 def test_subject_group_leakage_is_detected() -> None:
@@ -68,8 +68,12 @@ def test_structured_modalities_are_binned_and_train_normalized(tmp_path) -> None
     measurements, static, metadata = build_structured_modalities(
         records, paths, {"measurement_window_hours": 4, "measurement_bin_hours": 2}
     )
+    observed_bins = count_observed_measurement_bins(
+        records, paths, {"measurement_window_hours": 4, "measurement_bin_hours": 2}
+    )
     assert measurements.shape == (2, 2 * 7 * 2)
     assert static.shape == (2, 8)
     assert metadata["measurement_shape"] == [2, 14]
     assert np.isfinite(measurements).all()
     assert measurements[0].sum() >= 2.0  # two observation-mask entries
+    assert observed_bins.tolist() == [2, 1]

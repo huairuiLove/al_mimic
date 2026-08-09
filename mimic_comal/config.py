@@ -31,6 +31,39 @@ def _validate_scratch_multimodal(config: dict[str, Any]) -> None:
     visit(config)
 
 
+def _validate_active_learning(config: dict[str, Any]) -> None:
+    strategy = str(config.get("active_learning", {}).get("strategy", "comal")).lower()
+    allowed = {"comal", "mm_comal", "mosaic", "random"}
+    if strategy not in allowed:
+        raise ValueError(f"active_learning.strategy must be one of {sorted(allowed)}")
+    architecture = str(config.get("model", {}).get("architecture", "")).lower()
+    if strategy in {"mm_comal", "mosaic"} and architecture != "multimodal_transformer_scratch":
+        raise ValueError(f"{strategy} requires model.architecture=multimodal_transformer_scratch")
+    minimum_observed_bins = int(
+        config.get("dataset", {}).get(
+            "min_observed_bins", config.get("data", {}).get("min_observed_bins", 0)
+        )
+    )
+    if minimum_observed_bins < 0:
+        raise ValueError("dataset.min_observed_bins must be non-negative")
+    modality_dropout = float(config.get("model", {}).get("modality_dropout", 0.0))
+    if not 0.0 <= modality_dropout < 1.0:
+        raise ValueError("model.modality_dropout must be in [0, 1)")
+    if strategy == "mm_comal":
+        mm = config.get("acquisition", {}).get("mm", {})
+        if float(mm.get("alpha", 1.0)) < 0.0:
+            raise ValueError("acquisition.mm.alpha must be non-negative")
+        if str(mm.get("threshold_estimator", "shrunk")).lower() not in {"shrunk", "midpoint"}:
+            raise ValueError("acquisition.mm.threshold_estimator must be shrunk or midpoint")
+    if strategy == "mosaic":
+        mosaic = config.get("mosaic", {})
+        if not 0.0 <= float(mosaic.get("eta", 0.25)) <= 1.0:
+            raise ValueError("mosaic.eta must be in [0, 1]")
+        for key in ("partners", "workset_size", "synergy_workset_size"):
+            if int(mosaic.get(key, 1)) < 1:
+                raise ValueError(f"mosaic.{key} must be positive")
+
+
 def _merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
     result = dict(base)
     for key, value in override.items():
@@ -55,6 +88,7 @@ def load_config(path: str | Path) -> dict[str, Any]:
         config = _merge(load_config(parent_path), config)
     config["_config_path"] = str(path.resolve())
     _validate_scratch_multimodal(config)
+    _validate_active_learning(config)
     return config
 
 

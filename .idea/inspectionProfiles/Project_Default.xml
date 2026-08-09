@@ -1,0 +1,33 @@
+<component name="InspectionProjectProfileManager">
+  <profile version="1.0">
+    <option name="myName" value="Project Default" />
+    <inspection_tool class="PyPackageRequirementsInspection" enabled="true" level="WARNING" enabled_by_default="true">
+      <option name="ignoredPackages">
+        <list>
+          <option value="accelerate" />
+          <option value="datasets" />
+          <option value="evaluate" />
+          <option value="gpustat" />
+          <option value="matplotlib" />
+          <option value="pandas" />
+          <option value="python" />
+          <option value="scikit-learn" />
+          <option value="tensorboard" />
+          <option value="tensorboardX" />
+          <option value="tokenizers" />
+          <option value="torch" />
+          <option value="torchaudio" />
+          <option value="torchvision" />
+          <option value="tqdm" />
+          <option value="transformers" />
+          <option value="nltk" />
+          <option value="fastapi" />
+          <option value="uvicorn" />
+          <option value="pydantic" />
+          <option value="requests" />
+          <option value="volcengine" />
+        </list>
+      </option>
+    </inspection_tool>
+  </profile>
+</component>

@@ -1,0 +1,23 @@
+extends: mimic_comal.yaml
+
+experiment:
+  name: mimic_iii_mosaic
+
+model:
+  modality_dropout: 0.15
+
+active_learning:
+  strategy: mosaic
+
+mosaic:
+  eta: 0.25
+  partners: 4
+  mixup_closure_samples: 2048
+  workset_size: 1000
+  synergy_workset_size: 500
+  lambda_alpha: 1.0
+  damping: 0.01
+  fusion_batch_size: 4096
+  value_batch_size: 4096
+  deflation_steps: 0
+  synergy_epsilon: 1.0e-8

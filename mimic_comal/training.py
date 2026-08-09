@@ -233,6 +233,19 @@ class TrainedRound:
     # Optional resident labeled-pool caches for paper acquisition (avoids a re-encode).
     labeled_labels: torch.Tensor | None = None
     labeled_own_similarity: torch.Tensor | None = None
+    labeled_view_own_similarity: torch.Tensor | None = None
+
+
+def _is_exact_mm_reduction(config: dict[str, Any]) -> bool:
+    strategy = str(config.get("active_learning", {}).get("strategy", "comal")).lower()
+    if strategy != "mm_comal":
+        return False
+    mm_cfg = config.get("acquisition", {}).get("mm", {})
+    return (
+        float(mm_cfg.get("alpha", 1.0)) == 0.0
+        and float(config.get("comal", {}).get("cross_modal_weight", 0.15)) == 0.0
+        and str(mm_cfg.get("threshold_estimator", "shrunk")).lower() == "midpoint"
+    )
 
 
 def build_modules(
@@ -257,6 +270,7 @@ def build_modules(
             measurement_layers=int(model_cfg.get("measurement_layers", 2)),
             fusion_layers=int(model_cfg.get("fusion_layers", 2)),
             dropout=float(model_cfg.get("dropout", 0.1)),
+            modality_dropout=float(model_cfg.get("modality_dropout", 0.0)),
         ).to(device)
     elif architecture == "cached_text_mlp3":
         hidden = tuple(int(value) for value in model_cfg.get("hidden_dims", [512, 256]))
@@ -272,6 +286,12 @@ def build_modules(
         num_labels,
         int(comal_cfg.get("label_dim", 64)),
         int(comal_cfg.get("prototype_dim", 64)),
+        num_views=(
+            4
+            if str(config.get("active_learning", {}).get("strategy", "comal")).lower() == "mm_comal"
+            and not _is_exact_mm_reduction(config)
+            else 1
+        ),
     ).to(device)
     if device.type == "cuda" and bool(training.get("torch_compile", False)):
         classifier = _maybe_compile(classifier, True)  # type: ignore[assignment]
@@ -285,32 +305,97 @@ def _cache_classifier_features(
     feature_tensor: torch.Tensor,
     index_tensor: torch.Tensor | None,
     eval_batch_size: int,
+    *,
+    return_views: bool = False,
 ) -> torch.Tensor:
     """Frozen-classifier features for the labeled pool; avoids re-encoding each CoMAL step."""
     classifier.eval()
+    view_count = 4 if return_views else 1
+
+    def encode(inputs: torch.Tensor) -> torch.Tensor:
+        if return_views:
+            if not isinstance(classifier, MultimodalFusionClassifier):
+                raise ValueError("multi-view CoMAL requires the multimodal classifier")
+            output = classifier(inputs, return_tokens=True)
+            return torch.cat((output["modality_tokens"], output["features"][:, None, :]), dim=1)
+        return classifier(inputs)["features"]
+
+    def empty(count: int) -> torch.Tensor:
+        shape = (count, classifier.feature_dim) if view_count == 1 else (
+            count,
+            view_count,
+            classifier.feature_dim,
+        )
+        return feature_tensor.new_zeros(shape)
+
     if index_tensor is None:
         count = int(feature_tensor.shape[0])
         if count == 0:
-            return feature_tensor.new_zeros((0, classifier.feature_dim))
+            return empty(0)
         if count <= eval_batch_size:
-            return classifier(feature_tensor)["features"]
-        out = feature_tensor.new_empty((count, classifier.feature_dim))
+            return encode(feature_tensor)
+        out = empty(count)
         for start in range(0, count, eval_batch_size):
             stop = min(start + eval_batch_size, count)
-            out[start:stop] = classifier(feature_tensor[start:stop])["features"]
+            out[start:stop] = encode(feature_tensor[start:stop])
         return out
     count = int(index_tensor.numel())
     if count == 0:
-        return feature_tensor.new_zeros((0, classifier.feature_dim))
+        return empty(0)
     if count <= eval_batch_size:
-        return classifier(feature_tensor.index_select(0, index_tensor))["features"]
-    out = feature_tensor.new_empty((count, classifier.feature_dim))
+        return encode(feature_tensor.index_select(0, index_tensor))
+    out = empty(count)
     cursor = 0
     for batch_index in _index_batches(index_tensor, eval_batch_size, shuffle=False):
         width = int(batch_index.numel())
-        out[cursor : cursor + width] = classifier(feature_tensor.index_select(0, batch_index))["features"]
+        out[cursor : cursor + width] = encode(feature_tensor.index_select(0, batch_index))
         cursor += width
     return out
+
+
+def _multiview_contrastive_loss(
+    latent_features: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    temperature: float,
+    anchor_chunk_size: int,
+    cross_modal_weight: float,
+) -> torch.Tensor:
+    if latent_features.ndim != 4:
+        return supervised_contrastive_loss(
+            latent_features,
+            labels,
+            temperature=temperature,
+            anchor_chunk_size=anchor_chunk_size,
+        )
+    batch_size, num_views, num_labels, feature_dim = latent_features.shape
+    within = torch.stack(
+        [
+            supervised_contrastive_loss(
+                latent_features[:, view],
+                labels,
+                temperature=temperature,
+                anchor_chunk_size=anchor_chunk_size,
+            )
+            for view in range(num_views)
+        ]
+    ).mean()
+    if cross_modal_weight <= 0.0:
+        return within
+    expanded_labels = labels[:, None, :].expand(-1, num_views, -1).reshape(
+        batch_size * num_views, num_labels
+    )
+    view_ids = torch.arange(num_views, device=labels.device)[None, :, None].expand(
+        batch_size, -1, num_labels
+    ).reshape(batch_size * num_views, num_labels)
+    cross = supervised_contrastive_loss(
+        latent_features.reshape(batch_size * num_views, num_labels, feature_dim),
+        expanded_labels,
+        temperature=temperature,
+        anchor_chunk_size=anchor_chunk_size,
+        view_ids=view_ids,
+    )
+    return within + float(cross_modal_weight) * cross
 
 
 def train_round(
@@ -468,29 +553,35 @@ def train_round(
             labeled_features,
             None,
             int(training.get("eval_batch_size", 1024)),
+            return_views=comal.num_views > 1,
         )
         cached_labels = labeled_targets
         recon_w = float(comal_cfg.get("reconstruction_weight", 0.2))
         clf_w = float(comal_cfg.get("classification_weight", 0.5))
         temperature = float(comal_cfg.get("temperature", 0.07))
         anchor_chunk = int(comal_cfg.get("anchor_chunk_size", 1024))
+        cross_modal_weight = float(comal_cfg.get("cross_modal_weight", 0.15))
         comal_epoch_losses: list[torch.Tensor] = []
         comal_step = 0
         for _ in range(int(training.get("comal_epochs", 10))):
             epoch_loss = cached_features.new_zeros(())
             steps = 0
-            for fused, targets in _shuffled_slices(cached_features, cached_labels, comal_batch_size):
+            for cached, targets in _shuffled_slices(cached_features, cached_labels, comal_batch_size):
                 optimizer_comal.zero_grad(set_to_none=True)
                 with _autocast(device, precision):
                     # Skip similarity matmul in the train loss path only; eval always computes it.
-                    output = comal(fused, compute_similarities=False)
-                    contrastive = supervised_contrastive_loss(
+                    output = comal(cached, compute_similarities=False)
+                    contrastive = _multiview_contrastive_loss(
                         output["latent_features"],
                         targets,
                         temperature=temperature,
                         anchor_chunk_size=anchor_chunk,
+                        cross_modal_weight=cross_modal_weight,
                     )
-                    reconstruction = F.mse_loss(output["reconstructed_features"], fused)
+                    reconstruction_target = cached if cached.ndim == 2 else cached[:, -1]
+                    reconstruction = F.mse_loss(
+                        output["reconstructed_features"], reconstruction_target
+                    )
                     reconstruction_bce = criterion(output["reconstructed_logits"], targets)
                     loss = contrastive + recon_w * reconstruction + clf_w * reconstruction_bce
                 loss.backward()
@@ -513,6 +604,9 @@ def train_round(
             return_own_similarity=True,
         )
         labeled_labels_cache = cached_labels
+        labeled_view_own_cache = labeled_own_cache if comal.num_views > 1 else None
+        if comal.num_views > 1 and labeled_own_cache is not None:
+            labeled_own_cache = labeled_own_cache[:, -1]
     else:
         labeled_labels_cache = None
         labeled_own_cache = None
@@ -529,6 +623,7 @@ def train_round(
         clf_w = float(comal_cfg.get("classification_weight", 0.5))
         temperature = float(comal_cfg.get("temperature", 0.07))
         anchor_chunk = int(comal_cfg.get("anchor_chunk_size", 1024))
+        cross_modal_weight = float(comal_cfg.get("cross_modal_weight", 0.15))
         comal_step = 0
         for _ in range(int(training.get("comal_epochs", 10))):
             losses = []
@@ -537,17 +632,33 @@ def train_round(
                 targets = batch["labels"].to(device, non_blocking=True)
                 optimizer_comal.zero_grad(set_to_none=True)
                 with torch.no_grad():
-                    classifier_output = classifier(inputs)
-                fused = classifier_output["features"].detach()
+                    if comal.num_views > 1:
+                        if not isinstance(classifier, MultimodalFusionClassifier):
+                            raise ValueError("multi-view CoMAL requires the multimodal classifier")
+                        classifier_output = classifier(inputs, return_tokens=True)
+                        cached = torch.cat(
+                            (
+                                classifier_output["modality_tokens"],
+                                classifier_output["features"][:, None, :],
+                            ),
+                            dim=1,
+                        ).detach()
+                    else:
+                        classifier_output = classifier(inputs)
+                        cached = classifier_output["features"].detach()
                 with _autocast(device, precision):
-                    output = comal(fused, compute_similarities=False)
-                    contrastive = supervised_contrastive_loss(
+                    output = comal(cached, compute_similarities=False)
+                    contrastive = _multiview_contrastive_loss(
                         output["latent_features"],
                         targets,
                         temperature=temperature,
                         anchor_chunk_size=anchor_chunk,
+                        cross_modal_weight=cross_modal_weight,
                     )
-                    reconstruction = F.mse_loss(output["reconstructed_features"], fused)
+                    reconstruction_target = cached if cached.ndim == 2 else cached[:, -1]
+                    reconstruction = F.mse_loss(
+                        output["reconstructed_features"], reconstruction_target
+                    )
                     reconstruction_bce = criterion(output["reconstructed_logits"], targets)
                     loss = contrastive + recon_w * reconstruction + clf_w * reconstruction_bce
                 loss.backward()
@@ -584,6 +695,9 @@ def train_round(
         timings,
         labeled_labels=labeled_labels_cache,
         labeled_own_similarity=labeled_own_cache,
+        labeled_view_own_similarity=(
+            labeled_view_own_cache if resident and comal.num_views > 1 else None
+        ),
     )
 
 
@@ -604,14 +718,19 @@ def _refresh_prototypes_from_cached(
     num_labels = int(cached_labels.shape[1])
     latents: torch.Tensor | None = None
     if return_own_similarity and count > 0:
-        latents = cached_features.new_empty((count, num_labels, int(comal.prototype_dim)))
+        latent_shape = (
+            (count, num_labels, int(comal.prototype_dim))
+            if comal.num_views == 1
+            else (count, comal.num_views, num_labels, int(comal.prototype_dim))
+        )
+        latents = cached_features.new_empty(latent_shape)
     for start in range(0, max(count, 1), eval_batch_size):
         if count == 0:
             break
         stop = min(start + eval_batch_size, count)
-        fused = cached_features[start:stop]
+        cached = cached_features[start:stop]
         targets = cached_labels[start:stop]
-        latent_features = comal(fused, compute_similarities=False, compute_reconstruction=False)[
+        latent_features = comal(cached, compute_similarities=False, compute_reconstruction=False)[
             "latent_features"
         ]
         if latent_features.dtype != torch.float32:
@@ -620,20 +739,28 @@ def _refresh_prototypes_from_cached(
         if latents is not None:
             latents[start:stop] = latent
         negative = 1.0 - targets
-        sums[:-1] += torch.einsum("bl,bld->ld", targets, latent)
-        counts[:-1] += targets.sum(dim=0)
-        sums[-1] += torch.einsum("bl,bld->d", negative, latent)
-        counts[-1] += negative.sum()
+        if latent.ndim == 3:
+            sums[:-1] += torch.einsum("bl,bld->ld", targets, latent)
+            counts[:-1] += targets.sum(dim=0)
+            sums[-1] += torch.einsum("bl,bld->d", negative, latent)
+            counts[-1] += negative.sum()
+        else:
+            sums[:, :-1] += torch.einsum("bl,bvld->vld", targets, latent)
+            counts[:, :-1] += targets.sum(dim=0)[None, :]
+            sums[:, -1] += torch.einsum("bl,bvld->vd", negative, latent)
+            counts[:, -1] += negative.sum()
     comal.set_prototypes(sums, counts)
     if not return_own_similarity:
         return None
     if latents is None:
         return cached_features.new_zeros((0, num_labels))
     # Own-sims must use the refreshed prototypes, not the pre-update buffers.
-    prototypes = comal.prototypes[:-1]
+    prototypes = comal.prototypes[:-1] if comal.num_views == 1 else comal.prototypes[:, :-1]
     if prototypes.dtype != torch.float32:
         prototypes = prototypes.float()
-    return torch.einsum("nld,ld->nl", latents, prototypes)
+    if latents.ndim == 3:
+        return torch.einsum("nld,ld->nl", latents, prototypes)
+    return torch.einsum("nvld,vld->nvl", latents, prototypes)
 
 
 @torch.inference_mode()
@@ -658,18 +785,33 @@ def _refresh_prototypes_tensors(
         stop = min(start + eval_batch_size, count)
         inputs = selected_features[start:stop]
         targets = selected_labels[start:stop]
-        fused = classifier(inputs)["features"]
-        latent_features = comal(fused, compute_similarities=False, compute_reconstruction=False)[
+        if comal.num_views > 1:
+            if not isinstance(classifier, MultimodalFusionClassifier):
+                raise ValueError("multi-view CoMAL requires the multimodal classifier")
+            classifier_output = classifier(inputs, return_tokens=True)
+            cached = torch.cat(
+                (classifier_output["modality_tokens"], classifier_output["features"][:, None, :]),
+                dim=1,
+            )
+        else:
+            cached = classifier(inputs)["features"]
+        latent_features = comal(cached, compute_similarities=False, compute_reconstruction=False)[
             "latent_features"
         ]
         if latent_features.dtype != torch.float32:
             latent_features = latent_features.float()
         latent = F.normalize(latent_features, dim=-1)
         negative = 1.0 - targets
-        sums[:-1] += torch.einsum("bl,bld->ld", targets, latent)
-        counts[:-1] += targets.sum(dim=0)
-        sums[-1] += torch.einsum("bl,bld->d", negative, latent)
-        counts[-1] += negative.sum()
+        if latent.ndim == 3:
+            sums[:-1] += torch.einsum("bl,bld->ld", targets, latent)
+            counts[:-1] += targets.sum(dim=0)
+            sums[-1] += torch.einsum("bl,bld->d", negative, latent)
+            counts[-1] += negative.sum()
+        else:
+            sums[:, :-1] += torch.einsum("bl,bvld->vld", targets, latent)
+            counts[:, :-1] += targets.sum(dim=0)[None, :]
+            sums[:, -1] += torch.einsum("bl,bvld->vd", negative, latent)
+            counts[:, -1] += negative.sum()
     comal.set_prototypes(sums, counts)
 
 
@@ -710,18 +852,33 @@ def refresh_prototypes(
     for batch in loader:
         inputs = batch["features"].to(device, non_blocking=True)
         targets = batch["labels"].to(device, non_blocking=True)
-        fused = classifier(inputs)["features"]
-        latent_features = comal(fused, compute_similarities=False, compute_reconstruction=False)[
+        if comal.num_views > 1:
+            if not isinstance(classifier, MultimodalFusionClassifier):
+                raise ValueError("multi-view CoMAL requires the multimodal classifier")
+            classifier_output = classifier(inputs, return_tokens=True)
+            cached = torch.cat(
+                (classifier_output["modality_tokens"], classifier_output["features"][:, None, :]),
+                dim=1,
+            )
+        else:
+            cached = classifier(inputs)["features"]
+        latent_features = comal(cached, compute_similarities=False, compute_reconstruction=False)[
             "latent_features"
         ]
         if latent_features.dtype != torch.float32:
             latent_features = latent_features.float()
         latent = F.normalize(latent_features, dim=-1)
         negative = 1.0 - targets
-        sums[:-1] += torch.einsum("bl,bld->ld", targets, latent)
-        counts[:-1] += targets.sum(dim=0)
-        sums[-1] += torch.einsum("bl,bld->d", negative, latent)
-        counts[-1] += negative.sum()
+        if latent.ndim == 3:
+            sums[:-1] += torch.einsum("bl,bld->ld", targets, latent)
+            counts[:-1] += targets.sum(dim=0)
+            sums[-1] += torch.einsum("bl,bld->d", negative, latent)
+            counts[-1] += negative.sum()
+        else:
+            sums[:, :-1] += torch.einsum("bl,bvld->vld", targets, latent)
+            counts[:, :-1] += targets.sum(dim=0)[None, :]
+            sums[:, -1] += torch.einsum("bl,bvld->vd", negative, latent)
+            counts[:, -1] += negative.sum()
     comal.set_prototypes(sums, counts)
 
 
@@ -856,6 +1013,125 @@ def predict_tensors(
             else torch.empty(0, num_labels, prototype_dim, device=device)
         )
     return result
+
+
+@torch.inference_mode()
+def classifier_outputs_tensors(
+    classifier: Classifier,
+    features: np.ndarray,
+    labels: np.ndarray,
+    indices: Iterable[int],
+    config: dict[str, Any],
+    device: torch.device,
+    *,
+    return_tokens: bool = False,
+) -> dict[str, torch.Tensor]:
+    """Cache logits, fused features, and optional modality tokens for acquisition."""
+    if return_tokens and not isinstance(classifier, MultimodalFusionClassifier):
+        raise ValueError("modality tokens require the multimodal classifier")
+    training = config.get("training", {})
+    index_array = np.asarray(indices, dtype=np.int64)
+    index_source = indices if isinstance(indices, np.ndarray) else index_array
+    index_tensor = _to_device_index(index_source, device)
+    feature_tensor = _to_device_matrix(features, device)
+    label_tensor = _to_device_matrix(labels, device)
+    selected_features = feature_tensor.index_select(0, index_tensor)
+    selected_labels = label_tensor.index_select(0, index_tensor)
+    count = int(index_tensor.numel())
+    num_labels = int(labels.shape[1])
+    feature_dim = int(classifier.feature_dim)
+    eval_batch = int(training.get("eval_batch_size", 1024))
+    probabilities = torch.empty(count, num_labels, dtype=torch.float32, device=device)
+    fused_features = torch.empty(count, feature_dim, dtype=torch.float32, device=device)
+    modality_tokens = (
+        torch.empty(count, 3, feature_dim, dtype=torch.float32, device=device)
+        if return_tokens
+        else None
+    )
+    classifier.eval()
+    for start in range(0, count, eval_batch):
+        stop = min(start + eval_batch, count)
+        if return_tokens:
+            output = classifier(selected_features[start:stop], return_tokens=True)  # type: ignore[call-arg]
+        else:
+            output = classifier(selected_features[start:stop])
+        probabilities[start:stop] = torch.sigmoid(output["logits"]).float()
+        fused_features[start:stop] = output["features"].float()
+        if modality_tokens is not None:
+            modality_tokens[start:stop] = output["modality_tokens"].float()
+    result = {
+        "indices": index_tensor,
+        "labels": selected_labels,
+        "probabilities": probabilities,
+        "features": fused_features,
+    }
+    if modality_tokens is not None:
+        result["modality_tokens"] = modality_tokens
+    return result
+
+
+@torch.inference_mode()
+def predict_mm_tensors(
+    trained: TrainedRound,
+    features: np.ndarray,
+    labels: np.ndarray,
+    indices: Iterable[int],
+    config: dict[str, Any],
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    """Prediction cache with all MM-CoMAL view-wise own similarities."""
+    if trained.comal.num_views == 1:
+        baseline = predict_tensors(
+            trained,
+            features,
+            labels,
+            indices,
+            config,
+            device,
+            return_latents=False,
+            similarity_mode="own_bg",
+        )
+        baseline["view_own_similarity"] = baseline["prototype_similarities"][..., 0][:, None, :]
+        return baseline
+    classifier_output = classifier_outputs_tensors(
+        trained.classifier,
+        features,
+        labels,
+        indices,
+        config,
+        device,
+        return_tokens=True,
+    )
+    views = torch.cat(
+        (classifier_output["modality_tokens"], classifier_output["features"][:, None, :]), dim=1
+    )
+    count = int(views.shape[0])
+    eval_batch = int(config.get("training", {}).get("eval_batch_size", 1024))
+    num_labels = int(labels.shape[1])
+    view_similarities = torch.empty(
+        count,
+        trained.comal.num_views,
+        num_labels,
+        2,
+        dtype=torch.float32,
+        device=device,
+    )
+    trained.comal.eval()
+    for start in range(0, count, eval_batch):
+        stop = min(start + eval_batch, count)
+        output = trained.comal(
+            views[start:stop], compute_reconstruction=False, compute_similarities="own_bg"
+        )
+        view_similarities[start:stop] = output["prototype_similarities"].float()
+    return {
+        "indices": classifier_output["indices"],
+        "labels": classifier_output["labels"],
+        "probabilities": classifier_output["probabilities"],
+        "prototype_similarities": view_similarities[:, -1],
+        "view_own_similarity": view_similarities[..., 0],
+        "features": classifier_output["features"],
+        "modality_tokens": classifier_output["modality_tokens"],
+    }
 
 
 @torch.inference_mode()

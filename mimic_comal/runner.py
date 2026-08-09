@@ -18,13 +18,17 @@ from .features import load_features
 from .integrity import assert_original_unchanged
 from .model import (
     comal_acquisition_scores,
+    estimate_mm_comal_statistics,
+    mm_comal_acquisition_scores,
     paper_comal_acquisition_scores,
     positive_similarity_thresholds,
 )
 from .metrics import multilabel_metrics
 from .training import (
     TrainedRound,
+    classifier_outputs_tensors,
     label_matrix,
+    predict_mm_tensors,
     predict_tensors,
     prototype_similarity_metrics_torch,
     train_round,
@@ -175,6 +179,8 @@ class ActiveLearningExperiment:
         rounds = max(1, int(self.active_cfg.get("rounds", 5)))
         query_size = int(self.active_cfg.get("query_size", 1000))
         strategy = str(self.active_cfg.get("strategy", "comal")).lower()
+        if strategy not in {"comal", "mm_comal", "mosaic", "random"}:
+            raise ValueError("active_learning.strategy must be comal, mm_comal, mosaic, or random")
         labeled_mask = np.zeros(len(self.records), dtype=bool)
         labeled_mask[np.asarray(labeled, dtype=np.int64)] = True
         # Fixed each round; concatenate once instead of rebuilding val+test indices.
@@ -222,6 +228,10 @@ class ActiveLearningExperiment:
                 fuse_mode = "paper"
             elif will_query and strategy == "comal" and formula == "weighted":
                 fuse_mode = "weighted"  # val+test+candidates
+            elif will_query and strategy == "mm_comal":
+                fuse_mode = "paper_mm"
+            elif will_query and strategy == "mosaic":
+                fuse_mode = "mosaic"
             elif will_query and strategy == "random":
                 fuse_mode = "random"  # val+test+candidates (no latents)
             candidates = np.empty(0, dtype=np.int64)
@@ -291,7 +301,25 @@ class ActiveLearningExperiment:
                     labeled_count = int(labeled_array.size)
                     labeled_tensors = {name: value[:labeled_count] for name, value in acq.items()}
                     pool_tensors = {name: value[labeled_count:] for name, value in acq.items()}
-            elif fuse_mode in {"weighted", "random"}:
+            elif fuse_mode == "paper_mm":
+                pool_tensors = predict_mm_tensors(
+                    trained,
+                    self.features,
+                    self.labels,
+                    candidates,
+                    self.config,
+                    self.device,
+                )
+                if trained.labeled_view_own_similarity is None:
+                    labeled_tensors = predict_mm_tensors(
+                        trained,
+                        self.features,
+                        self.labels,
+                        labeled_array,
+                        self.config,
+                        self.device,
+                    )
+            elif fuse_mode in {"weighted", "random", "mosaic"}:
                 pool_tensors = predict_tensors(
                     trained,
                     self.features,
@@ -321,6 +349,8 @@ class ActiveLearningExperiment:
             if will_query:
                 assert pool_tensors is not None
                 score_tensor: torch.Tensor | None = None
+                preferred_positions: torch.Tensor | None = None
+                method_diagnostics: dict[str, Any] = {}
                 if strategy == "random":
                     scores = rng.random(len(candidates))
                     components = {"combined": scores}
@@ -407,8 +437,109 @@ class ActiveLearningExperiment:
                         name: _async_to_host(getattr(parts, name).detach(), copy_stream)
                         for name in component_names
                     }
+                elif strategy == "mm_comal":
+                    mm_cfg = cfg.get("mm", {})
+                    labeled_labels_t = (
+                        trained.labeled_labels
+                        if trained.labeled_labels is not None
+                        else labeled_tensors["labels"]
+                    )
+                    labeled_view_own = (
+                        trained.labeled_view_own_similarity
+                        if trained.labeled_view_own_similarity is not None
+                        else labeled_tensors["view_own_similarity"]
+                    )
+                    statistics = estimate_mm_comal_statistics(
+                        labeled_view_own,
+                        labeled_labels_t,
+                        reliability_shrinkage=float(mm_cfg.get("reliability_shrinkage", 10.0)),
+                        threshold_shrinkage=float(mm_cfg.get("threshold_shrinkage", 10.0)),
+                        threshold_estimator=str(mm_cfg.get("threshold_estimator", "shrunk")),
+                        include_fused_in_weights=bool(
+                            mm_cfg.get("include_fused_in_weights", False)
+                        ),
+                        equal_weights=bool(mm_cfg.get("equal_weights", False)),
+                    )
+                    parts = mm_comal_acquisition_scores(
+                        pool_tensors["probabilities"],
+                        pool_tensors["view_own_similarity"],
+                        statistics,
+                        expected_cardinality=labeled_labels_t.sum(dim=1).mean(),
+                        alpha=float(mm_cfg.get("alpha", 1.0)),
+                        dispersion=str(mm_cfg.get("dispersion", "weighted_mad")),
+                    )
+                    component_names = (
+                        "inverse_positive_evidence",
+                        "cardinality_mismatch",
+                        "prototype_positive_count",
+                        "dispersion",
+                        "base_score",
+                        "combined",
+                    )
+                    score_tensor = parts.combined.detach()
+                    component_host = {
+                        name: _async_to_host(getattr(parts, name).detach(), copy_stream)
+                        for name in component_names
+                    }
+                    method_diagnostics = {
+                        "view_names": ["clinical_note", "icu_measurements", "demographics", "fused"][-int(statistics.weights.shape[0]) :],
+                        "mean_reliability_by_view": [
+                            float(value) for value in statistics.reliability.mean(dim=1)
+                        ],
+                        "mean_weight_by_view": [float(value) for value in statistics.weights.mean(dim=1)],
+                        "positive_count_min": float(statistics.positive_counts.min()),
+                        "positive_count_median": float(statistics.positive_counts.median()),
+                    }
+                elif strategy == "mosaic":
+                    from mosaic.acquire import acquire_mosaic
+
+                    labeled_outputs = classifier_outputs_tensors(
+                        trained.classifier,
+                        self.features,
+                        self.labels,
+                        labeled_array,
+                        self.config,
+                        self.device,
+                        return_tokens=True,
+                    )
+                    reference_outputs = classifier_outputs_tensors(
+                        trained.classifier,
+                        self.features,
+                        self.labels,
+                        validation_indices,
+                        self.config,
+                        self.device,
+                        return_tokens=True,
+                    )
+                    candidate_outputs = classifier_outputs_tensors(
+                        trained.classifier,
+                        self.features,
+                        self.labels,
+                        candidates,
+                        self.config,
+                        self.device,
+                        return_tokens=True,
+                    )
+                    mosaic_result = acquire_mosaic(
+                        trained.classifier,
+                        labeled_outputs,
+                        reference_outputs,
+                        candidate_outputs,
+                        query_size=query_size,
+                        config=self.config,
+                        seed=self.seed + round_index,
+                    )
+                    score_tensor = mosaic_result.combined.detach()
+                    preferred_positions = mosaic_result.selected_positions.detach()
+                    component_host = {
+                        "additive": _async_to_host(mosaic_result.additive, copy_stream),
+                        "synergy": _async_to_host(mosaic_result.synergy, copy_stream),
+                        "total_gain": _async_to_host(mosaic_result.total_gain, copy_stream),
+                        "combined": _async_to_host(mosaic_result.combined, copy_stream),
+                    }
+                    method_diagnostics = mosaic_result.diagnostics
                 else:
-                    raise ValueError("active_learning.strategy must be comal or random")
+                    raise AssertionError(f"unhandled acquisition strategy: {strategy}")
                 # Pool diagnostics only need own/background sims, not the full L×(L+1) cube.
                 pool_sims = pool_tensors["prototype_similarities"]
                 if pool_sims.shape[-1] == 2:
@@ -428,7 +559,9 @@ class ActiveLearningExperiment:
                 }
                 count = min(query_size, len(candidates))
                 ranked_host: torch.Tensor | None = None
-                if score_tensor is not None and count < int(score_tensor.numel()):
+                if preferred_positions is not None:
+                    ranked_host = _async_to_host(preferred_positions[:count], copy_stream)
+                elif score_tensor is not None and count < int(score_tensor.numel()):
                     # Top-k on the compute stream while pool/component D2H runs on copy_stream.
                     top_values, top_positions = torch.topk(score_tensor, k=count, largest=True, sorted=False)
                     order = torch.argsort(top_values, descending=True, stable=True)
@@ -438,9 +571,16 @@ class ActiveLearningExperiment:
                 elif self.device.type == "cuda":
                     torch.cuda.current_stream(self.device).synchronize()
                 pool = {name: value.numpy() for name, value in host.items()}
-                if strategy == "comal":
+                if strategy != "random":
                     components = {name: value.numpy() for name, value in component_host.items()}
                     scores = components["combined"]
+                    if strategy == "mm_comal":
+                        from scipy.stats import kendalltau
+
+                        tau = kendalltau(components["base_score"], components["combined"]).statistic
+                        method_diagnostics["kendall_tau_vs_unmodulated"] = (
+                            float(tau) if np.isfinite(tau) else None
+                        )
                 if ranked_host is not None:
                     positions = ranked_host.numpy()
                 else:
@@ -457,6 +597,8 @@ class ActiveLearningExperiment:
                     "components": acquisition_summary(components, positions),
                     "combined_distribution": _summary(np.asarray(scores)),
                 }
+                if method_diagnostics:
+                    acquisition["method_diagnostics"] = method_diagnostics
                 diagnostics_prediction = pool
                 diagnostic_scores = np.asarray(scores)
             else:
@@ -485,7 +627,11 @@ class ActiveLearningExperiment:
                 diagnostics_prediction["labels"],
                 diagnostics_prediction["probabilities"],
                 diagnostics_prediction.get("latents"),
-                trained.comal.prototypes,
+                (
+                    trained.comal.prototypes[-1]
+                    if trained.comal.prototypes.ndim == 3
+                    else trained.comal.prototypes
+                ),
                 self.label_names,
                 acquisition_scores=diagnostic_scores,
                 prototype_similarities=diagnostics_prediction.get("prototype_similarities"),

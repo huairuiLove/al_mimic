@@ -19,6 +19,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
+import numpy as np
+
 from .config import require_paths
 
 
@@ -158,6 +160,17 @@ def _write_json(path: Path, value: Any) -> None:
     path.write_text(json.dumps(value, indent=2, ensure_ascii=False, allow_nan=False) + "\n", encoding="utf-8")
 
 
+def _records_from_candidates(
+    candidates: list[tuple[str, str, str, set[str]]], label_set: set[str]
+) -> list[MIMICRecord]:
+    records = []
+    for hadm, subject, split, codes in sorted(candidates, key=lambda item: int(item[0])):
+        selected = tuple(sorted(codes & label_set))
+        if selected:
+            records.append(MIMICRecord(len(records), hadm, subject, split, selected, ""))
+    return records
+
+
 def prepare_mimic(config: dict[str, Any], output_dir: str | Path | None = None) -> dict[str, Any]:
     """Create deterministic JSONL records and an audit manifest.
 
@@ -197,6 +210,44 @@ def prepare_mimic(config: dict[str, Any], output_dir: str | Path | None = None) 
             candidates.append((hadm, subject, _select_split(subject, prep_cfg), diagnosis[hadm]))
     if not candidates:
         raise RuntimeError("no admissions have both a selected note and an ICD-9 diagnosis")
+    candidates_before_gate = list(candidates)
+    minimum_observed_bins = int(
+        dataset_cfg.get("min_observed_bins", config.get("data", {}).get("min_observed_bins", 0))
+    )
+    cohort_gate: dict[str, Any] = {
+        "enabled": minimum_observed_bins > 0,
+        "min_observed_bins": minimum_observed_bins,
+        "records_before_label_filter_before_gate": len(candidates_before_gate),
+    }
+    if minimum_observed_bins > 0:
+        from .config import require_multimodal_paths
+        from .multimodal import count_observed_measurement_bins
+
+        temporary_records = [
+            MIMICRecord(index, hadm, subject, split, tuple(), "")
+            for index, (hadm, subject, split, _codes) in enumerate(candidates)
+        ]
+        observed_bin_counts = count_observed_measurement_bins(
+            temporary_records,
+            require_multimodal_paths(config),
+            config.get("features", {}),
+        )
+        candidates = [
+            candidate
+            for candidate, observed_bins in zip(candidates, observed_bin_counts)
+            if int(observed_bins) >= minimum_observed_bins
+        ]
+        cohort_gate["observed_bins"] = {
+            "minimum": int(observed_bin_counts.min()) if observed_bin_counts.size else 0,
+            "median": float(np.median(observed_bin_counts)) if observed_bin_counts.size else 0.0,
+            "maximum": int(observed_bin_counts.max()) if observed_bin_counts.size else 0,
+        }
+    cohort_gate["records_before_label_filter_after_gate"] = len(candidates)
+    cohort_gate["removed_before_label_filter"] = len(candidates_before_gate) - len(candidates)
+    if not candidates:
+        raise RuntimeError(
+            "complete-modality cohort is empty; lower dataset.min_observed_bins or check ICU tables"
+        )
     # Label vocabulary is estimated from train only, preventing test-label leakage.
     frequencies = Counter(code for _, _, split, codes in candidates if split == "train" for code in codes)
     minimum = int(prep_cfg.get("min_label_frequency", 50))
@@ -208,11 +259,17 @@ def prepare_mimic(config: dict[str, Any], output_dir: str | Path | None = None) 
         raise RuntimeError("label vocabulary is empty; lower preprocessing.min_label_frequency")
     label_set = set(labels)
     records: list[MIMICRecord] = []
-    for hadm, subject, split, codes in sorted(candidates, key=lambda item: int(item[0])):
-        selected = tuple(sorted(codes & label_set))
-        if not selected:
-            continue
-        records.append(MIMICRecord(len(records), hadm, subject, split, selected, notes[hadm]))
+    for record in _records_from_candidates(candidates, label_set):
+        records.append(
+            MIMICRecord(
+                record.row_index,
+                record.hadm_id,
+                record.subject_id,
+                record.split,
+                record.labels,
+                notes[record.hadm_id],
+            )
+        )
     if len({record.split for record in records}) < 3:
         # Tiny smoke-test datasets can hash into one partition.  Keep the main
         # protocol grouped while guaranteeing all artifacts are usable.
@@ -251,17 +308,22 @@ def prepare_mimic(config: dict[str, Any], output_dir: str | Path | None = None) 
             for record in records:
                 handle.write(json.dumps(asdict(record), ensure_ascii=False) + "\n")
     audit = audit_records(records, tuple(labels))
+    before_gate_records = _records_from_candidates(candidates_before_gate, label_set)
+    cohort_gate["before"] = audit_records(before_gate_records, tuple(labels))
+    cohort_gate["after"] = audit_records(records, tuple(labels))
+    audit["cohort_gate"] = cohort_gate
     _write_json(output / "labels.json", {"labels": labels, "frequencies": dict(frequencies)})
     _write_json(output / "audit.json", audit)
     _write_json(
         output / "manifest.json",
         {
-            "format_version": 1,
+            "format_version": 2,
             "source": {name: str(path.resolve()) for name, path in paths.items()},
             "records": len(records),
             "labels": labels,
             "preprocessing": prep_cfg,
             "split_group": "SUBJECT_ID",
+            "cohort_gate": cohort_gate,
         },
     )
     return {"output_dir": str(output), "records": len(records), "labels": len(labels), "audit": audit}
