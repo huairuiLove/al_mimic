@@ -21,3 +21,12 @@ def test_pretrained_input_is_rejected_for_scratch_model(tmp_path) -> None:
     )
     with pytest.raises(ValueError, match="forbidden"):
         load_config(path)
+
+
+def test_modis_configs_are_valid_multimodal_strategies() -> None:
+    full = load_config("configs/mimic_modis.yaml")
+    smoke = load_config("configs/mimic_modis_smoke.yaml")
+
+    assert full["active_learning"]["strategy"] == "modis"
+    assert smoke["active_learning"]["strategy"] == "modis"
+    assert full["model"]["architecture"] == "multimodal_transformer_scratch"

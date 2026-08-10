@@ -1,0 +1,19 @@
+extends: mimic_smoke.yaml
+
+experiment:
+  name: mimic_iii_modis_smoke
+
+active_learning:
+  strategy: modis
+
+modis:
+  beta: [1.0, 1.0, 1.0]
+  grid_k: 4
+  bisect_steps: 0
+  workset_size: 40
+  prototype: mean
+  oof_folds: 2
+  probe_epochs: 2
+  probe_batch_size: 64
+  fusion_batch_size: 128
+  probe_eval_batch_size: 128

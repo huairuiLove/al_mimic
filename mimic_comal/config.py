@@ -33,11 +33,11 @@ def _validate_scratch_multimodal(config: dict[str, Any]) -> None:
 
 def _validate_active_learning(config: dict[str, Any]) -> None:
     strategy = str(config.get("active_learning", {}).get("strategy", "comal")).lower()
-    allowed = {"comal", "mm_comal", "mosaic", "random"}
+    allowed = {"comal", "mm_comal", "modis", "mosaic", "random"}
     if strategy not in allowed:
         raise ValueError(f"active_learning.strategy must be one of {sorted(allowed)}")
     architecture = str(config.get("model", {}).get("architecture", "")).lower()
-    if strategy in {"mm_comal", "mosaic"} and architecture != "multimodal_transformer_scratch":
+    if strategy in {"mm_comal", "modis", "mosaic"} and architecture != "multimodal_transformer_scratch":
         raise ValueError(f"{strategy} requires model.architecture=multimodal_transformer_scratch")
     minimum_observed_bins = int(
         config.get("dataset", {}).get(
@@ -62,6 +62,22 @@ def _validate_active_learning(config: dict[str, Any]) -> None:
         for key in ("partners", "workset_size", "synergy_workset_size"):
             if int(mosaic.get(key, 1)) < 1:
                 raise ValueError(f"mosaic.{key} must be positive")
+    if strategy == "modis":
+        modis = config.get("modis", {})
+        beta = modis.get("beta", [1.0, 1.0, 1.0])
+        if not isinstance(beta, list) or len(beta) != 3:
+            raise ValueError("modis.beta must contain three values")
+        if any(not isinstance(value, (int, float)) for value in beta):
+            raise ValueError("modis.beta values must be numeric")
+        for key in ("grid_k", "workset_size", "fusion_batch_size", "probe_epochs"):
+            if int(modis.get(key, 1)) < 1:
+                raise ValueError(f"modis.{key} must be positive")
+        if int(modis.get("bisect_steps", 0)) < 0:
+            raise ValueError("modis.bisect_steps must be non-negative")
+        if int(modis.get("oof_folds", 5)) < 2:
+            raise ValueError("modis.oof_folds must be at least 2")
+        if str(modis.get("prototype", "mean")).lower() not in {"mean", "medoid"}:
+            raise ValueError("modis.prototype must be mean or medoid")
 
 
 def _merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:

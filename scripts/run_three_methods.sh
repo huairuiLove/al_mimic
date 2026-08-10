@@ -7,6 +7,7 @@ configs=(
   "configs/mimic_comal.yaml"
   "configs/mimic_mm_comal.yaml"
   "configs/mimic_mosaic.yaml"
+  "configs/mimic_modis.yaml"
 )
 
 case "${phase}" in
@@ -24,7 +25,8 @@ case "${phase}" in
       --experiment experiments/mimic_iii_comal CoMAL \
       --experiment experiments/mimic_iii_mm_comal MM-CoMAL \
       --experiment experiments/mimic_iii_mosaic MoSAIC \
-      --output experiments/three_method_comparison.png
+      --experiment experiments/mimic_iii_modis MoDIS \
+      --output experiments/four_method_comparison.png
     ;;
   all)
     python main.py prepare --config "${shared_config}"
@@ -38,7 +40,8 @@ case "${phase}" in
       --experiment experiments/mimic_iii_comal CoMAL \
       --experiment experiments/mimic_iii_mm_comal MM-CoMAL \
       --experiment experiments/mimic_iii_mosaic MoSAIC \
-      --output experiments/three_method_comparison.png
+      --experiment experiments/mimic_iii_modis MoDIS \
+      --output experiments/four_method_comparison.png
     ;;
   *)
     echo "usage: $0 [prepare|features|active|all]" >&2

@@ -1,0 +1,17 @@
+extends: mimic_comal.yaml
+
+experiment:
+  name: mimic_iii_modis
+
+active_learning:
+  strategy: modis
+
+modis:
+  beta: [1.0, 1.0, 1.0]
+  grid_k: 8
+  bisect_steps: 0
+  workset_size: 5000
+  prototype: mean
+  oof_folds: 5
+  fusion_batch_size: 4096
+  probe_eval_batch_size: 4096

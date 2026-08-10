@@ -10,7 +10,7 @@ from mimic_comal.data import MIMICRecord
 from mimic_comal.runner import ActiveLearningExperiment
 
 
-@pytest.mark.parametrize("strategy", ["comal", "mm_comal", "mosaic"])
+@pytest.mark.parametrize("strategy", ["comal", "mm_comal", "mosaic", "modis"])
 def test_synthetic_active_learning_run(tmp_path, strategy: str) -> None:
     prepared = tmp_path / "prepared"
     features_dir = prepared / "features"
@@ -56,7 +56,7 @@ def test_synthetic_active_learning_run(tmp_path, strategy: str) -> None:
             "measurement_layers": 1,
             "fusion_layers": 1,
             "dropout": 0.0,
-            "modality_dropout": 0.1 if strategy != "comal" else 0.0,
+            "modality_dropout": 0.1 if strategy in {"mm_comal", "mosaic"} else 0.0,
         },
         "comal": {
             "label_dim": 4,
@@ -103,6 +103,17 @@ def test_synthetic_active_learning_run(tmp_path, strategy: str) -> None:
             "value_batch_size": 32,
             "deflation_steps": 1,
         },
+        "modis": {
+            "beta": [1.0, 1.0, 1.0],
+            "grid_k": 4,
+            "workset_size": 6,
+            "prototype": "mean",
+            "oof_folds": 2,
+            "probe_epochs": 1,
+            "probe_batch_size": 8,
+            "fusion_batch_size": 32,
+            "probe_eval_batch_size": 32,
+        },
     }
     result = ActiveLearningExperiment(config).run()
     experiment = output / strategy
@@ -113,3 +124,15 @@ def test_synthetic_active_learning_run(tmp_path, strategy: str) -> None:
     state = json.loads((experiment / "active_state.json").read_text())
     assert len(state["records"]) == 2
     assert len(state["records"][0]["query_indices"]) == 3
+    if strategy == "modis":
+        assert (experiment / "checkpoints" / "modis_probes.pt").is_file()
+        assert "modis" in json.loads(
+            (experiment / "diagnostics" / "round_000.json").read_text()
+        )
+        integrity = json.loads((experiment / "source_integrity.json").read_text())
+        assert set(integrity["adapter_extensions"]["modis"]) == {
+            "modis/__init__.py",
+            "modis/acquire.py",
+            "modis/intervene.py",
+            "modis/probes.py",
+        }

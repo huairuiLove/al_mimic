@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import random
 import time
@@ -69,6 +70,54 @@ def _summary(values: np.ndarray) -> dict[str, float]:
         "min": float(values.min()),
         "max": float(values.max()),
     }
+
+
+def _integrity_report(strategy: str, root: Path) -> dict[str, Any]:
+    report = assert_original_unchanged(root)
+    if strategy != "modis":
+        return report
+    extension_files = (
+        "modis/__init__.py",
+        "modis/acquire.py",
+        "modis/intervene.py",
+        "modis/probes.py",
+    )
+    extension_hashes: dict[str, str] = {}
+    for relative_path in extension_files:
+        path = root / relative_path
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        extension_hashes[relative_path] = digest.hexdigest()
+    return report | {"adapter_extensions": {"modis": extension_hashes}}
+
+
+@torch.inference_mode()
+def _prototype_similarities_from_fused(
+    trained: TrainedRound,
+    fused_features: torch.Tensor,
+    *,
+    batch_size: int,
+) -> torch.Tensor:
+    similarities = torch.empty(
+        fused_features.shape[0],
+        trained.comal.num_labels,
+        2,
+        dtype=torch.float32,
+        device=fused_features.device,
+    )
+    trained.comal.eval()
+    step = max(1, int(batch_size))
+    for start in range(0, int(fused_features.shape[0]), step):
+        stop = min(start + step, int(fused_features.shape[0]))
+        output = trained.comal(
+            fused_features[start:stop],
+            compute_reconstruction=False,
+            compute_similarities="own_bg",
+        )
+        similarities[start:stop] = output["prototype_similarities"].float()
+    return similarities
 
 
 def _initial_indices(train_indices: np.ndarray, labels: np.ndarray, size: int, seed: int) -> list[int]:
@@ -157,6 +206,41 @@ class ActiveLearningExperiment:
             },
             checkpoint_dir / "final.pt",
         )
+        if trained.modis_state is not None:
+            probe_host = {
+                key: _async_to_host(value.detach(), None)
+                for key, value in trained.modis_state.probes.state_dict().items()
+            }
+            statistics = trained.modis_state.statistics
+            statistics_host = {
+                name: _async_to_host(getattr(statistics, name).detach(), None)
+                for name in (
+                    "information_gain",
+                    "skill_scores",
+                    "skill_standard_errors",
+                    "shrunk_skill_scores",
+                    "pooled_skill_scores",
+                    "label_weights",
+                    "modality_weights",
+                )
+            }
+            prototype_host = _async_to_host(trained.modis_state.prototypes.detach(), None)
+            prevalence_host = _async_to_host(
+                trained.modis_state.labeled_prevalence.detach(), None
+            )
+            if self.device.type == "cuda":
+                torch.cuda.current_stream(self.device).synchronize()
+            torch.save(
+                {
+                    "round": round_index,
+                    "probes": probe_host,
+                    "statistics": statistics_host,
+                    "prototypes": prototype_host,
+                    "labeled_prevalence": prevalence_host,
+                    "diagnostics": trained.modis_state.diagnostics,
+                },
+                checkpoint_dir / "modis_probes.pt",
+            )
 
     def run(self) -> dict[str, Any]:
         random.seed(self.seed)
@@ -179,8 +263,10 @@ class ActiveLearningExperiment:
         rounds = max(1, int(self.active_cfg.get("rounds", 5)))
         query_size = int(self.active_cfg.get("query_size", 1000))
         strategy = str(self.active_cfg.get("strategy", "comal")).lower()
-        if strategy not in {"comal", "mm_comal", "mosaic", "random"}:
-            raise ValueError("active_learning.strategy must be comal, mm_comal, mosaic, or random")
+        if strategy not in {"comal", "mm_comal", "modis", "mosaic", "random"}:
+            raise ValueError(
+                "active_learning.strategy must be comal, mm_comal, modis, mosaic, or random"
+            )
         labeled_mask = np.zeros(len(self.records), dtype=bool)
         labeled_mask[np.asarray(labeled, dtype=np.int64)] = True
         # Fixed each round; concatenate once instead of rebuilding val+test indices.
@@ -217,6 +303,7 @@ class ActiveLearningExperiment:
                 round_config,
                 self.device,
                 previous=previous,
+                subject_groups=(record.subject_id for record in self.records),
             )
             unlabeled = train_indices[~labeled_mask[train_indices]]
             will_query = bool(unlabeled.size and round_index < rounds - 1)
@@ -232,6 +319,8 @@ class ActiveLearningExperiment:
                 fuse_mode = "paper_mm"
             elif will_query and strategy == "mosaic":
                 fuse_mode = "mosaic"
+            elif will_query and strategy == "modis":
+                fuse_mode = "modis"
             elif will_query and strategy == "random":
                 fuse_mode = "random"  # val+test+candidates (no latents)
             candidates = np.empty(0, dtype=np.int64)
@@ -249,6 +338,7 @@ class ActiveLearningExperiment:
             labeled_array = np.asarray(labeled, dtype=np.int64)
             labeled_tensors: dict[str, torch.Tensor] | None = None
             pool_tensors: dict[str, torch.Tensor] | None = None
+            candidate_outputs: dict[str, torch.Tensor] | None = None
             # Intermediate rounds only need own/background for GPU metrics; full
             # [N,L,L+1] cubes are reserved for the final npz / diagnostics dump.
             eval_tensors = predict_tensors(
@@ -330,6 +420,24 @@ class ActiveLearningExperiment:
                     return_latents=False,
                     similarity_mode="own_bg",
                 )
+            elif fuse_mode == "modis":
+                candidate_outputs = classifier_outputs_tensors(
+                    trained.classifier,
+                    self.features,
+                    self.labels,
+                    candidates,
+                    self.config,
+                    self.device,
+                    return_tokens=True,
+                )
+                pool_tensors = {
+                    **candidate_outputs,
+                    "prototype_similarities": _prototype_similarities_from_fused(
+                        trained,
+                        candidate_outputs["features"],
+                        batch_size=int(self.training_cfg.get("eval_batch_size", 1024)),
+                    ),
+                }
             # Prototype similarity metrics stay on-device; only D2H sims on the final round for npz.
             # Defer eval host sync + sklearn metrics until after acquisition so ranking is not blocked.
             validation_metrics = {
@@ -538,6 +646,69 @@ class ActiveLearningExperiment:
                         "combined": _async_to_host(mosaic_result.combined, copy_stream),
                     }
                     method_diagnostics = mosaic_result.diagnostics
+                elif strategy == "modis":
+                    from modis.acquire import acquire_modis
+
+                    if trained.modis_state is None or candidate_outputs is None:
+                        raise RuntimeError("MoDIS probe state and candidate tokens are required")
+                    comparison_scores: dict[str, torch.Tensor] = {}
+                    if cached_labeled_labels is not None and cached_labeled_own is not None:
+                        pool_own = pool_tensors["prototype_similarities"][..., 0]
+                        paper_thresholds = positive_similarity_thresholds(
+                            None,
+                            cached_labeled_labels,
+                            trained.comal.prototypes.detach(),
+                            own_similarity=cached_labeled_own,
+                        )
+                        paper_parts = paper_comal_acquisition_scores(
+                            pool_tensors["probabilities"],
+                            None,
+                            trained.comal.prototypes.detach(),
+                            paper_thresholds,
+                            expected_cardinality=cached_labeled_labels.sum(dim=1).mean(),
+                            own_similarity=pool_own,
+                        )
+                        comparison_scores["paper_comal"] = paper_parts.combined
+                    metadata: dict[str, np.ndarray] = {
+                        "text_length": np.asarray(
+                            [len(self.records[int(index)].text) for index in candidates],
+                            dtype=np.float32,
+                        )
+                    }
+                    observed_bins = self.feature_metadata.get("structured", {}).get(
+                        "measurement_observed_bins_by_record"
+                    )
+                    if isinstance(observed_bins, list) and len(observed_bins) == len(self.records):
+                        metadata["measurement_observed_bins"] = np.asarray(
+                            observed_bins, dtype=np.float32
+                        )[candidates]
+                    initial_prevalence = torch.as_tensor(
+                        self.labels[np.asarray(initial, dtype=np.int64)].mean(axis=0),
+                        dtype=torch.float32,
+                        device=self.device,
+                    )
+                    modis_result = acquire_modis(
+                        trained.classifier,
+                        trained.modis_state,
+                        candidate_outputs,
+                        query_size=query_size,
+                        config=self.config,
+                        initial_prevalence=initial_prevalence,
+                        candidate_metadata=metadata,
+                        comparison_scores=comparison_scores,
+                    )
+                    score_tensor = modis_result.combined.detach()
+                    preferred_positions = modis_result.selected_positions.detach()
+                    component_host = {
+                        "disagreement": _async_to_host(modis_result.disagreement, copy_stream),
+                        "instability": _async_to_host(modis_result.instability, copy_stream),
+                        "dominance": _async_to_host(modis_result.dominance, copy_stream),
+                        "sufficiency_penalty": _async_to_host(
+                            modis_result.sufficiency_penalty, copy_stream
+                        ),
+                        "combined": _async_to_host(modis_result.combined, copy_stream),
+                    }
+                    method_diagnostics = modis_result.diagnostics
                 else:
                     raise AssertionError(f"unhandled acquisition strategy: {strategy}")
                 # Pool diagnostics only need own/background sims, not the full L×(L+1) cube.
@@ -641,6 +812,8 @@ class ActiveLearningExperiment:
                 "used_for_selection": False,
                 "purpose": "retrospective score reliability and rare-label diagnostics only",
             }
+            if strategy == "modis" and acquisition.get("method_diagnostics"):
+                diagnostics["modis"] = acquisition["method_diagnostics"]
             _write_json(self.output_dir / "diagnostics" / f"round_{round_index:03d}.json", diagnostics)
             record = {
                 "round_index": round_index,
@@ -706,6 +879,6 @@ class ActiveLearningExperiment:
         _write_json(self.output_dir / "resolved_config.json", self.config)
         _write_json(
             self.output_dir / "source_integrity.json",
-            assert_original_unchanged(Path.cwd()),
+            _integrity_report(strategy, Path.cwd()),
         )
         return {"output_dir": str(self.output_dir), "final_metrics": final, "rounds": rounds}

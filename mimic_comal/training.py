@@ -234,6 +234,7 @@ class TrainedRound:
     labeled_labels: torch.Tensor | None = None
     labeled_own_similarity: torch.Tensor | None = None
     labeled_view_own_similarity: torch.Tensor | None = None
+    modis_state: Any | None = None
 
 
 def _is_exact_mm_reduction(config: dict[str, Any]) -> bool:
@@ -406,6 +407,7 @@ def train_round(
     device: torch.device,
     *,
     previous: TrainedRound | None = None,
+    subject_groups: Iterable[object] | None = None,
 ) -> TrainedRound:
     training = config.get("training", {})
     indices = np.unique(np.asarray(list(labeled_indices), dtype=np.int64))
@@ -688,6 +690,43 @@ def train_round(
             )
         else:
             refresh_prototypes(classifier, comal, features, labels, indices, config, device)
+    modis_state = None
+    if str(config.get("active_learning", {}).get("strategy", "comal")).lower() == "modis":
+        if not isinstance(classifier, MultimodalFusionClassifier):
+            raise ValueError("MoDIS requires the multimodal classifier")
+        probe_start = time.perf_counter()
+        labeled_outputs = classifier_outputs_tensors(
+            classifier,
+            features,
+            labels,
+            indices,
+            config,
+            device,
+            return_tokens=True,
+        )
+        if subject_groups is None:
+            aligned_groups: Iterable[object] = indices.tolist()
+        else:
+            all_groups = np.asarray(list(subject_groups), dtype=object)
+            if all_groups.shape[0] == labels.shape[0]:
+                aligned_groups = all_groups[indices]
+            elif all_groups.shape[0] == indices.shape[0]:
+                aligned_groups = all_groups
+            else:
+                raise ValueError("subject_groups must align with all records or labeled indices")
+        from modis.probes import train_modality_probes
+
+        modis_state = train_modality_probes(
+            labeled_outputs["modality_tokens"],
+            labeled_outputs["labels"],
+            aligned_groups,
+            config,
+            seed=int(training.get("seed", 17)),
+        )
+        history["probe_loss"] = modis_state.history
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        timings["modis_probe_training_sec"] = time.perf_counter() - probe_start
     return TrainedRound(
         classifier,
         comal,
@@ -698,6 +737,7 @@ def train_round(
         labeled_view_own_similarity=(
             labeled_view_own_cache if resident and comal.num_views > 1 else None
         ),
+        modis_state=modis_state,
     )
 
 
