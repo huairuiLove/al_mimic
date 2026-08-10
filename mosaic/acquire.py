@@ -1,4 +1,4 @@
-"""Two-stage MoSAIC acquisition with exact three-modality lattice evaluation."""
+"""Two-stage MoSAIC acquisition with exact multimodal lattice evaluation."""
 
 from __future__ import annotations
 
@@ -7,9 +7,8 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
-
-from mimic_comal.model import MultimodalFusionClassifier
 
 from .design import FisherDesign
 from .intervene import coalition_masks, intervene_tokens
@@ -52,7 +51,7 @@ def _rank_union(
 
 
 def _closure_samples(
-    classifier: MultimodalFusionClassifier,
+    classifier: nn.Module,
     labeled_tokens: torch.Tensor,
     *,
     count: int,
@@ -79,7 +78,7 @@ def _closure_samples(
 
 
 def _counterfactual_features(
-    classifier: MultimodalFusionClassifier,
+    classifier: nn.Module,
     work_tokens: torch.Tensor,
     partner_tokens: torch.Tensor,
     *,
@@ -99,15 +98,13 @@ def _counterfactual_features(
             rng=rng,
             lambda_alpha=lambda_alpha,
         )
-        coalition_features.append(
-            fuse_token_batches(classifier, intervened, batch_size=fusion_batch_size)
-        )
+        coalition_features.append(fuse_token_batches(classifier, intervened, batch_size=fusion_batch_size))
     return torch.stack(coalition_features, dim=1)
 
 
 def _lattice_values(
     design: FisherDesign,
-    classifier: MultimodalFusionClassifier,
+    classifier: nn.Module,
     counterfactual_features: torch.Tensor,
     *,
     value_batch_size: int,
@@ -129,9 +126,10 @@ def _lattice_values(
 
 def _score_workset(
     design: FisherDesign,
-    classifier: MultimodalFusionClassifier,
+    classifier: nn.Module,
     counterfactual_features: torch.Tensor,
     *,
+    num_modalities: int,
     eta: float,
     value_batch_size: int,
 ) -> tuple[torch.Tensor, LatticeDecomposition]:
@@ -141,12 +139,24 @@ def _score_workset(
         counterfactual_features,
         value_batch_size=value_batch_size,
     )
-    return values, decompose_lattice(values, num_modalities=3, eta=eta)
+    return values, decompose_lattice(values, num_modalities=num_modalities, eta=eta)
+
+
+def _mean_pairwise_similarity(tokens: torch.Tensor) -> torch.Tensor:
+    if tokens.ndim != 3 or tokens.shape[1] < 2:
+        raise ValueError("MoSAIC requires at least two modality tokens")
+    normalized = F.normalize(tokens, dim=-1)
+    similarities = [
+        F.cosine_similarity(normalized[:, left], normalized[:, right], dim=1)
+        for left in range(tokens.shape[1])
+        for right in range(left + 1, tokens.shape[1])
+    ]
+    return torch.stack(similarities, dim=1).mean(dim=1)
 
 
 @torch.inference_mode()
 def acquire_mosaic(
-    classifier: MultimodalFusionClassifier,
+    classifier: nn.Module,
     labeled: dict[str, torch.Tensor],
     reference: dict[str, torch.Tensor],
     candidates: dict[str, torch.Tensor],
@@ -156,8 +166,8 @@ def acquire_mosaic(
     seed: int,
 ) -> MosaicAcquisitionResult:
     """Run MoSAIC and return candidate-relative positions in greedy order."""
-    if not isinstance(classifier, MultimodalFusionClassifier):
-        raise ValueError("MoSAIC requires MultimodalFusionClassifier")
+    if not callable(getattr(classifier, "fuse_from_tokens", None)):
+        raise ValueError("MoSAIC requires a classifier with fuse_from_tokens")
     mosaic_cfg = config.get("mosaic", {})
     eta = float(mosaic_cfg.get("eta", 0.25))
     if not 0.0 <= eta <= 1.0:
@@ -188,8 +198,12 @@ def acquire_mosaic(
         closure_probabilities=closure_probabilities,
     )
     bound = design.upper_bound(candidates["features"], candidates["probabilities"])
-    token_mean = candidates["modality_tokens"].mean(dim=1)
-    interaction_proxy = 1.0 - F.cosine_similarity(candidates["features"], token_mean, dim=1)
+    num_modalities = int(candidates["modality_tokens"].shape[1])
+    expected_modalities = len(getattr(classifier, "modality_names", ()))
+    if expected_modalities != num_modalities:
+        raise ValueError("candidate modality tokens do not match classifier.modality_names")
+    pairwise_similarity = _mean_pairwise_similarity(candidates["modality_tokens"])
+    interaction_proxy = 1.0 - pairwise_similarity
     work_positions, screening = _rank_union(
         bound,
         interaction_proxy,
@@ -210,6 +224,7 @@ def acquire_mosaic(
         design,
         classifier,
         counterfactual,
+        num_modalities=num_modalities,
         eta=eta,
         value_batch_size=value_batch_size,
     )
@@ -245,6 +260,7 @@ def acquire_mosaic(
             design,
             classifier,
             counterfactual,
+            num_modalities=num_modalities,
             eta=eta,
             value_batch_size=value_batch_size,
         )
@@ -260,16 +276,21 @@ def acquire_mosaic(
         return full
 
     combined = expand(initial_decomposition.score)
-    higher_order = initial_decomposition.interactions[:, [3, 5, 6, 7]].abs().amax(dim=1)
+    masks = coalition_masks(num_modalities).to(initial_decomposition.interactions.device)
+    higher_order_mask = masks.sum(dim=1) >= 2
+    higher_order = initial_decomposition.interactions[:, higher_order_mask].abs().amax(dim=1)
     diagnostics = {
         "screening": screening,
         "partners": partners,
-        "coalitions": 8,
+        "modalities": num_modalities,
+        "coalitions": 1 << num_modalities,
         "workset_size": int(work_positions.numel()),
         "deflation_steps": deflation_steps,
         "empty_value_mean": float(values[:, 0].mean()),
         "higher_order_abs_mean": float(higher_order.mean()),
-        "linearized_warning": bool(float(higher_order.mean()) < float(mosaic_cfg.get("synergy_epsilon", 1e-8))),
+        "linearized_warning": bool(
+            float(higher_order.mean()) < float(mosaic_cfg.get("synergy_epsilon", 1e-8))
+        ),
     }
     return MosaicAcquisitionResult(
         selected_positions=selected_positions,

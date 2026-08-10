@@ -1,94 +1,78 @@
 experiment:
-  name: mimic_iii_comal_a800
+  name: mimic_iii_yang_wu_bertencoder_comal
   output_root: experiments
 
 dataset:
-  root: mimic-iii-clinical-database-1.4
-  prepared_dir: prepared/mimic_iii
-  feature_dir: prepared/mimic_iii/features_multimodal_scratch
+  prepared_dir: prepared/yang_wu_diagnoses_48h
+  split_hdf5: data/yang_wu_mimic/features/outcome=Diagnoses,T=48.0,dt=1.0/splits.hdf5
+  split_group: with_notes
+  clinicalbert_checkpoint: pretrained/clinicalbert/pytorch_model.bin
 
 preprocessing:
-  seed: 17
-  train_fraction: 0.8
-  validation_fraction: 0.1
-  note_categories: [Discharge summary]
-  max_notes_per_admission: 4
-  max_text_chars: 12000
-  code_prefix_length: 3
-  label_top_k: 50
-  min_label_frequency: 100
-  max_records: null
-
-features:
-  encoder: multimodal_scratch
-  dimension: 256
-  max_features: 100000
-  min_df: 2
-  max_df: 0.995
-  ngram_range: [1, 2]
-  seed: 17
-  svd_n_iter: 7
-  transform_batch_size: 8192
-  joblib_compress: 0
-  measurement_window_hours: 48
-  measurement_bin_hours: 2
+  cohort: metavision
+  task: Diagnoses
+  observation_hours: 48
+  timestep_hours: 1
+  max_note_tokens: 512
+  expected_total_samples: 10210
+  expected_label_count: 1042
+  time_invariant_dim: 97
+  time_series_dim: 7411
+  split_protocol: yang_wu_official_7_1.5_1.5
+  label_format: icd9_top3_multihot
+  note_protocol: latest_per_category_description_within_48h
 
 model:
-  architecture: multimodal_transformer_scratch
-  initialization: random
-  fusion_dim: 256
-  num_heads: 8
-  measurement_layers: 2
-  fusion_layers: 2
+  architecture: yang_wu_bertencoder
+  initialization: clinicalbert_pretrained_fresh_fusion_each_round
+  output_activation: sigmoid
+  seed: 1337
+  text_hidden_dim: 768
+  time_invariant_hidden_dim: 64
+  time_series_hidden_dim: 1024
+  time_series_layers: 3
+  time_series_heads: 16
+  output_size: 1042
   dropout: 0.1
 
 comal:
-  label_dim: 64
-  prototype_dim: 64
+  label_dim: 8
+  prototype_dim: 8
   temperature: 0.07
   learning_rate: 0.001
   reconstruction_weight: 0.2
   classification_weight: 0.5
-  anchor_chunk_size: 4096
+  anchor_chunk_size: 1024
+  contrastive_label_sample_size: 256
+  cross_modal_weight: 0.15
   negative_prototype: shared_background
 
 training:
   seed: 17
   device: cuda
-  precision: bf16
-  allow_tf32: true
-  cudnn_benchmark: true
-  gpu_resident_features: true
-  fused_optimizer: true
-  torch_compile: false
-  batch_size: 4096
-  eval_batch_size: 16384
-  comal_batch_size: 192
+  precision: fp32
+  optimizer: adam
+  loss: binary_cross_entropy
+  batch_size: 40
+  eval_batch_size: 400
+  comal_batch_size: 40
   epochs: 20
-  comal_epochs: 10
-  learning_rate: 0.001
-  weight_decay: 0.0001
-  maximum_pos_weight: 20
-  gradient_clip: 5.0
-  gradient_clip_interval: 1
-  threshold: 0.5
-  num_workers: 0
-  persistent_workers: false
-  prefetch_factor: 2
-  pin_memory: true
-  cpu_threads: 18
-  interop_threads: 2
+  comal_epochs: 20
+  learning_rate: 0.0001
+  weight_decay: 0.0
+  warmup_proportion: 0.1
+  gradient_clip: 1.0
   inherit_across_rounds: false
+  num_workers: 12
+  pin_memory: true
+  allow_tf32: false
+  cudnn_benchmark: false
 
 active_learning:
   strategy: comal
-  initial_labeled: 3000
-  query_size: 1000
-  candidate_size: 49152
+  initial_fraction: 0.10
+  query_fraction: 0.05
   rounds: 6
 
 acquisition:
   formula: paper
-  uncertainty_weight: 0.5
-  prototype_weight: 0.35
-  cardinality_weight: 0.15

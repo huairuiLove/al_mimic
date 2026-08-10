@@ -30,14 +30,7 @@ case "$ACTION" in
     python main.py features --config "$CONFIG"
     ;;
   active)
-    python main.py active --config "$CONFIG"
-    python main.py visualize --config "$CONFIG"
-    python main.py active --config configs/mimic_a800_random.yaml
-    python main.py visualize --config configs/mimic_a800_random.yaml
-    python scripts/compare_experiments.py \
-      --experiment experiments/mimic_iii_comal_a800 CoMAL \
-      --experiment experiments/mimic_iii_random_a800 Random \
-      --output experiments/a800_comal_vs_random.png
+    scripts/run_four_methods.sh active
     ;;
   all)
     "$0" prepare

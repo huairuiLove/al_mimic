@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "mimic-iii-comal"
 version = "0.1.0"
-description = "CoMAL, MM-CoMAL, MoSAIC, and MoDIS active learning on MIMIC-III"
+description = "Multimodal active learning for MIMIC and BRSET diagnosis prediction"
 requires-python = ">=3.10,<3.14"
 dependencies = [
   "torch>=2.1",
@@ -14,9 +14,12 @@ dependencies = [
   "scikit-learn>=1.3",
   "PyYAML>=6.0",
   "matplotlib>=3.7",
-  "joblib>=1.3",
-  "tqdm>=4.65",
   "orjson>=3.9",
+  "h5py>=3.9",
+  "transformers>=4.40,<5",
+  "torchvision>=0.16",
+  "Pillow>=10",
+  "iterative-stratification>=0.1.9",
 ]
 
 [project.optional-dependencies]
@@ -24,9 +27,10 @@ dev = ["pytest>=8.0", "ruff>=0.12"]
 
 [project.scripts]
 mimic-comal = "mimic_comal.cli:main"
+brset-al = "brset_al.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["mimic_comal*", "modis*", "mosaic*"]
+include = ["mimic_comal*", "brset_al*", "modis*", "mosaic*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

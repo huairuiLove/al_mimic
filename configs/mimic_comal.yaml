@@ -1,21 +1,7 @@
 extends: mimic_a800_144c.yaml
 
 experiment:
-  name: mimic_iii_comal
-
-dataset:
-  min_observed_bins: 6
-
-model:
-  modality_dropout: 0.0
-
-training:
-  inherit_across_rounds: true
-  incremental_epochs: 8
-  incremental_comal_epochs: 4
+  name: mimic_iii_yang_wu_bertencoder_comal
 
 active_learning:
   strategy: comal
-
-acquisition:
-  formula: paper

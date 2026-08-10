@@ -1,7 +1,7 @@
-"""Offline MIMIC-III CoMAL reproduction toolkit.
+"""Multimodal active learning for MIMIC-III diagnosis prediction.
 
-The original implementation under ``CoMAL-main`` is kept intact.  This package
-contains adapters and experiment plumbing for MIMIC-III only.
+The original CoMAL implementation under ``CoMAL-main`` remains immutable; this
+package contains the Yang-Wu baseline and four acquisition adapters.
 """
 
 __version__ = "0.1.0"

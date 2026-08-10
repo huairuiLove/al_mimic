@@ -1,9 +1,0 @@
-extends: mimic_a800_144c.yaml
-
-experiment:
-  name: mimic_cross_round_inherit
-
-training:
-  inherit_across_rounds: true
-  incremental_epochs: 3
-  incremental_comal_epochs: 2

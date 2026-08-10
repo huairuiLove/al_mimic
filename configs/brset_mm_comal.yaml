@@ -1,7 +1,7 @@
-extends: mimic_a800_144c.yaml
+extends: brset_base.yaml
 
 experiment:
-  name: mimic_iii_yang_wu_bertencoder_mm_comal
+  name: brset_v1_0_2_resnet50_metadata_mm_comal
 
 active_learning:
   strategy: mm_comal

@@ -1,4 +1,4 @@
-"""Command-line interface for MIMIC-III CoMAL reproduction."""
+"""Command-line interface for formal multimodal MIMIC-III active learning."""
 
 from __future__ import annotations
 
@@ -19,8 +19,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", default="configs/mimic_a800_144c.yaml")
     parser.add_argument("--name", help="override experiment.name")
     parser.add_argument("--output-root", help="override experiment.output_root")
-    parser.add_argument("--device", help="override training.device")
-    parser.add_argument("--rounds", type=int, help="override active_learning.rounds")
     parser.add_argument("--prepared-dir", help="override dataset.prepared_dir")
     parser.add_argument("--experiment-dir", help="experiment directory for visualize")
     return parser
@@ -28,39 +26,28 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _apply_overrides(config: dict, args: argparse.Namespace) -> None:
     experiment = config.setdefault("experiment", {})
-    training = config.setdefault("training", {})
     dataset = config.setdefault("dataset", {})
     if args.name:
         experiment["name"] = args.name
     if args.output_root:
         experiment["output_root"] = args.output_root
-    if args.device:
-        training["device"] = args.device
-        config.setdefault("features", {})["device"] = args.device
-    if args.rounds is not None:
-        if args.rounds < 1:
-            raise ValueError("--rounds must be positive")
-        config.setdefault("active_learning", {})["rounds"] = args.rounds
     if args.prepared_dir:
         dataset["prepared_dir"] = args.prepared_dir
-        dataset["feature_dir"] = str(Path(args.prepared_dir) / "features")
 
 
 def _validate(config: dict) -> dict:
-    from .data import audit_records, load_records
     from .integrity import assert_original_unchanged
+    from .multimodal_data import audit_split_hdf5
 
-    prepared = Path(config.get("dataset", {}).get("prepared_dir", "prepared/mimic_iii"))
-    records = load_records(prepared)
-    labels = tuple(json.loads((prepared / "labels.json").read_text(encoding="utf-8"))["labels"])
-    audit = audit_records(records, labels)
-    if audit["group_leakage"]:
-        raise RuntimeError("SUBJECT_ID leakage detected between splits")
+    audit = audit_split_hdf5(config)
     return {
-        "prepared_dir": str(prepared),
-        "records": len(records),
-        "labels": len(labels),
-        "audit": audit,
+        "records": audit.total_samples,
+        "labels": audit.label_count,
+        "split_counts": audit.split_counts,
+        "time_steps": audit.time_steps,
+        "time_series_dim": audit.time_series_dim,
+        "time_invariant_dim": audit.time_invariant_dim,
+        "note_tokens": audit.note_tokens,
         "original_comal_integrity": assert_original_unchanged(Path.cwd()),
     }
 
@@ -74,9 +61,9 @@ def main() -> None:
     if command == "hardware":
         result = hardware_report(config)
     elif command == "prepare":
-        from .data import prepare_mimic
+        from .multimodal_data import prepare_official_artifacts
 
-        result = prepare_mimic(config)
+        result = prepare_official_artifacts(config)
     elif command == "validate-data":
         result = _validate(config)
     elif command == "explore":
@@ -84,9 +71,9 @@ def main() -> None:
 
         result = explore_dataset(config)
     elif command == "features":
-        from .features import build_features
+        from .multimodal_data import prepare_official_artifacts
 
-        result = build_features(config)
+        result = prepare_official_artifacts(config)
     elif command == "active":
         from .runner import ActiveLearningExperiment
 
@@ -100,15 +87,14 @@ def main() -> None:
         )
         result = visualize_experiment(directory)
     else:
-        from .data import prepare_mimic
-        from .features import build_features
+        from .multimodal_data import prepare_official_artifacts
         from .runner import ActiveLearningExperiment
         from .visualization import explore_dataset, visualize_experiment
 
-        result = {"prepare": prepare_mimic(config)}
+        result = {"prepare": prepare_official_artifacts(config)}
         result["validation"] = _validate(config)
         result["exploration"] = explore_dataset(config)
-        result["features"] = build_features(config)
+        result["features"] = prepare_official_artifacts(config)
         result["active"] = ActiveLearningExperiment(config).run()
         result["visualization"] = visualize_experiment(result["active"]["output_dir"])
     print(json.dumps(result, indent=2, ensure_ascii=False, allow_nan=False))

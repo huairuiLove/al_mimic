@@ -1,7 +1,0 @@
-extends: mimic_a800_144c.yaml
-
-experiment:
-  name: mimic_cross_round_cold
-
-training:
-  inherit_across_rounds: false

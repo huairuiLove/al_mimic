@@ -1,7 +1,7 @@
-extends: mimic_a800_144c.yaml
+extends: brset_base.yaml
 
 experiment:
-  name: mimic_iii_yang_wu_bertencoder_mosaic
+  name: brset_v1_0_2_resnet50_metadata_mosaic
 
 active_learning:
   strategy: mosaic
@@ -15,6 +15,6 @@ mosaic:
   synergy_workset_size: 500
   deflation_steps: 1000
   damping: 0.01
-  fusion_batch_size: 400
-  value_batch_size: 400
+  fusion_batch_size: 512
+  value_batch_size: 512
   synergy_epsilon: 1.0e-8

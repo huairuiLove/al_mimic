@@ -1,4 +1,4 @@
-"""CoMAL-compatible classifier and label-wise contrastive module."""
+"""Yang-Wu multimodal classifier and active-learning acquisition modules."""
 
 from __future__ import annotations
 
@@ -9,186 +9,206 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class TextMLPClassifier(nn.Module):
-    """Three-linear-layer head trained on cached note embeddings."""
-
-    def __init__(self, input_dim: int, num_labels: int, hidden_dims: tuple[int, int], dropout: float) -> None:
-        super().__init__()
-        drop: nn.Module = nn.Identity() if float(dropout) <= 0.0 else nn.Dropout(dropout)
-        gelu = nn.GELU(approximate="tanh")
-        self.backbone = nn.Sequential(
-            nn.LayerNorm(input_dim),
-            nn.Linear(input_dim, hidden_dims[0]),
-            gelu,
-            drop,
-            nn.Linear(hidden_dims[0], hidden_dims[1]),
-            nn.GELU(approximate="tanh"),
-            nn.Identity() if float(dropout) <= 0.0 else nn.Dropout(dropout),
-        )
-        self.classifier = nn.Linear(hidden_dims[1], num_labels)
-        self.feature_dim = hidden_dims[1]
-
-    def forward(self, features: torch.Tensor) -> dict[str, torch.Tensor]:
-        # Resident caches are already float32; skip a redundant cast on the hot path.
-        inputs = features if features.dtype == torch.float32 else features.float()
-        fused = self.backbone(inputs)
-        return {"logits": self.classifier(fused), "features": fused}
-
-
-class MultimodalFusionClassifier(nn.Module):
-    """Scratch encoders for notes, ICU measurements, and demographics.
-
-    The measurement Transformer and late modality Transformer mirror the
-    encoder/fusion pattern in ``multimodal-clinical-pretraining``. Cached inputs
-    contain no learned neural representations; every parameter here is newly
-    initialized for the active-learning run.
-    """
+class YangWuGate(nn.Module):
+    """Clinical-note-primary multimodal adaptation gate from Yang and Wu."""
 
     def __init__(
         self,
-        input_dim: int,
-        num_labels: int,
-        modalities: list[dict[str, object]],
-        *,
-        hidden_dim: int = 256,
-        num_heads: int = 8,
-        measurement_layers: int = 2,
-        fusion_layers: int = 2,
-        dropout: float = 0.1,
-        modality_dropout: float = 0.0,
+        text_dim: int,
+        time_invariant_dim: int,
+        time_series_dim: int,
+        dropout: float,
     ) -> None:
         super().__init__()
-        by_name = {str(item["name"]): item for item in modalities}
-        required = {"clinical_note", "icu_measurements", "demographics"}
-        if set(by_name) != required:
-            raise ValueError(f"multimodal layout must contain exactly {sorted(required)}")
-        self.slices: dict[str, tuple[int, int]] = {}
-        for name, item in by_name.items():
-            start, stop = int(item["start"]), int(item["stop"])
-            if not 0 <= start < stop <= input_dim:
-                raise ValueError(f"invalid {name} feature slice [{start}, {stop})")
-            self.slices[name] = (start, stop)
-        measurement_shape = [int(value) for value in by_name["icu_measurements"]["shape"]]  # type: ignore[index]
-        if len(measurement_shape) != 2 or measurement_shape[0] * measurement_shape[1] != (
-            self.slices["icu_measurements"][1] - self.slices["icu_measurements"][0]
-        ):
-            raise ValueError("icu_measurements shape does not match its cached feature slice")
-        self.measurement_shape = (measurement_shape[0], measurement_shape[1])
-        if hidden_dim % num_heads:
-            raise ValueError("model.fusion_dim must be divisible by model.num_heads")
-        if not 0.0 <= float(modality_dropout) < 1.0:
-            raise ValueError("model.modality_dropout must be in [0, 1)")
+        self.static_weight = nn.Linear(text_dim + time_invariant_dim, 1)
+        self.time_series_weight = nn.Linear(text_dim + time_series_dim, 1)
+        self.adjustment = nn.Linear(time_invariant_dim + time_series_dim, text_dim)
+        self.beta = nn.Parameter(torch.randn(1))
+        self.norm = nn.LayerNorm(text_dim)
+        self.dropout = nn.Dropout(dropout)
 
-        text_dim = self.slices["clinical_note"][1] - self.slices["clinical_note"][0]
-        static_dim = self.slices["demographics"][1] - self.slices["demographics"][0]
-        self.text_encoder = nn.Sequential(
-            nn.LayerNorm(text_dim),
-            nn.Linear(text_dim, hidden_dim),
-            nn.GELU(approximate="tanh"),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim),
+    def forward(
+        self,
+        text: torch.Tensor,
+        time_invariant: torch.Tensor,
+        time_series: torch.Tensor,
+    ) -> torch.Tensor:
+        static_gate = torch.sigmoid(
+            self.static_weight(torch.cat((text, time_invariant), dim=-1))
         )
-        self.measurement_projection = nn.Linear(self.measurement_shape[1], hidden_dim)
-        measurement_layer = nn.TransformerEncoderLayer(
-            hidden_dim,
-            num_heads,
-            dim_feedforward=hidden_dim * 4,
+        series_gate = torch.sigmoid(
+            self.time_series_weight(torch.cat((text, time_series), dim=-1))
+        )
+        adjustment = self.adjustment(
+            torch.cat((static_gate * time_invariant, series_gate * time_series), dim=-1)
+        )
+        ratio = text.norm() / adjustment.norm().clamp_min(1e-12)
+        alpha = torch.minimum(ratio * self.beta, adjustment.new_ones(()))
+        return self.dropout(self.norm(text + alpha * adjustment))
+
+
+class YangWuBertEncoderClassifier(nn.Module):
+    """BertEncoder for 48-hour, 1,042-label MIMIC-III diagnosis prediction.
+
+    The classifier follows the paper architecture. ``modality_tokens`` are an
+    exact telescoping decomposition of the frozen model's fused representation;
+    they are exposed only for the four active-learning methods.
+    """
+
+    modality_names = ("clinical_notes", "time_series", "time_invariant")
+
+    def __init__(
+        self,
+        clinicalbert_checkpoint: str | None,
+        *,
+        num_labels: int = 1042,
+        time_invariant_dim: int = 97,
+        time_invariant_hidden_dim: int = 64,
+        time_series_dim: int = 7411,
+        time_series_hidden_dim: int = 1024,
+        time_series_layers: int = 3,
+        time_series_heads: int = 16,
+        text_hidden_dim: int = 768,
+        dropout: float = 0.1,
+        text_encoder: nn.Module | None = None,
+    ) -> None:
+        super().__init__()
+        if time_series_hidden_dim % time_series_heads:
+            raise ValueError("time-series hidden dimension must be divisible by attention heads")
+        self.text_encoder = text_encoder or self._load_clinicalbert(clinicalbert_checkpoint)
+        self.time_invariant_encoder = nn.Linear(
+            time_invariant_dim, time_invariant_hidden_dim
+        )
+        self.time_series_projection = nn.Linear(time_series_dim, time_series_hidden_dim)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=time_series_hidden_dim,
+            nhead=time_series_heads,
             dropout=dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
         )
-        self.measurement_encoder = nn.TransformerEncoder(
-            measurement_layer, measurement_layers, enable_nested_tensor=False
+        self.time_series_encoder = nn.TransformerEncoder(
+            encoder_layer, num_layers=time_series_layers
         )
-        self.measurement_cls = nn.Parameter(torch.empty(1, 1, hidden_dim))
-        self.measurement_position = nn.Parameter(torch.empty(1, self.measurement_shape[0] + 1, hidden_dim))
-        self.static_encoder = nn.Sequential(
-            nn.LayerNorm(static_dim),
-            nn.Linear(static_dim, hidden_dim),
-            nn.GELU(approximate="tanh"),
-            nn.Dropout(dropout),
+        self.gate = YangWuGate(
+            text_hidden_dim,
+            time_invariant_hidden_dim,
+            time_series_hidden_dim,
+            dropout,
         )
-        fusion_layer = nn.TransformerEncoderLayer(
-            hidden_dim,
-            num_heads,
-            dim_feedforward=hidden_dim * 4,
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
-        )
-        self.fusion_encoder = nn.TransformerEncoder(fusion_layer, fusion_layers, enable_nested_tensor=False)
-        self.modality_embedding = nn.Parameter(torch.empty(1, 3, hidden_dim))
-        self.missing_modality_embedding = nn.Parameter(torch.empty(1, 3, hidden_dim))
-        self.modality_dropout = float(modality_dropout)
-        self.output_norm = nn.LayerNorm(hidden_dim)
-        self.classifier = nn.Linear(hidden_dim, num_labels)
-        self.feature_dim = hidden_dim
-        self.reset_parameters()
+        self.classifier = nn.Linear(text_hidden_dim, num_labels)
+        self.feature_dim = text_hidden_dim
+        self.num_labels = num_labels
 
-    def reset_parameters(self) -> None:
-        for module in self.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-        nn.init.normal_(self.measurement_cls, std=0.02)
-        nn.init.normal_(self.measurement_position, std=0.02)
-        nn.init.normal_(self.modality_embedding, std=0.02)
-        # Zero initialization keeps the modality-dropout-off baseline RNG stream unchanged.
-        nn.init.zeros_(self.missing_modality_embedding)
-
-    def _select(self, features: torch.Tensor, name: str) -> torch.Tensor:
-        start, stop = self.slices[name]
-        return features[:, start:stop]
-
-    def encode_modalities(self, features: torch.Tensor) -> torch.Tensor:
-        inputs = features if features.dtype == torch.float32 else features.float()
-        text_token = self.text_encoder(self._select(inputs, "clinical_note"))
-        measurement = self._select(inputs, "icu_measurements").reshape(
-            -1, self.measurement_shape[0], self.measurement_shape[1]
+    @staticmethod
+    def _load_clinicalbert(checkpoint: str | None) -> nn.Module:
+        if not checkpoint:
+            raise ValueError("a ClinicalBERT checkpoint is required")
+        try:
+            from transformers import BertConfig, BertModel
+        except ImportError as exc:  # pragma: no cover - dependency error is environment-specific
+            raise RuntimeError("transformers is required for the Yang-Wu baseline") from exc
+        encoder = BertModel(BertConfig())
+        try:
+            state = torch.load(checkpoint, map_location="cpu", weights_only=True)
+        except TypeError:  # pragma: no cover - old torch compatibility
+            state = torch.load(checkpoint, map_location="cpu")
+        if isinstance(state, dict) and isinstance(state.get("state_dict"), dict):
+            state = state["state_dict"]
+        if not isinstance(state, dict):
+            raise ValueError("ClinicalBERT checkpoint must contain a state dictionary")
+        model_state = encoder.state_dict()
+        compatible = {
+            str(key).removeprefix("bert."): value
+            for key, value in state.items()
+            if str(key).removeprefix("bert.") in model_state
+            and model_state[str(key).removeprefix("bert.")].shape == value.shape
+        }
+        coverage = sum(value.numel() for value in compatible.values()) / sum(
+            value.numel() for value in model_state.values()
         )
-        measurement = self.measurement_projection(measurement)
-        cls = self.measurement_cls.expand(measurement.shape[0], -1, -1)
-        measurement = torch.cat((cls, measurement), dim=1) + self.measurement_position
-        measurement_token = self.measurement_encoder(measurement)[:, 0]
-        static_token = self.static_encoder(self._select(inputs, "demographics"))
-        return torch.stack((text_token, measurement_token, static_token), dim=1)
+        if coverage < 0.95:
+            raise ValueError(
+                f"ClinicalBERT checkpoint covers only {coverage:.1%} of BERT-base parameters"
+            )
+        model_state.update(compatible)
+        encoder.load_state_dict(model_state)
+        return encoder
 
-    def _apply_modality_dropout(self, tokens: torch.Tensor) -> torch.Tensor:
-        if not self.training or self.modality_dropout <= 0.0:
-            return tokens
-        dropped = torch.rand(tokens.shape[:2], device=tokens.device) < self.modality_dropout
-        all_dropped = dropped.all(dim=1)
-        if all_dropped.any():
-            keep = torch.randint(tokens.shape[1], (int(all_dropped.sum()),), device=tokens.device)
-            dropped[all_dropped, keep] = False
-        missing = self.missing_modality_embedding.expand(tokens.shape[0], -1, -1)
-        return torch.where(dropped.unsqueeze(-1), missing, tokens)
+    def _encode_text(
+        self,
+        input_ids: torch.Tensor,
+        token_type_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        output = self.text_encoder(
+            input_ids=input_ids,
+            token_type_ids=token_type_ids,
+            attention_mask=attention_mask,
+        )
+        if hasattr(output, "pooler_output") and output.pooler_output is not None:
+            return output.pooler_output
+        if isinstance(output, (tuple, list)) and len(output) > 1:
+            return output[1]
+        raise ValueError("ClinicalBERT encoder must return a pooled BERT-base representation")
+
+    def encode_modalities(self, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, ...]:
+        static = F.relu(self.time_invariant_encoder(batch["time_invariant"].float()))
+        series = F.relu(self.time_series_projection(batch["time_series"].float()))
+        series = self.time_series_encoder(series.transpose(0, 1))[0]
+        text = self._encode_text(
+            batch["input_ids"].long(),
+            batch["token_type_ids"].long(),
+            batch["attention_mask"].long(),
+        )
+        return text, series, static
+
+    def _decompose(
+        self,
+        text: torch.Tensor,
+        series: torch.Tensor,
+        static: torch.Tensor,
+        fused: torch.Tensor,
+    ) -> torch.Tensor:
+        zeros_static = torch.zeros_like(static)
+        zeros_series = torch.zeros_like(series)
+        text_only = self.gate(text, zeros_static, zeros_series)
+        text_static = self.gate(text, static, zeros_series)
+        static_contribution = text_static - text_only
+        series_contribution = fused - text_static
+        return torch.stack((text_only, series_contribution, static_contribution), dim=1)
 
     def fuse_from_tokens(self, tokens: torch.Tensor, *, apply_dropout: bool = False) -> torch.Tensor:
-        if tokens.ndim != 3 or tokens.shape[1:] != self.modality_embedding.shape[1:]:
-            raise ValueError("tokens must have shape [N, 3, fusion_dim]")
-        fused_tokens = self._apply_modality_dropout(tokens) if apply_dropout else tokens
-        return self.output_norm(
-            self.fusion_encoder(fused_tokens + self.modality_embedding).mean(dim=1)
-        )
+        del apply_dropout
+        if tokens.ndim != 3 or tokens.shape[1:] != (3, self.feature_dim):
+            raise ValueError(f"tokens must have shape [N, 3, {self.feature_dim}]")
+        return tokens.sum(dim=1)
 
-    def forward(self, features: torch.Tensor, *, return_tokens: bool = False) -> dict[str, torch.Tensor]:
-        tokens = self.encode_modalities(features)
-        fused = self.fuse_from_tokens(tokens, apply_dropout=True)
-        result = {"logits": self.classifier(fused), "features": fused}
+    def probabilities_from_fused(self, fused: torch.Tensor) -> torch.Tensor:
+        return torch.sigmoid(self.classifier(fused))
+
+    def forward(
+        self,
+        batch: dict[str, torch.Tensor],
+        *,
+        return_tokens: bool = False,
+    ) -> dict[str, torch.Tensor]:
+        text, series, static = self.encode_modalities(batch)
+        fused = self.gate(text, static, series)
+        logits = self.classifier(fused)
+        result = {
+            "logits": logits,
+            "probabilities": torch.sigmoid(logits),
+            "features": fused,
+        }
         if return_tokens:
-            result["modality_tokens"] = tokens
+            result["modality_tokens"] = self._decompose(text, series, static, fused)
         return result
 
 
 class CoMALModule(nn.Module):
     """Label-wise latent reconstruction module used by CoMAL.
 
-    This follows the original ``MLP_VAE`` topology while accepting the adapter's
-    cached text features.  Positive labels have one prototype per ICD group and
+    This follows the original ``MLP_VAE`` topology while accepting frozen
+    BertEncoder features. Positive labels have one prototype per ICD group and
     all negatives share a background prototype, matching ``cl_neg_mode=1``.
     """
 

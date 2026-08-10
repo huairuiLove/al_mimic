@@ -1,8 +1,0 @@
-extends: mimic_a800_144c.yaml
-
-experiment:
-  name: mimic_iii_random_a800
-
-active_learning:
-  strategy: random
-

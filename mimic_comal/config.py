@@ -1,4 +1,4 @@
-"""Configuration loading and validation for MIMIC-III experiments."""
+"""Configuration loading for the formal Yang and Wu MIMIC-III diagnosis task."""
 
 from __future__ import annotations
 
@@ -8,76 +8,140 @@ from typing import Any
 import yaml
 
 
-def _validate_scratch_multimodal(config: dict[str, Any]) -> None:
-    model = config.get("model", {})
-    if str(model.get("architecture", "")).lower() != "multimodal_transformer_scratch":
+FORMAL_STRATEGIES = {"comal", "mm_comal", "modis", "mosaic"}
+
+
+def _require_equal(name: str, actual: Any, required: Any) -> None:
+    if actual != required:
+        raise ValueError(f"formal Yang-Wu protocol requires {name}={required!r}, got {actual!r}")
+
+
+def _reject_shortcuts(value: Any, prefix: str = "") -> None:
+    """Reject experiment-shortening knobs in every formal configuration."""
+    if not isinstance(value, dict):
         return
-    features = config.get("features", {})
-    if str(features.get("encoder", "")).lower() != "multimodal_scratch":
-        raise ValueError("scratch multimodal model requires features.encoder=multimodal_scratch")
-    if str(model.get("initialization", "")).lower() != "random":
-        raise ValueError("scratch multimodal model requires model.initialization=random")
-    forbidden = ("pretrained", "checkpoint", "model_path", "weights_path", "resume_from")
+    forbidden = {
+        "dry_run",
+        "dryrun",
+        "smoke",
+        "max_records",
+        "max_rows",
+        "max_batches",
+        "max_steps",
+        "limit_train_batches",
+        "fast_dev_run",
+        "resume_from",
+        "round_checkpoint",
+        "previous_checkpoint",
+        "warm_start",
+    }
+    for key, child in value.items():
+        path = f"{prefix}.{key}" if prefix else str(key)
+        if str(key).lower() in forbidden:
+            raise ValueError(f"formal experiments forbid shortcut setting: {path}")
+        _reject_shortcuts(child, path)
 
-    def visit(value: Any, prefix: str = "") -> None:
-        if not isinstance(value, dict):
-            return
-        for key, child in value.items():
-            path = f"{prefix}.{key}" if prefix else str(key)
-            if any(token in str(key).lower() for token in forbidden) and child not in (None, False, ""):
-                raise ValueError(f"pretrained/checkpoint input is forbidden for scratch training: {path}")
-            visit(child, path)
 
-    visit(config)
+def _validate_yang_wu_protocol(config: dict[str, Any]) -> None:
+    dataset = config.get("dataset", {})
+    preprocessing = config.get("preprocessing", {})
+    model = config.get("model", {})
+    training = config.get("training", {})
+    active = config.get("active_learning", {})
 
+    required_values = {
+        "dataset.split_group": (dataset.get("split_group"), "with_notes"),
+        "preprocessing.cohort": (preprocessing.get("cohort"), "metavision"),
+        "preprocessing.task": (preprocessing.get("task"), "Diagnoses"),
+        "preprocessing.split_protocol": (
+            preprocessing.get("split_protocol"),
+            "yang_wu_official_7_1.5_1.5",
+        ),
+        "preprocessing.label_format": (
+            preprocessing.get("label_format"),
+            "icd9_top3_multihot",
+        ),
+        "preprocessing.note_protocol": (
+            preprocessing.get("note_protocol"),
+            "latest_per_category_description_within_48h",
+        ),
+        "model.architecture": (model.get("architecture"), "yang_wu_bertencoder"),
+        "model.initialization": (
+            model.get("initialization"),
+            "clinicalbert_pretrained_fresh_fusion_each_round",
+        ),
+        "model.output_activation": (model.get("output_activation"), "sigmoid"),
+        "training.optimizer": (training.get("optimizer"), "adam"),
+        "training.loss": (training.get("loss"), "binary_cross_entropy"),
+        "training.precision": (training.get("precision"), "fp32"),
+    }
+    for name, (actual, required) in required_values.items():
+        _require_equal(name, actual, required)
 
-def _validate_active_learning(config: dict[str, Any]) -> None:
-    strategy = str(config.get("active_learning", {}).get("strategy", "comal")).lower()
-    allowed = {"comal", "mm_comal", "modis", "mosaic", "random"}
-    if strategy not in allowed:
-        raise ValueError(f"active_learning.strategy must be one of {sorted(allowed)}")
-    architecture = str(config.get("model", {}).get("architecture", "")).lower()
-    if strategy in {"mm_comal", "modis", "mosaic"} and architecture != "multimodal_transformer_scratch":
-        raise ValueError(f"{strategy} requires model.architecture=multimodal_transformer_scratch")
-    minimum_observed_bins = int(
-        config.get("dataset", {}).get(
-            "min_observed_bins", config.get("data", {}).get("min_observed_bins", 0)
-        )
-    )
-    if minimum_observed_bins < 0:
-        raise ValueError("dataset.min_observed_bins must be non-negative")
-    modality_dropout = float(config.get("model", {}).get("modality_dropout", 0.0))
-    if not 0.0 <= modality_dropout < 1.0:
-        raise ValueError("model.modality_dropout must be in [0, 1)")
-    if strategy == "mm_comal":
-        mm = config.get("acquisition", {}).get("mm", {})
-        if float(mm.get("alpha", 1.0)) < 0.0:
-            raise ValueError("acquisition.mm.alpha must be non-negative")
-        if str(mm.get("threshold_estimator", "shrunk")).lower() not in {"shrunk", "midpoint"}:
-            raise ValueError("acquisition.mm.threshold_estimator must be shrunk or midpoint")
-    if strategy == "mosaic":
-        mosaic = config.get("mosaic", {})
-        if not 0.0 <= float(mosaic.get("eta", 0.25)) <= 1.0:
-            raise ValueError("mosaic.eta must be in [0, 1]")
-        for key in ("partners", "workset_size", "synergy_workset_size"):
-            if int(mosaic.get(key, 1)) < 1:
-                raise ValueError(f"mosaic.{key} must be positive")
-    if strategy == "modis":
-        modis = config.get("modis", {})
-        beta = modis.get("beta", [1.0, 1.0, 1.0])
-        if not isinstance(beta, list) or len(beta) != 3:
-            raise ValueError("modis.beta must contain three values")
-        if any(not isinstance(value, (int, float)) for value in beta):
-            raise ValueError("modis.beta values must be numeric")
-        for key in ("grid_k", "workset_size", "fusion_batch_size", "probe_epochs"):
-            if int(modis.get(key, 1)) < 1:
-                raise ValueError(f"modis.{key} must be positive")
-        if int(modis.get("bisect_steps", 0)) < 0:
-            raise ValueError("modis.bisect_steps must be non-negative")
-        if int(modis.get("oof_folds", 5)) < 2:
-            raise ValueError("modis.oof_folds must be at least 2")
-        if str(modis.get("prototype", "mean")).lower() not in {"mean", "medoid"}:
-            raise ValueError("modis.prototype must be mean or medoid")
+    integer_values = {
+        "preprocessing.observation_hours": (preprocessing.get("observation_hours"), 48),
+        "preprocessing.timestep_hours": (preprocessing.get("timestep_hours"), 1),
+        "preprocessing.max_note_tokens": (preprocessing.get("max_note_tokens"), 512),
+        "preprocessing.expected_total_samples": (
+            preprocessing.get("expected_total_samples"),
+            10210,
+        ),
+        "preprocessing.expected_label_count": (
+            preprocessing.get("expected_label_count"),
+            1042,
+        ),
+        "preprocessing.time_invariant_dim": (
+            preprocessing.get("time_invariant_dim"),
+            97,
+        ),
+        "preprocessing.time_series_dim": (
+            preprocessing.get("time_series_dim"),
+            7411,
+        ),
+        "model.text_hidden_dim": (model.get("text_hidden_dim"), 768),
+        "model.time_invariant_hidden_dim": (
+            model.get("time_invariant_hidden_dim"),
+            64,
+        ),
+        "model.time_series_hidden_dim": (model.get("time_series_hidden_dim"), 1024),
+        "model.time_series_layers": (model.get("time_series_layers"), 3),
+        "model.time_series_heads": (model.get("time_series_heads"), 16),
+        "model.output_size": (model.get("output_size"), 1042),
+        "training.epochs": (training.get("epochs"), 20),
+        "training.comal_epochs": (training.get("comal_epochs"), 20),
+        "active_learning.rounds": (active.get("rounds"), 6),
+    }
+    for name, (actual, required) in integer_values.items():
+        try:
+            normalized = int(actual)
+        except (TypeError, ValueError):
+            normalized = actual
+        _require_equal(name, normalized, required)
+
+    float_values = {
+        "model.dropout": (model.get("dropout"), 0.1),
+        "training.learning_rate": (training.get("learning_rate"), 1e-4),
+        "training.weight_decay": (training.get("weight_decay"), 0.0),
+        "training.gradient_clip": (training.get("gradient_clip"), 1.0),
+        "training.warmup_proportion": (training.get("warmup_proportion"), 0.1),
+        "active_learning.initial_fraction": (active.get("initial_fraction"), 0.10),
+        "active_learning.query_fraction": (active.get("query_fraction"), 0.05),
+    }
+    for name, (actual, required) in float_values.items():
+        try:
+            normalized = float(actual)
+        except (TypeError, ValueError):
+            normalized = actual
+        _require_equal(name, normalized, required)
+
+    strategy = str(active.get("strategy", "")).lower()
+    if strategy not in FORMAL_STRATEGIES:
+        raise ValueError(f"active_learning.strategy must be one of {sorted(FORMAL_STRATEGIES)}")
+    if bool(training.get("inherit_across_rounds", False)):
+        raise ValueError("formal protocol forbids cross-round weight inheritance")
+    if not str(dataset.get("clinicalbert_checkpoint", "")).strip():
+        raise ValueError("dataset.clinicalbert_checkpoint must name the ClinicalBERT source checkpoint")
+    _reject_shortcuts(config)
 
 
 def _merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -103,63 +167,28 @@ def load_config(path: str | Path) -> dict[str, Any]:
             parent_path = path.parent / parent_path
         config = _merge(load_config(parent_path), config)
     config["_config_path"] = str(path.resolve())
-    _validate_scratch_multimodal(config)
-    _validate_active_learning(config)
+    _validate_yang_wu_protocol(config)
     return config
+
+
+def resolve_path(config: dict[str, Any], value: str | Path) -> Path:
+    path = Path(value).expanduser()
+    if path.is_absolute():
+        return path
+    config_path = Path(config.get("_config_path", ".")).resolve()
+    return (config_path.parent / path).resolve() if str(path).startswith("./") else path.resolve()
 
 
 def require_paths(config: dict[str, Any]) -> dict[str, Path]:
     dataset = config.get("dataset", {})
-    root = Path(dataset.get("root", "mimic-iii-clinical-database-1.4"))
-
-    def table_path(config_key: str, table_name: str) -> Path:
-        explicit = dataset.get(config_key)
-        if explicit:
-            return Path(explicit)
-        compressed = root / f"{table_name}.csv.gz"
-        return compressed if compressed.is_file() else root / f"{table_name}.csv"
-
     paths = {
-        "root": root,
-        "admissions": table_path("admissions", "ADMISSIONS"),
-        "diagnoses": table_path("diagnoses", "DIAGNOSES_ICD"),
-        "notes": table_path("notes", "NOTEEVENTS"),
+        "split_hdf5": resolve_path(config, dataset.get("split_hdf5", "")),
+        "clinicalbert_checkpoint": resolve_path(
+            config, dataset.get("clinicalbert_checkpoint", "")
+        ),
     }
-    missing = [name for name, value in paths.items() if name != "root" and not value.is_file()]
+    missing = [name for name, path in paths.items() if not path.is_file()]
     if missing:
-        raise FileNotFoundError("missing MIMIC-III files: " + ", ".join(missing))
+        details = ", ".join(f"{name}={paths[name]}" for name in missing)
+        raise FileNotFoundError(f"missing formal Yang-Wu inputs: {details}")
     return paths
-
-
-def require_multimodal_paths(config: dict[str, Any]) -> dict[str, Path]:
-    """Resolve the additional raw tables required by the multimodal adapter."""
-    paths = require_paths(config)
-    dataset = config.get("dataset", {})
-    root = paths["root"]
-
-    def table_path(config_key: str, table_name: str) -> Path:
-        explicit = dataset.get(config_key)
-        if explicit:
-            return Path(explicit)
-        compressed = root / f"{table_name}.csv.gz"
-        return compressed if compressed.is_file() else root / f"{table_name}.csv"
-
-    paths.update(
-        {
-            "patients": table_path("patients", "PATIENTS"),
-            "icustays": table_path("icustays", "ICUSTAYS"),
-            "chartevents": table_path("chartevents", "CHARTEVENTS"),
-        }
-    )
-    missing = [name for name in ("patients", "icustays", "chartevents") if not paths[name].is_file()]
-    if missing:
-        raise FileNotFoundError("missing multimodal MIMIC-III files: " + ", ".join(missing))
-    return paths
-
-
-def resolve_path(config: dict[str, Any], value: str | Path) -> Path:
-    path = Path(value)
-    config_path = Path(config.get("_config_path", ".")).resolve()
-    if not path.is_absolute() and config_path.parent.exists() and str(path).startswith("./"):
-        return (config_path.parent / path).resolve()
-    return path

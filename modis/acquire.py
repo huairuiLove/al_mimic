@@ -9,7 +9,7 @@ from typing import Any, Mapping
 import numpy as np
 import torch
 
-from mimic_comal.model import MultimodalFusionClassifier
+import torch.nn as nn
 from mosaic.tokens import fuse_token_batches, probabilities_from_fused
 
 from .intervene import interpolate_modality_token
@@ -149,7 +149,7 @@ def _spearman(left: torch.Tensor, right: torch.Tensor) -> float | None:
 
 @torch.inference_mode()
 def critical_instability(
-    classifier: MultimodalFusionClassifier,
+    classifier: nn.Module,
     tokens: torch.Tensor,
     prototypes: torch.Tensor,
     base_decisions: torch.Tensor,
@@ -266,7 +266,7 @@ def _geometric_rank_score(
 
 @torch.inference_mode()
 def acquire_modis(
-    classifier: MultimodalFusionClassifier,
+    classifier: nn.Module,
     probe_state: MoDISProbeState,
     candidates: dict[str, torch.Tensor],
     *,
@@ -277,8 +277,8 @@ def acquire_modis(
     comparison_scores: Mapping[str, torch.Tensor] | None = None,
 ) -> MoDISAcquisitionResult:
     """Score a candidate pool according to equations (3)-(13)."""
-    if not isinstance(classifier, MultimodalFusionClassifier):
-        raise ValueError("MoDIS requires MultimodalFusionClassifier")
+    if not callable(getattr(classifier, "fuse_from_tokens", None)):
+        raise ValueError("MoDIS requires a classifier with fuse_from_tokens")
     required = {"probabilities", "modality_tokens"}
     if not required.issubset(candidates):
         raise ValueError("candidates must include probabilities and modality_tokens")

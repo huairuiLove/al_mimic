@@ -12,8 +12,7 @@ import numpy as np
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
-from .data import audit_records, load_records
-from .training import label_matrix
+from .multimodal_data import YangWuFeatureStore
 
 
 COLORS = ("#287271", "#d9895b", "#5b6f9c", "#b35c44")
@@ -29,20 +28,20 @@ def _write_json(path: Path, payload: Any) -> None:
 
 def explore_dataset(config: dict[str, Any], output_dir: str | Path | None = None) -> dict[str, Any]:
     dataset = config.get("dataset", {})
-    prepared = Path(dataset.get("prepared_dir", "prepared/mimic_iii"))
+    prepared = Path(dataset.get("prepared_dir", "prepared/yang_wu_diagnoses_48h"))
     output = Path(output_dir or prepared / "exploration")
     output.mkdir(parents=True, exist_ok=True)
-    records = load_records(prepared)
-    label_names = tuple(json.loads((prepared / "labels.json").read_text(encoding="utf-8"))["labels"])
-    labels = label_matrix(records, label_names)
+    store = YangWuFeatureStore(config, validate=True)
+    labels = store.labels
+    label_names = tuple(f"ICD9-group-{index:04d}" for index in range(labels.shape[1]))
     files: dict[str, str] = {}
 
     positives = labels.sum(axis=0)
-    order = np.argsort(positives)
-    fig, axis = plt.subplots(figsize=(9, max(5, len(label_names) * 0.22)))
+    order = np.argsort(positives)[-min(50, len(label_names)) :]
+    fig, axis = plt.subplots(figsize=(9, 12))
     axis.barh(np.arange(len(order)), positives[order], color=COLORS[0])
     axis.set_yticks(np.arange(len(order)), [label_names[index] for index in order])
-    axis.set_xlabel("Admissions with positive ICD-9 group")
+    axis.set_xlabel("ICU visits with positive three-digit ICD-9 group (top 50)")
     axis.grid(axis="x", alpha=0.2)
     fig.tight_layout()
     files["label_prevalence"] = "label_prevalence.png"
@@ -53,7 +52,7 @@ def explore_dataset(config: dict[str, Any], output_dir: str | Path | None = None
     bins = np.arange(cardinality.max() + 2) - 0.5
     fig, axis = plt.subplots(figsize=(8, 4.5))
     axis.hist(cardinality, bins=bins, color=COLORS[1], edgecolor="white")
-    axis.set(xlabel="Positive ICD-9 groups per admission", ylabel="Admissions")
+    axis.set(xlabel="Positive ICD-9 groups per ICU visit", ylabel="ICU visits")
     axis.grid(axis="y", alpha=0.2)
     fig.tight_layout()
     files["cardinality"] = "label_cardinality.png"
@@ -91,10 +90,19 @@ def explore_dataset(config: dict[str, Any], output_dir: str | Path | None = None
     fig.savefig(output / files["method_scaling"], dpi=_SAVE_DPI)
     plt.close(fig)
 
-    audit = audit_records(records, label_names)
+    audit: dict[str, Any] = {
+        "protocol": "Yang-Wu Diagnoses 48h",
+        "records": store.audit.total_samples,
+        "labels": store.audit.label_count,
+        "split_counts": store.audit.split_counts,
+        "time_steps": store.audit.time_steps,
+        "time_series_dim": store.audit.time_series_dim,
+        "time_invariant_dim": store.audit.time_invariant_dim,
+        "note_tokens": store.audit.note_tokens,
+    }
     split_positive = {
-        split: labels[[record.split == split for record in records]].sum(axis=0)
-        for split in ("train", "validation", "test")
+        split: labels[store.indices(split)].sum(axis=0)
+        for split in ("train", "val", "test")
     }
     audit["split_label_coverage"] = {
         split: int((values > 0).sum()) for split, values in split_positive.items()
@@ -118,17 +126,16 @@ def visualize_experiment(experiment_dir: str | Path, output_dir: str | Path | No
     state = json.loads((experiment / "active_state.json").read_text(encoding="utf-8"))
     prediction = np.load(experiment / "final_predictions.npz")
     records = state["records"]
-    labels = state["label_names"]
     files: dict[str, str] = {}
 
     rounds = [record["round_index"] for record in records]
-    labeled = [record["labeled_before_query"] for record in records]
+    labeled = [record["labeled_count"] for record in records]
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.4))
     for index, split in enumerate(("validation", "test")):
         for metric, color in (
-            ("auprc_macro", COLORS[0]),
-            ("auprc_micro", COLORS[1]),
-            ("f1_micro", COLORS[2]),
+            ("recall_at_10", COLORS[0]),
+            ("recall_at_20", COLORS[1]),
+            ("recall_at_30", COLORS[2]),
         ):
             axes[index].plot(
                 labeled,
@@ -146,11 +153,20 @@ def visualize_experiment(experiment_dir: str | Path, output_dir: str | Path | No
     plt.close(fig)
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.4))
+    has_comal = any(record["training_history"].get("comal_loss") for record in records)
     for round_index, record in enumerate(records):
         axes[0].plot(record["training_history"]["classifier_loss"], alpha=0.75, label=f"r{round_index}")
-        axes[1].plot(record["training_history"]["comal_loss"], alpha=0.75, label=f"r{round_index}")
+        auxiliary = record["training_history"].get("comal_loss") or record["training_history"].get(
+            "probe_loss", []
+        )
+        if auxiliary:
+            axes[1].plot(auxiliary, alpha=0.75, label=f"r{round_index}")
     axes[0].set(title="Classifier training", xlabel="Epoch", ylabel="Loss")
-    axes[1].set(title="CoMAL training", xlabel="Epoch", ylabel="Loss")
+    axes[1].set(
+        title="CoMAL training" if has_comal else "Acquisition auxiliary training",
+        xlabel="Epoch",
+        ylabel="Loss",
+    )
     for axis in axes:
         axis.grid(alpha=0.2)
     if len(records) <= 10:
@@ -161,10 +177,13 @@ def visualize_experiment(experiment_dir: str | Path, output_dir: str | Path | No
     plt.close(fig)
 
     classifier_time = [record["timing"]["classifier_training_sec"] for record in records]
-    comal_time = [record["timing"]["comal_training_sec"] for record in records]
+    auxiliary_time = [
+        record["timing"].get("comal_training_sec", record["timing"].get("modis_probe_training_sec", 0.0))
+        for record in records
+    ]
     fig, axis = plt.subplots(figsize=(8, 4.5))
     axis.bar(rounds, classifier_time, label="classifier", color=COLORS[0])
-    axis.bar(rounds, comal_time, bottom=classifier_time, label="CoMAL", color=COLORS[1])
+    axis.bar(rounds, auxiliary_time, bottom=classifier_time, label="acquisition auxiliary", color=COLORS[1])
     axis.set(xlabel="Round", ylabel="Wall seconds", title="Training time by round")
     axis.legend()
     axis.grid(axis="y", alpha=0.2)
@@ -175,26 +194,16 @@ def visualize_experiment(experiment_dir: str | Path, output_dir: str | Path | No
 
     test_labels = prediction["test_labels"]
     test_probs = prediction["test_probabilities"]
-    from sklearn.metrics import average_precision_score
-
-    per_label = []
-    for index in range(len(labels)):
-        value = (
-            average_precision_score(test_labels[:, index], test_probs[:, index])
-            if np.unique(test_labels[:, index]).size == 2
-            else np.nan
-        )
-        per_label.append(value)
-    valid = np.flatnonzero(np.isfinite(per_label))
-    order = valid[np.argsort(np.asarray(per_label)[valid])]
-    fig, axis = plt.subplots(figsize=(9, max(5, len(order) * 0.22)))
-    axis.barh(np.arange(len(order)), np.asarray(per_label)[order], color=COLORS[2])
-    axis.set_yticks(np.arange(len(order)), [labels[index] for index in order])
-    axis.set(xlabel="Test average precision", xlim=(0, 1))
-    axis.grid(axis="x", alpha=0.2)
+    top_30 = np.argsort(-test_probs, axis=1, kind="stable")[:, :30]
+    hits = np.take_along_axis(test_labels, top_30, axis=1).sum(axis=1)
+    visit_recall = hits / test_labels.sum(axis=1)
+    fig, axis = plt.subplots(figsize=(9, 5))
+    axis.hist(visit_recall, bins=40, range=(0, 1), color=COLORS[2], edgecolor="white")
+    axis.set(xlabel="Per-visit test Recall@30", ylabel="ICU visits", xlim=(0, 1))
+    axis.grid(axis="y", alpha=0.2)
     fig.tight_layout()
-    files["per_label"] = "test_per_label_auprc.png"
-    fig.savefig(output / files["per_label"], dpi=_SAVE_DPI)
+    files["per_visit"] = "test_per_visit_recall_at_30.png"
+    fig.savefig(output / files["per_visit"], dpi=_SAVE_DPI)
     plt.close(fig)
 
     report = {"experiment": str(experiment), "output_dir": str(output), "files": files}
@@ -211,12 +220,12 @@ def compare_experiments(
     fig, axis = plt.subplots(figsize=(8, 5))
     for position, (directory, name) in enumerate(zip(experiment_dirs, names)):
         state = json.loads((Path(directory) / "active_state.json").read_text(encoding="utf-8"))
-        x = [record["labeled_before_query"] for record in state["records"]]
-        y = [record["test_metrics"]["auprc_macro"] for record in state["records"]]
+        x = [record["labeled_count"] for record in state["records"]]
+        y = [record["test_metrics"]["recall_at_30"] for record in state["records"]]
         area = float(np.trapezoid(y, x) / max(x[-1] - x[0], 1)) if len(x) > 1 else y[0]
-        curves[name] = {"labeled": x, "test_auprc_macro": y, "normalised_area": area}
+        curves[name] = {"labeled": x, "test_recall_at_30": y, "normalised_area": area}
         axis.plot(x, y, marker="o", label=name, color=COLORS[position % len(COLORS)])
-    axis.set(xlabel="Labeled admissions", ylabel="Test macro AUPRC", title="Active-learning comparison")
+    axis.set(xlabel="Labeled ICU visits", ylabel="Test Recall@30", title="Active-learning comparison")
     axis.grid(alpha=0.2)
     axis.legend()
     fig.tight_layout()

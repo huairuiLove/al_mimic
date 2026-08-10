@@ -1,13 +1,10 @@
 from __future__ import annotations
 
 import math
-from copy import deepcopy
 
-import numpy as np
 import torch
 import torch.nn as nn
 
-from mimic_comal.training import train_round
 from modis.acquire import (
     critical_instability,
     decision_support,
@@ -156,71 +153,3 @@ def test_grid_instability_is_conservative_against_dense_scan() -> None:
 
     assert result.per_modality[0, 0].item() <= dense_supremum + 1e-6
     assert dense_supremum - result.per_modality[0, 0].item() < 1 / 8
-
-
-def test_stop_gradient_probes_leave_comal_training_trajectory_unchanged() -> None:
-    generator = np.random.default_rng(11)
-    features = generator.normal(size=(12, 14)).astype(np.float32)
-    labels = np.asarray(
-        [[index % 2, (index // 2) % 2, (index + 1) % 3 == 0] for index in range(12)],
-        dtype=np.float32,
-    )
-    config = {
-        "_feature_metadata": {
-            "initialization": "random",
-            "pretrained_weights": False,
-            "modalities": [
-                {"name": "clinical_note", "start": 0, "stop": 2, "shape": [2]},
-                {"name": "icu_measurements", "start": 2, "stop": 6, "shape": [2, 2]},
-                {"name": "demographics", "start": 6, "stop": 14, "shape": [8]},
-            ],
-        },
-        "model": {
-            "architecture": "multimodal_transformer_scratch",
-            "fusion_dim": 8,
-            "num_heads": 2,
-            "measurement_layers": 1,
-            "fusion_layers": 1,
-            "dropout": 0.0,
-            "modality_dropout": 0.0,
-        },
-        "comal": {"label_dim": 4, "prototype_dim": 4, "anchor_chunk_size": 16},
-        "training": {
-            "device": "cpu",
-            "precision": "fp32",
-            "batch_size": 4,
-            "comal_batch_size": 4,
-            "eval_batch_size": 16,
-            "epochs": 1,
-            "comal_epochs": 1,
-            "num_workers": 0,
-            "pin_memory": False,
-            "seed": 29,
-        },
-        "active_learning": {"strategy": "comal"},
-        "modis": {
-            "oof_folds": 2,
-            "probe_epochs": 1,
-            "probe_batch_size": 4,
-            "prototype": "mean",
-        },
-    }
-    indices = np.arange(8)
-    torch.manual_seed(29)
-    baseline = train_round(features, labels, indices, config, torch.device("cpu"))
-    modis_config = deepcopy(config)
-    modis_config["active_learning"]["strategy"] = "modis"
-    torch.manual_seed(29)
-    modis = train_round(
-        features,
-        labels,
-        indices,
-        modis_config,
-        torch.device("cpu"),
-        subject_groups=np.asarray([str(index) for index in range(12)]),
-    )
-
-    for name, value in baseline.classifier.state_dict().items():
-        assert torch.equal(value, modis.classifier.state_dict()[name])
-    for name, value in baseline.comal.state_dict().items():
-        assert torch.equal(value, modis.comal.state_dict()[name])

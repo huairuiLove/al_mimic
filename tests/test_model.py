@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import torch
+import torch.nn as nn
 
 from mimic_comal.model import (
     CoMALModule,
-    MultimodalFusionClassifier,
+    YangWuBertEncoderClassifier,
     comal_acquisition_scores,
     estimate_mm_comal_statistics,
     mm_comal_acquisition_scores,
@@ -14,31 +17,50 @@ from mimic_comal.model import (
 )
 
 
-def test_scratch_multimodal_classifier_shapes() -> None:
-    layout = [
-        {"name": "clinical_note", "start": 0, "stop": 6, "shape": [6]},
-        {"name": "icu_measurements", "start": 6, "stop": 22, "shape": [4, 4]},
-        {"name": "demographics", "start": 22, "stop": 30, "shape": [8]},
-    ]
+class _TinyBert(nn.Module):
+    def __init__(self, hidden_dim: int) -> None:
+        super().__init__()
+        self.embedding = nn.Embedding(32, hidden_dim)
+
+    def forward(self, input_ids, token_type_ids, attention_mask):
+        del token_type_ids
+        values = self.embedding(input_ids)
+        weights = attention_mask.unsqueeze(-1).float()
+        pooled = (values * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1)
+        return SimpleNamespace(pooler_output=pooled)
+
+
+def test_yang_wu_multimodal_multilabel_classifier_shapes() -> None:
     torch.manual_seed(3)
-    model = MultimodalFusionClassifier(
-        30,
-        5,
-        layout,
-        hidden_dim=16,
-        num_heads=4,
-        measurement_layers=1,
-        fusion_layers=1,
+    model = YangWuBertEncoderClassifier(
+        None,
+        num_labels=1042,
+        time_invariant_dim=5,
+        time_invariant_hidden_dim=4,
+        time_series_dim=7,
+        time_series_hidden_dim=16,
+        time_series_layers=1,
+        time_series_heads=4,
+        text_hidden_dim=8,
         dropout=0.0,
+        text_encoder=_TinyBert(8),
+    ).eval()
+    batch = {
+        "time_series": torch.randn(2, 3, 7),
+        "time_invariant": torch.randn(2, 5),
+        "input_ids": torch.randint(0, 32, (2, 6)),
+        "token_type_ids": torch.zeros(2, 6, dtype=torch.long),
+        "attention_mask": torch.ones(2, 6, dtype=torch.long),
+    }
+    result = model(batch, return_tokens=True)
+    assert result["logits"].shape == (2, 1042)
+    assert result["probabilities"].shape == (2, 1042)
+    assert result["features"].shape == (2, 8)
+    assert result["modality_tokens"].shape == (2, 3, 8)
+    assert torch.allclose(
+        result["features"], model.fuse_from_tokens(result["modality_tokens"]), atol=1e-6
     )
-    inputs = torch.randn(7, 30)
-    result = model(inputs, return_tokens=True)
-    assert result["features"].shape == (7, 16)
-    assert result["logits"].shape == (7, 5)
-    assert result["modality_tokens"].shape == (7, 3, 16)
-    assert torch.allclose(result["features"], model.fuse_from_tokens(result["modality_tokens"]))
-    assert all(parameter.requires_grad for parameter in model.parameters())
-    assert torch.isfinite(result["logits"]).all()
+    assert torch.all((result["probabilities"] >= 0) & (result["probabilities"] <= 1))
 
 
 def test_comal_shapes_and_loss_are_finite() -> None:

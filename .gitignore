@@ -11,6 +11,7 @@ prepared/
 experiments/
 mimic-iii-clinical-database-1.4/
 mimic-iii-clinical-database-1.4.zip
+brazilian-ophthalmological_1.0.2/
 
 # Upstream CoMAL caches/weights are too large for GitHub's 100MB blob limit.
 CoMAL-main/data/
