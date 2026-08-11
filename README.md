@@ -21,6 +21,19 @@ The complete fixed protocol is documented in
 The MDS-ED task remains a separate integration target; its data and labels are
 never passed through this MIMIC-III runner.
 
+Run MDS-ED only from its own directory after preparing its ECG memmap:
+
+```bash
+cd MDS-ED-main/src
+python prepare_release.py --audit-only
+python prepare_release.py --validate-prepared --output data/memmap
+python main_all.py --config-name config_supervised_multimodal_mdsed_diagnoses_s4
+```
+
+The root `main.py` and `mimic-comal` CLI are intentionally MIMIC-III-only; the
+MDS-ED loader, folds, labels and macro-AUROC evaluation stay under
+`MDS-ED-main/`.
+
 ## BRSET multimodal base
 
 BRSET is implemented as an independent full-data runner. It fuses an ImageNet

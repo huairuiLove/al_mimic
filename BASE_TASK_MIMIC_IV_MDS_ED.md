@@ -53,6 +53,18 @@ layout when the complete `MDS-ED-main` directory is uploaded. The release
 contains 129,057 ECG rows and 1,428 diagnosis columns; rows with no positive
 diagnosis code are valid negative examples and are retained.
 
+After conversion, validate the row-to-waveform mapping and metadata:
+
+```bash
+python prepare_release.py \
+  --mdsed-csv data/memmap/mds_ed.csv \
+  --output data/memmap \
+  --validate-prepared
+```
+
+Do not pass MDS-ED files to `main.py` or `mimic_comal`; those commands belong to
+the independent MIMIC-III Yang-Wu task.
+
 ### Optional raw reconstruction path
 
 Only use this when reproducing the dataset table itself. It requires the
