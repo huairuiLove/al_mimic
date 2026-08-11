@@ -26,11 +26,10 @@ preparation command rather than guessed.
 
 ### Recommended training path
 
-Download the prepared MDS-ED table and the linked ECG waveform archive:
+Download the prepared MDS-ED table and the fully extracted ECG waveform directory:
 
 1. `mds_ed.csv` from MIMIC-IV-Ext-MDS-ED v1.0.0.
-2. `mimic-iv-ecg-diagnostic-electrocardiogram-matched-subset-1.0.zip` from
-   MIMIC-IV-ECG v1.0.
+2. The extracted `mimic-iv-ecg_1.0/` directory from MIMIC-IV-ECG v1.0.
 
 The prepared table already contains the MIMIC-IV and MIMIC-IV-ED-derived
 demographics, biometrics, vital-sign trends, laboratory-value trends, labels,
@@ -43,13 +42,13 @@ Prepare the ECG memmap and audit the table with:
 cd MDS-ED-main/src
 python prepare_release.py \
   --mdsed-csv data/mds_ed.csv \
-  --ecg-zip data/mimic-iv-ecg-diagnostic-electrocardiogram-matched-subset-1.0.zip \
+  --ecg-path data/mimic-iv-ecg_1.0 \
   --output data/memmap
 ```
 
-`prepare_release.py` also accepts an already extracted
-`mimic-iv-ecg_1.0` directory via `--ecg-path` and auto-discovers the extracted
-layout when the complete `MDS-ED-main` directory is uploaded. The release
+`prepare_release.py` requires an already extracted `mimic-iv-ecg_1.0`
+directory via `--ecg-path` and auto-discovers the extracted layout when the
+complete `MDS-ED-main` directory is uploaded. ZIP files are not supported. The release
 contains 129,057 ECG rows and 1,428 diagnosis columns; rows with no positive
 diagnosis code are valid negative examples and are retained.
 
@@ -74,7 +73,7 @@ preprocessor:
 | Source | Required files |
 |---|---|
 | MIMIC-IV-ECG-Ext-ICD v1.0.1 | `records_w_diag_icd10.csv` |
-| MIMIC-IV-ECG v1.0 | matched-subset waveform archive (`.hea`/`.dat`) |
+| MIMIC-IV-ECG v1.0 | extracted matched-subset waveform directory (`.hea`/`.dat`) |
 | MIMIC-IV v2.2 | `admissions.csv.gz`, `diagnoses_icd.csv.gz`, `d_labitems.csv.gz`, `labevents.csv.gz`, `icustays.csv.gz`, `procedures_icd.csv.gz`, `omr.csv.gz` |
 | MIMIC-IV-ED v2.2 | `edstays.csv.gz`, `diagnosis.csv.gz`, `pyxis.csv.gz`, `vitalsign.csv.gz`, `triage.csv.gz` |
 
