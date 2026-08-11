@@ -18,6 +18,13 @@ mimic-iii-clinical-database-1.4.zip
 brazilian-ophthalmological_1.0.2/
 # Duplicate of third_party/FIDDLE-experiments; keep one copy in git.
 FIDDLE-experiments-master/
+FIDDLE-experiments-master.zip
+
+# Credentialed MIMIC-IV/MDS-ED releases stay on the data server, not GitHub.
+MDS-ED-main/mimic-iv-*/
+MDS-ED-main/mimic-iv-*.zip
+MDS-ED-main/mimic-iv-ext-*/
+MDS-ED-main/mimic-iv-ext-*.zip
 
 # Upstream CoMAL caches/weights are too large for GitHub's 100MB blob limit.
 CoMAL-main/data/
