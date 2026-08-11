@@ -100,6 +100,7 @@ def collect_classifier_outputs(
         "labels": [],
         "probabilities": [],
         "features": [],
+        "subject_ids": [],
         "indices": [],
     }
     if return_tokens:
@@ -111,6 +112,7 @@ def collect_classifier_outputs(
         values["labels"].append(batch["labels"].float())
         values["probabilities"].append(output["probabilities"].float())
         values["features"].append(output["features"].float())
+        values["subject_ids"].append(batch["subject_id"].long())
         values["indices"].append(batch["index"].long())
         if return_tokens:
             values["modality_tokens"].append(output["modality_tokens"].float())
@@ -123,8 +125,14 @@ def collect_classifier_outputs(
                 (0, 3, classifier.feature_dim), dtype=torch.float32, device=device
             )
         else:
-            width = store.audit.label_count if name in {"labels", "probabilities"} else 0
-            result[name] = torch.empty((0, width), dtype=torch.float32, device=device)
+            if name in {"labels", "probabilities"}:
+                result[name] = torch.empty(
+                    (0, store.audit.label_count), dtype=torch.float32, device=device
+                )
+            elif name in {"subject_ids", "indices"}:
+                result[name] = torch.empty((0,), dtype=torch.long, device=device)
+            else:
+                result[name] = torch.empty((0, 0), dtype=torch.float32, device=device)
     return result
 
 
@@ -261,21 +269,85 @@ def attach_comal_outputs(
     return result
 
 
-def _train_comal(
+def _build_comal(
     classifier: YangWuBertEncoderClassifier,
+    config: dict[str, Any],
+    device: torch.device,
+) -> tuple[CoMALModule, AdamW]:
+    strategy = str(config["active_learning"]["strategy"]).lower()
+    multi_view = strategy == "mm_comal"
+    cfg = config.get("comal", {})
+    training = config.get("training", {})
+    comal = CoMALModule(
+        classifier.feature_dim,
+        classifier.num_labels,
+        int(cfg.get("label_dim", 8)),
+        int(cfg.get("prototype_dim", 8)),
+        num_views=len(classifier.modality_names) + 1 if multi_view else 1,
+    ).to(device)
+    optimizer = AdamW(
+        comal.parameters(),
+        lr=float(cfg.get("learning_rate", 1e-3)),
+        weight_decay=float(training.get("weight_decay", 0.0)),
+    )
+    return comal, optimizer
+
+
+def _comal_loss(
+    comal: CoMALModule,
+    classifier_output: dict[str, torch.Tensor],
+    targets: torch.Tensor,
+    config: dict[str, Any],
+) -> torch.Tensor:
+    cfg = config.get("comal", {})
+    multi_view = comal.num_views > 1
+    # The auxiliary branch is optimized in this same step, while its input is
+    # detached so its loss cannot update the classifier or any encoder path.
+    if multi_view:
+        features = torch.cat(
+            (
+                classifier_output["modality_tokens"].detach(),
+                classifier_output["features"].detach()[:, None, :],
+            ),
+            dim=1,
+        )
+    else:
+        features = classifier_output["features"].detach()
+    output = comal(features, compute_similarities=False)
+    latent, contrastive_targets = _sample_contrastive_labels(
+        output["latent_features"],
+        targets,
+        int(cfg.get("contrastive_label_sample_size", 256)),
+    )
+    contrastive = _contrastive_loss(
+        latent,
+        contrastive_targets,
+        temperature=float(cfg.get("temperature", 0.07)),
+        anchor_chunk_size=int(cfg.get("anchor_chunk_size", 1024)),
+        cross_modal_weight=float(cfg.get("cross_modal_weight", 0.15)),
+    )
+    fused_target = features if features.ndim == 2 else features[:, -1]
+    reconstruction = F.mse_loss(output["reconstructed_features"], fused_target)
+    reconstruction_bce = F.binary_cross_entropy_with_logits(
+        output["reconstructed_logits"], targets
+    )
+    return (
+        contrastive
+        + float(cfg.get("reconstruction_weight", 0.2)) * reconstruction
+        + float(cfg.get("classification_weight", 0.5)) * reconstruction_bce
+    )
+
+
+@torch.inference_mode()
+def _finalize_comal(
+    classifier: YangWuBertEncoderClassifier,
+    comal: CoMALModule,
     store: YangWuFeatureStore,
     indices: np.ndarray,
     config: dict[str, Any],
     device: torch.device,
-) -> tuple[
-    CoMALModule,
-    list[float],
-    dict[str, torch.Tensor],
-    torch.Tensor,
-    torch.Tensor | None,
-]:
-    strategy = str(config["active_learning"]["strategy"]).lower()
-    multi_view = strategy == "mm_comal"
+) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor | None]:
+    multi_view = comal.num_views > 1
     outputs = collect_classifier_outputs(
         classifier, store, indices, config, device, return_tokens=multi_view
     )
@@ -285,62 +357,7 @@ def _train_comal(
         else outputs["features"]
     )
     labels = outputs["labels"]
-    cfg = config.get("comal", {})
     training = config.get("training", {})
-    comal = CoMALModule(
-        classifier.feature_dim,
-        int(labels.shape[1]),
-        int(cfg.get("label_dim", 8)),
-        int(cfg.get("prototype_dim", 8)),
-        num_views=4 if multi_view else 1,
-    ).to(device)
-    optimizer = AdamW(
-        comal.parameters(),
-        lr=float(cfg.get("learning_rate", 1e-3)),
-        weight_decay=float(training.get("weight_decay", 0.0)),
-    )
-    reconstruction_weight = float(cfg.get("reconstruction_weight", 0.2))
-    classification_weight = float(cfg.get("classification_weight", 0.5))
-    batch_size = int(training.get("comal_batch_size", training.get("batch_size", 40)))
-    epochs = int(training["comal_epochs"])
-    history: list[float] = []
-    comal.train()
-    for _epoch in range(epochs):
-        order = torch.randperm(features.shape[0], device=device)
-        losses = []
-        for start in range(0, int(order.numel()), batch_size):
-            selected = order[start : start + batch_size]
-            batch_features = features.index_select(0, selected)
-            targets = labels.index_select(0, selected)
-            optimizer.zero_grad(set_to_none=True)
-            output = comal(batch_features, compute_similarities=False)
-            latent, contrastive_targets = _sample_contrastive_labels(
-                output["latent_features"],
-                targets,
-                int(cfg.get("contrastive_label_sample_size", 256)),
-            )
-            contrastive = _contrastive_loss(
-                latent,
-                contrastive_targets,
-                temperature=float(cfg.get("temperature", 0.07)),
-                anchor_chunk_size=int(cfg.get("anchor_chunk_size", 1024)),
-                cross_modal_weight=float(cfg.get("cross_modal_weight", 0.15)),
-            )
-            fused_target = batch_features if batch_features.ndim == 2 else batch_features[:, -1]
-            reconstruction = F.mse_loss(output["reconstructed_features"], fused_target)
-            reconstruction_bce = F.binary_cross_entropy_with_logits(
-                output["reconstructed_logits"], targets
-            )
-            loss = (
-                contrastive
-                + reconstruction_weight * reconstruction
-                + classification_weight * reconstruction_bce
-            )
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(comal.parameters(), float(training["gradient_clip"]))
-            optimizer.step()
-            losses.append(loss.detach())
-        history.append(float(torch.stack(losses).mean().cpu()))
     comal.eval()
     refresh_prototypes(
         comal,
@@ -360,7 +377,7 @@ def _train_comal(
     else:
         view_own = None
         own = similarities[..., 0]
-    return comal, history, outputs, own, view_own
+    return outputs, own, view_own
 
 
 def train_multimodal_round(
@@ -396,44 +413,66 @@ def train_multimodal_round(
         optimizer,
         _linear_warmup_decay(total_steps, float(training["warmup_proportion"])),
     )
+    strategy = str(config["active_learning"]["strategy"]).lower()
+    comal: CoMALModule | None = None
+    comal_optimizer: AdamW | None = None
+    if strategy in {"comal", "mm_comal"}:
+        comal, comal_optimizer = _build_comal(classifier, config, device)
     precision = str(training["precision"])
     history: dict[str, list[float]] = {"classifier_loss": [], "comal_loss": []}
     timings: dict[str, float] = {}
     start = time.perf_counter()
     classifier.train()
+    if comal is not None:
+        comal.train()
     for _epoch in range(epochs):
-        losses = []
+        classifier_losses: list[torch.Tensor] = []
+        comal_losses: list[torch.Tensor] = []
         for host_batch in loader:
             batch = _move_batch(host_batch, device)
             optimizer.zero_grad(set_to_none=True)
+            if comal_optimizer is not None:
+                comal_optimizer.zero_grad(set_to_none=True)
             with _autocast(device, precision):
-                output = classifier(batch)
-                loss = F.binary_cross_entropy_with_logits(output["logits"], batch["labels"])
+                output = classifier(batch, return_tokens=comal is not None and comal.num_views > 1)
+                classifier_loss = F.binary_cross_entropy_with_logits(
+                    output["logits"], batch["labels"]
+                )
+                auxiliary_loss = (
+                    _comal_loss(comal, output, batch["labels"], config)
+                    if comal is not None
+                    else classifier_loss.detach() * 0.0
+                )
+                loss = classifier_loss + auxiliary_loss
             loss.backward()
             torch.nn.utils.clip_grad_norm_(classifier.parameters(), float(training["gradient_clip"]))
+            if comal is not None:
+                torch.nn.utils.clip_grad_norm_(comal.parameters(), float(training["gradient_clip"]))
             optimizer.step()
+            if comal_optimizer is not None:
+                comal_optimizer.step()
             scheduler.step()
-            losses.append(loss.detach())
-        history["classifier_loss"].append(float(torch.stack(losses).mean().cpu()))
+            classifier_losses.append(classifier_loss.detach())
+            if comal is not None:
+                comal_losses.append(auxiliary_loss.detach())
+        history["classifier_loss"].append(float(torch.stack(classifier_losses).mean().cpu()))
+        if comal is not None:
+            history["comal_loss"].append(float(torch.stack(comal_losses).mean().cpu()))
     if device.type == "cuda":
         torch.cuda.synchronize(device)
-    timings["classifier_training_sec"] = time.perf_counter() - start
+    timings["joint_training_sec"] = time.perf_counter() - start
+    timings["classifier_training_sec"] = timings["joint_training_sec"]
 
-    strategy = str(config["active_learning"]["strategy"]).lower()
-    comal = None
     labeled_outputs = None
     labeled_own = None
     labeled_view_own = None
     modis_state = None
     if strategy in {"comal", "mm_comal"}:
-        start = time.perf_counter()
-        comal, comal_history, labeled_outputs, labeled_own, labeled_view_own = _train_comal(
-            classifier, store, indices, config, device
+        if comal is None:
+            raise RuntimeError("joint CoMAL module was not initialized")
+        labeled_outputs, labeled_own, labeled_view_own = _finalize_comal(
+            classifier, comal, store, indices, config, device
         )
-        history["comal_loss"] = comal_history
-        if device.type == "cuda":
-            torch.cuda.synchronize(device)
-        timings["comal_training_sec"] = time.perf_counter() - start
     elif strategy == "modis":
         start = time.perf_counter()
         labeled_outputs = collect_classifier_outputs(
@@ -444,7 +483,7 @@ def train_multimodal_round(
         modis_state = train_modality_probes(
             labeled_outputs["modality_tokens"],
             labeled_outputs["labels"],
-            labeled_outputs["indices"].detach().cpu().numpy(),
+            labeled_outputs["subject_ids"].detach().cpu().numpy(),
             config,
             seed=int(training.get("seed", 17)),
         )

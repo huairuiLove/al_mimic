@@ -11,12 +11,14 @@ def main() -> None:
     parser.add_argument("experiment")
     args = parser.parse_args()
     state = json.loads((Path(args.experiment) / "active_state.json").read_text())
-    print("round\tlabeled\tclassifier_sec\tcomal_sec\ttotal_sec")
+    print("round\tlabeled\ttraining_sec\tcomal_sec\ttotal_sec")
     for record in state["records"]:
         timing = record["timing"]
+        training_seconds = timing.get("joint_training_sec", timing.get("classifier_training_sec", 0.0))
+        comal_seconds = timing.get("comal_training_sec", 0.0)
         print(
-            f"{record['round_index']}\t{record['labeled_before_query']}\t"
-            f"{timing['classifier_training_sec']:.3f}\t{timing['comal_training_sec']:.3f}\t"
+            f"{record['round_index']}\t{record.get('labeled_count', record.get('labeled_before_query', 0))}\t"
+            f"{training_seconds:.3f}\t{comal_seconds:.3f}\t"
             f"{timing['round_total_sec']:.3f}"
         )
 

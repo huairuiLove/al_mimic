@@ -24,6 +24,7 @@ REQUIRED_ARRAYS = (
     "attention_mask",
     "label",
 )
+SUBJECT_ID_ARRAYS = ("subject_id", "SUBJECT_ID")
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,6 +47,16 @@ def _import_h5py():
     return h5py
 
 
+def _subject_id_array(group: Any) -> str:
+    for name in SUBJECT_ID_ARRAYS:
+        if name in group:
+            return name
+    raise ValueError(
+        "official split artifact must contain a row-aligned subject_id/SUBJECT_ID array "
+        "for grouped active-learning validation"
+    )
+
+
 def audit_split_hdf5(config: dict[str, Any]) -> YangWuDataAudit:
     """Validate every source-aligned tensor before a formal experiment starts."""
     paths = require_paths(config)
@@ -66,12 +77,16 @@ def audit_split_hdf5(config: dict[str, Any]) -> YangWuDataAudit:
             missing = [name for name in REQUIRED_ARRAYS if name not in group]
             if missing:
                 raise ValueError(f"{group_name}/{split} is missing arrays: {missing}")
+            subject_id_name = _subject_id_array(group)
             count = int(group["label"].shape[0])
             shapes = {name: tuple(group[name].shape) for name in REQUIRED_ARRAYS}
+            shapes[subject_id_name] = tuple(group[subject_id_name].shape)
             if any(shape[0] != count for shape in shapes.values()):
                 raise ValueError(f"unaligned rows in {group_name}/{split}: {shapes}")
             if len(shapes["X"]) != 3 or len(shapes["s"]) != 2:
                 raise ValueError("official X and s tensors must have shapes [N,T,D] and [N,D]")
+            if len(shapes[subject_id_name]) != 1:
+                raise ValueError("subject_id/SUBJECT_ID must have shape [N]")
             if any(len(shapes[name]) != 2 for name in ("input_ids", "token_type_ids", "attention_mask")):
                 raise ValueError("official BERT input tensors must have shape [N,512]")
             current = (
@@ -86,6 +101,9 @@ def audit_split_hdf5(config: dict[str, Any]) -> YangWuDataAudit:
             elif current != (label_count, time_steps, time_series_dim, time_invariant_dim, note_tokens):
                 raise ValueError(f"feature dimensions differ across official splits: {current}")
             split_counts[split] = count
+            subject_ids = np.asarray(group[subject_id_name], dtype=np.int64)
+            if np.any(subject_ids <= 0):
+                raise ValueError("subject_id/SUBJECT_ID values must be positive MIMIC subject identifiers")
             batch = 512
             for start in range(0, count, batch):
                 labels = np.asarray(group["label"][start : start + batch])
@@ -115,6 +133,22 @@ def audit_split_hdf5(config: dict[str, Any]) -> YangWuDataAudit:
         raise ValueError("formal Yang-Wu tensor mismatch: " + "; ".join(mismatches))
     if not all(split_counts.values()):
         raise ValueError(f"official train/val/test splits must all be non-empty: {split_counts}")
+    with h5py.File(paths["split_hdf5"], "r") as handle:
+        root = handle[group_name]
+        split_subjects = {
+            split: set(
+                np.asarray(root[split][_subject_id_array(root[split])], dtype=np.int64).tolist()
+            )
+            for split in SPLIT_NAMES
+        }
+    overlap = {
+        f"{left}/{right}": sorted(split_subjects[left] & split_subjects[right])[:5]
+        for position, left in enumerate(SPLIT_NAMES)
+        for right in SPLIT_NAMES[position + 1 :]
+        if split_subjects[left] & split_subjects[right]
+    }
+    if overlap:
+        raise ValueError(f"subject leakage across official splits: {overlap}")
     return YangWuDataAudit(
         split_counts,
         total,
@@ -140,6 +174,7 @@ class YangWuFeatureStore:
         self.split_counts = audit.split_counts
         self.offsets = np.cumsum([0, *(self.split_counts[name] for name in SPLIT_NAMES)])
         self.labels = self._load_labels()
+        self.subject_ids = self._load_subject_ids()
         self.splits = np.concatenate(
             [np.full(self.split_counts[name], name, dtype=object) for name in SPLIT_NAMES]
         )
@@ -167,6 +202,19 @@ class YangWuFeatureStore:
             root = handle[self.group_name]
             return np.concatenate(
                 [np.asarray(root[name]["label"], dtype=np.float32) for name in SPLIT_NAMES]
+            )
+
+    def _load_subject_ids(self) -> np.ndarray:
+        h5py = _import_h5py()
+        with h5py.File(self.path, "r") as handle:
+            root = handle[self.group_name]
+            return np.concatenate(
+                [
+                    np.asarray(
+                        root[name][_subject_id_array(root[name])], dtype=np.int64
+                    )
+                    for name in SPLIT_NAMES
+                ]
             )
 
     def indices(self, split: str) -> np.ndarray:
@@ -254,6 +302,9 @@ class YangWuDataset(Dataset[dict[str, torch.Tensor]]):
                 np.asarray(group["attention_mask"][local_index], dtype=np.int64)
             ),
             "labels": torch.from_numpy(np.asarray(group["label"][local_index], dtype=np.float32)),
+            "subject_id": torch.tensor(
+                int(np.asarray(group[_subject_id_array(group)][local_index])), dtype=torch.long
+            ),
             "index": torch.tensor(global_index, dtype=torch.long),
         }
 

@@ -65,7 +65,10 @@ dataset:
 
 The loader requires `splits.hdf5/with_notes/{train,val,test}` and validates the
 paper dimensions: 10,210 visits total, 1,042 labels, `[48,7411]` time series,
-97 static features, and 512 note tokens. No fallback or synthetic data path exists.
+97 static features, 512 note tokens, and a row-aligned `SUBJECT_ID` (or
+`subject_id`) array. The subject identifier is used for MoDIS grouped OOF
+folds; global row indices are rejected as a substitute. No fallback or
+synthetic data path exists.
 
 ## Run
 

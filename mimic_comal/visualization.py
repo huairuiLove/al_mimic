@@ -80,7 +80,7 @@ def explore_dataset(config: dict[str, Any], output_dir: str | Path | None = None
     similarity_mib = tokens.astype(float) ** 2 * 4 / 1024**2
     fig, axis = plt.subplots(figsize=(8, 4.5))
     axis.plot(batches, similarity_mib, marker="o", color=COLORS[2])
-    configured = int(config.get("training", {}).get("comal_batch_size", 32))
+    configured = int(config.get("training", {}).get("batch_size", 32))
     axis.axvline(configured, color=COLORS[3], linestyle="--", label=f"configured={configured}")
     axis.set(xlabel="CoMAL batch size", ylabel="One FP32 similarity matrix (MiB)", yscale="log")
     axis.grid(alpha=0.2)
@@ -111,7 +111,7 @@ def explore_dataset(config: dict[str, Any], output_dir: str | Path | None = None
     audit["feature_feasibility"] = {
         "coMAL_batch_tokens": configured * len(label_names),
         "coMAL_similarity_matrix_mib": float((configured * len(label_names)) ** 2 * 4 / 1024**2),
-        "recommendation": "keep comal_batch_size bounded; scale cached-feature classifier batches independently",
+        "recommendation": "keep the joint classifier/CoMAL batch bounded; scale evaluation batches independently",
     }
     _write_json(output / "dataset_audit.json", audit)
     report = {"output_dir": str(output), "files": files, "audit": str(output / "dataset_audit.json")}

@@ -124,11 +124,19 @@ the frozen classifier exposes three 768-dimensional path-contribution tokens
 - **MM-CoMAL**: separate prototype banks for notes, time series, time invariant,
   and fused views, so `4 x (1,042 + 1)` prototypes; reliability-weighted evidence
   and cross-view dispersion determine acquisition.
-- **MoDIS**: stop-gradient per-modality probes, grouped out-of-fold reliability,
-  modality disagreement, intervention instability, and a sufficiency penalty.
+- **MoDIS**: stop-gradient per-modality probes, `SUBJECT_ID`-grouped
+  out-of-fold reliability, modality disagreement, intervention instability,
+  and a sufficiency penalty.
 - **MoSAIC**: Fisher-design screening, eight coalitions over three modalities,
   on-manifold token interventions, Mobius additive/synergy decomposition, and
-  greedy Fisher deflation.
+  greedy Fisher deflation. Its Fisher residual reference set is the fixed
+  validation split; the labeled train set supplies the information matrix, and
+  the test split is never used for acquisition.
+
+For CoMAL and MM-CoMAL, the auxiliary branch is optimized jointly with the
+classifier on each labeled batch. Its input feature/tokens are detached, so
+the auxiliary loss updates only the CoMAL branch; the classifier still receives
+gradients from its BCE objective.
 
 These are acquisition strategies. None may change the baseline classifier,
 cohort, labels, split, epoch count, or evaluation metrics.
@@ -140,7 +148,9 @@ Formal execution requires:
 1. The official Yang-Wu/FIDDLE diagnosis artifact at
    `features/outcome=Diagnoses,T=48.0,dt=1.0/splits.hdf5`.
 2. Group `with_notes` containing `train`, `val`, and `test` with arrays `X`, `s`,
-   `input_ids`, `token_type_ids`, `attention_mask`, and `label`.
+   `input_ids`, `token_type_ids`, `attention_mask`, `label`, and a row-aligned
+   `SUBJECT_ID` (or `subject_id`) array. The identifier is required for
+   patient-grouped MoDIS OOF folds; global row indices are not valid substitutes.
 3. The ClinicalBERT BERT-base state dictionary used as the common source
    initialization.
 4. CUDA hardware capable of training the approximately 150M-parameter model.

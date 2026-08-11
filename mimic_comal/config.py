@@ -108,7 +108,6 @@ def _validate_yang_wu_protocol(config: dict[str, Any]) -> None:
         "model.time_series_heads": (model.get("time_series_heads"), 16),
         "model.output_size": (model.get("output_size"), 1042),
         "training.epochs": (training.get("epochs"), 20),
-        "training.comal_epochs": (training.get("comal_epochs"), 20),
         "active_learning.rounds": (active.get("rounds"), 6),
     }
     for name, (actual, required) in integer_values.items():

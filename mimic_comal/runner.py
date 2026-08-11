@@ -311,6 +311,7 @@ class ActiveLearningExperiment:
         candidates: np.ndarray,
         query_size: int,
         round_index: int,
+        validation_outputs: dict[str, torch.Tensor] | None = None,
     ) -> tuple[list[int], dict[str, Any]]:
         if trained.labeled_outputs is None:
             raise RuntimeError("MoSAIC labeled outputs are missing")
@@ -322,8 +323,20 @@ class ActiveLearningExperiment:
             self.device,
             return_tokens=True,
         )
-        # Fisher reference labels come only from the currently labeled train set.
-        reference_outputs = trained.labeled_outputs
+        # The Fisher residual direction is defined on the fixed validation set
+        # (the historical RND/MoSAIC protocol's reference set), not on L_t.
+        reference_outputs = validation_outputs
+        if reference_outputs is None:
+            reference_outputs = collect_classifier_outputs(
+                trained.classifier,
+                self.store,
+                self.store.indices("val"),
+                self.config,
+                self.device,
+                return_tokens=False,
+            )
+        if "labels" not in reference_outputs:
+            raise RuntimeError("MoSAIC Fisher reference outputs are missing validation labels")
         from mosaic.acquire import acquire_mosaic
 
         result = acquire_mosaic(
@@ -347,6 +360,8 @@ class ActiveLearningExperiment:
             "method": "MoSAIC Fisher design with modality-lattice synergy",
             "candidate_count": int(candidates.size),
             "selected_count": len(queries),
+            "reference_split": "validation",
+            "reference_count": int(reference_outputs["labels"].shape[0]),
             "score_components": _score_summary(components, positions),
             "method_diagnostics": result.diagnostics,
         }
@@ -429,6 +444,7 @@ class ActiveLearningExperiment:
                         candidates,
                         query_size,
                         round_index,
+                        validation,
                     )
                 else:  # protected by config validation
                     raise AssertionError(strategy)
@@ -449,10 +465,15 @@ class ActiveLearningExperiment:
                         "target_model": "Yang-Wu BertEncoder",
                         "initialization": "fresh from ClinicalBERT source checkpoint",
                         "classifier_epochs": int(self.training["epochs"]),
-                        "comal_epochs": (
-                            int(self.training["comal_epochs"])
+                        "comal_training": (
+                            "joint_with_classifier_stop_gradient"
                             if strategy in {"comal", "mm_comal"}
-                            else 0
+                            else "none"
+                        ),
+                        "mosaic_fisher_reference": (
+                            "official_validation_split"
+                            if strategy == "mosaic"
+                            else "none"
                         ),
                     },
                     "timing": trained.timings

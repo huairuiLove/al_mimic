@@ -47,6 +47,12 @@ python prepare_release.py \
   --output data/memmap
 ```
 
+`prepare_release.py` also accepts an already extracted
+`mimic-iv-ecg_1.0` directory via `--ecg-path` and auto-discovers the extracted
+layout when the complete `MDS-ED-main` directory is uploaded. The release
+contains 129,057 ECG rows and 1,428 diagnosis columns; rows with no positive
+diagnosis code are valid negative examples and are retained.
+
 ### Optional raw reconstruction path
 
 Only use this when reproducing the dataset table itself. It requires the
@@ -118,4 +124,3 @@ rank training ECG encounters, but may not alter the 1,428-label target, fold
 assignment, 90-minute observation window, waveform preprocessing, or macro
 AUROC evaluation. This adapter is a separate integration target; the current
 Yang-Wu runner does not silently treat MDS-ED as MIMIC-III data.
-

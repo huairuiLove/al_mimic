@@ -55,9 +55,7 @@ training:
   loss: binary_cross_entropy
   batch_size: 40
   eval_batch_size: 400
-  comal_batch_size: 40
   epochs: 20
-  comal_epochs: 20
   learning_rate: 0.0001
   weight_decay: 0.0
   warmup_proportion: 0.1

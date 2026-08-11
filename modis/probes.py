@@ -129,6 +129,12 @@ def probe_probabilities(
 
 def _group_folds(groups: Iterable[object], requested_folds: int) -> list[tuple[np.ndarray, np.ndarray]]:
     group_array = np.asarray(list(groups), dtype=object)
+    if group_array.ndim != 1:
+        raise ValueError("OOF groups must be a one-dimensional row-aligned SUBJECT_ID array")
+    if group_array.size == 0:
+        return []
+    if any(group is None for group in group_array):
+        raise ValueError("OOF groups must contain true SUBJECT_ID values, not missing identifiers")
     unique_count = int(np.unique(group_array).size)
     fold_count = min(max(2, int(requested_folds)), unique_count)
     if unique_count < 2:
@@ -215,9 +221,12 @@ def train_modality_probes(
     *,
     seed: int,
 ) -> MoDISProbeState:
-    """Fit full-pool probes and grouped OOF copies without perturbing the caller RNG."""
+    """Fit probes and SUBJECT_ID-grouped OOF copies without perturbing caller RNG."""
     if tokens.ndim != 3 or labels.ndim != 2 or tokens.shape[0] != labels.shape[0]:
         raise ValueError("expected tokens [N,M,D] and labels [N,C]")
+    group_array = np.asarray(list(groups), dtype=object)
+    if group_array.ndim != 1 or group_array.shape[0] != tokens.shape[0]:
+        raise ValueError("OOF SUBJECT_ID groups must be row-aligned with tokens and labels")
     modis_cfg = config.get("modis", {})
     training_cfg = config.get("training", {})
     epochs = int(modis_cfg.get("probe_epochs", training_cfg.get("epochs", 20)))
@@ -234,7 +243,7 @@ def train_modality_probes(
     }
     detached_tokens = tokens.detach().float()
     detached_labels = labels.detach().float()
-    folds = _group_folds(groups, int(modis_cfg.get("oof_folds", 5)))
+    folds = _group_folds(group_array, int(modis_cfg.get("oof_folds", 5)))
     cuda_devices = []
     if tokens.device.type == "cuda":
         cuda_devices = [tokens.device.index if tokens.device.index is not None else torch.cuda.current_device()]
@@ -284,6 +293,7 @@ def train_modality_probes(
     )
     diagnostics = {
         "oof_folds": len(folds),
+        "oof_group_count": int(np.unique(group_array).size),
         "information_gain": statistics.information_gain.detach().cpu().tolist(),
         "skill_scores": statistics.skill_scores.detach().cpu().tolist(),
         "skill_standard_errors": statistics.skill_standard_errors.detach().cpu().tolist(),
