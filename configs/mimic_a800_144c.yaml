@@ -14,10 +14,10 @@ preprocessing:
   observation_hours: 48
   timestep_hours: 1
   max_note_tokens: 512
-  expected_total_samples: 10210
-  expected_label_count: 1042
+  expected_total_samples: 10258
+  expected_label_count: 915
   time_invariant_dim: 97
-  time_series_dim: 7411
+  time_series_dim: 7749
   split_protocol: yang_wu_official_7_1.5_1.5
   label_format: icd9_top3_multihot
   note_protocol: latest_per_category_description_within_48h
@@ -32,7 +32,7 @@ model:
   time_series_hidden_dim: 1024
   time_series_layers: 3
   time_series_heads: 16
-  output_size: 1042
+  output_size: 915
   dropout: 0.1
 
 comal:

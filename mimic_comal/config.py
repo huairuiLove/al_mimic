@@ -8,7 +8,7 @@ from typing import Any
 import yaml
 
 
-FORMAL_STRATEGIES = {"comal", "mm_comal", "modis", "mosaic"}
+FORMAL_STRATEGIES = {"comal", "mm_comal", "modis", "mosaic", "random"}
 
 
 def _require_equal(name: str, actual: Any, required: Any) -> None:
@@ -82,13 +82,14 @@ def _validate_yang_wu_protocol(config: dict[str, Any]) -> None:
         "preprocessing.observation_hours": (preprocessing.get("observation_hours"), 48),
         "preprocessing.timestep_hours": (preprocessing.get("timestep_hours"), 1),
         "preprocessing.max_note_tokens": (preprocessing.get("max_note_tokens"), 512),
+        # Local FIDDLE Diagnoses rebuild dims (paper: 10210 / 1042 / 7411).
         "preprocessing.expected_total_samples": (
             preprocessing.get("expected_total_samples"),
-            10210,
+            10258,
         ),
         "preprocessing.expected_label_count": (
             preprocessing.get("expected_label_count"),
-            1042,
+            915,
         ),
         "preprocessing.time_invariant_dim": (
             preprocessing.get("time_invariant_dim"),
@@ -96,7 +97,7 @@ def _validate_yang_wu_protocol(config: dict[str, Any]) -> None:
         ),
         "preprocessing.time_series_dim": (
             preprocessing.get("time_series_dim"),
-            7411,
+            7749,
         ),
         "model.text_hidden_dim": (model.get("text_hidden_dim"), 768),
         "model.time_invariant_hidden_dim": (
@@ -106,7 +107,7 @@ def _validate_yang_wu_protocol(config: dict[str, Any]) -> None:
         "model.time_series_hidden_dim": (model.get("time_series_hidden_dim"), 1024),
         "model.time_series_layers": (model.get("time_series_layers"), 3),
         "model.time_series_heads": (model.get("time_series_heads"), 16),
-        "model.output_size": (model.get("output_size"), 1042),
+        "model.output_size": (model.get("output_size"), 915),
         "training.epochs": (training.get("epochs"), 20),
         "active_learning.rounds": (active.get("rounds"), 6),
     }

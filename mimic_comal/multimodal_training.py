@@ -15,6 +15,7 @@ from torch.optim import Adam, AdamW
 from torch.optim.lr_scheduler import LambdaLR
 
 from .config import require_paths
+from .mixup import MixupConfig, label_space_mixup
 from .model import CoMALModule, YangWuBertEncoderClassifier, supervised_contrastive_loss
 from .multimodal_data import YangWuFeatureStore
 
@@ -421,6 +422,13 @@ def train_multimodal_round(
     precision = str(training["precision"])
     history: dict[str, list[float]] = {"classifier_loss": [], "comal_loss": []}
     timings: dict[str, float] = {}
+    mixup = MixupConfig.from_config(config)
+    mixup_generator: np.random.Generator | None = None
+    if mixup.enabled:
+        mixup_generator = np.random.default_rng(model_seed)
+        history["mixup_loss"] = []
+        history["mixup_anchor_positive_mean"] = []
+        history["mixup_mixed_positive_mean"] = []
     start = time.perf_counter()
     classifier.train()
     if comal is not None:
@@ -428,6 +436,9 @@ def train_multimodal_round(
     for _epoch in range(epochs):
         classifier_losses: list[torch.Tensor] = []
         comal_losses: list[torch.Tensor] = []
+        mixup_losses: list[torch.Tensor] = []
+        anchor_positives: list[float] = []
+        mixed_positives: list[float] = []
         for host_batch in loader:
             batch = _move_batch(host_batch, device)
             optimizer.zero_grad(set_to_none=True)
@@ -444,6 +455,19 @@ def train_multimodal_round(
                     else classifier_loss.detach() * 0.0
                 )
                 loss = classifier_loss + auxiliary_loss
+                if mixup.enabled:
+                    assert mixup_generator is not None
+                    mixed = label_space_mixup(
+                        output["features"], batch["labels"], mixup, mixup_generator
+                    )
+                    if mixed is not None:
+                        mixup_loss = F.binary_cross_entropy_with_logits(
+                            classifier.classifier(mixed.features), mixed.labels
+                        )
+                        loss = loss + mixup.weight * mixup_loss
+                        mixup_losses.append(mixup_loss.detach())
+                        anchor_positives.append(mixed.diagnostics["anchor_positive_mean"])
+                        mixed_positives.append(mixed.diagnostics["mixed_positive_mean"])
             loss.backward()
             torch.nn.utils.clip_grad_norm_(classifier.parameters(), float(training["gradient_clip"]))
             if comal is not None:
@@ -458,6 +482,16 @@ def train_multimodal_round(
         history["classifier_loss"].append(float(torch.stack(classifier_losses).mean().cpu()))
         if comal is not None:
             history["comal_loss"].append(float(torch.stack(comal_losses).mean().cpu()))
+        if mixup.enabled:
+            history["mixup_loss"].append(
+                float(torch.stack(mixup_losses).mean().cpu()) if mixup_losses else 0.0
+            )
+            history["mixup_anchor_positive_mean"].append(
+                float(np.mean(anchor_positives)) if anchor_positives else 0.0
+            )
+            history["mixup_mixed_positive_mean"].append(
+                float(np.mean(mixed_positives)) if mixed_positives else 0.0
+            )
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     timings["joint_training_sec"] = time.perf_counter() - start

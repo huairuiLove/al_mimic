@@ -1,0 +1,7 @@
+extends: mimic_a800_144c.yaml
+
+experiment:
+  name: mimic_iii_yang_wu_bertencoder_random
+
+active_learning:
+  strategy: random

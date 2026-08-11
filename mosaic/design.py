@@ -44,18 +44,28 @@ class FisherDesign:
             fisher_weights = torch.cat((fisher_weights, closure_weights), dim=0)
         dimension = int(labeled.shape[1])
         identity = torch.eye(dimension, dtype=torch.float32, device=labeled.device)
-        information = torch.einsum("nc,nd,ne->cde", fisher_weights, labeled, labeled)
-        information = information + float(damping) * identity[None, :, :]
-        cholesky, info = torch.linalg.cholesky_ex(information)
-        if bool((info != 0).any()):
-            raise RuntimeError("Fisher blocks are not positive definite; increase mosaic.damping")
+        base = torch.einsum("nc,nd,ne->cde", fisher_weights, labeled, labeled)
+        # Multilabel Fisher blocks can be numerically singular; escalate damping.
+        used = float(damping)
+        cholesky = info = None
+        for scale in (1.0, 3.0, 10.0, 30.0, 100.0, 300.0, 1000.0):
+            used = float(damping) * float(scale)
+            information = base + used * identity[None, :, :]
+            cholesky, info = torch.linalg.cholesky_ex(information)
+            if not bool((info != 0).any()):
+                break
+        else:
+            raise RuntimeError(
+                "Fisher blocks are not positive definite; increase mosaic.damping "
+                f"(tried up to {used:g})"
+            )
         inverse = torch.cholesky_inverse(cholesky)
         residual = reference_probabilities.float() - reference_labels.float()
         reference_gradient = torch.einsum("nc,nd->cd", residual, reference) / max(
             int(reference.shape[0]), 1
         )
         direction = torch.einsum("cde,ce->cd", inverse, reference_gradient)
-        return cls(inverse, reference_gradient, direction, information.diagonal(dim1=-2, dim2=-1).sum(-1), damping)
+        return cls(inverse, reference_gradient, direction, information.diagonal(dim1=-2, dim2=-1).sum(-1), used)
 
     def upper_bound(self, features: torch.Tensor, probabilities: torch.Tensor) -> torch.Tensor:
         augmented = augment_bias(features.float())
