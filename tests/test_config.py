@@ -14,14 +14,15 @@ def test_formal_configs_use_multimodal_multilabel_baseline() -> None:
         ("configs/mimic_mm_comal.yaml", "mm_comal"),
         ("configs/mimic_modis.yaml", "modis"),
         ("configs/mimic_mosaic.yaml", "mosaic"),
+        ("configs/mimic_random.yaml", "random"),
     ):
         config = load_config(path)
         assert config["model"]["architecture"] == "yang_wu_bertencoder"
         assert config["model"]["output_activation"] == "sigmoid"
-        assert config["preprocessing"]["expected_total_samples"] == 10210
-        assert config["preprocessing"]["expected_label_count"] == 1042
+        assert config["preprocessing"]["expected_total_samples"] == 10258
+        assert config["preprocessing"]["expected_label_count"] == 915
         assert config["preprocessing"]["observation_hours"] == 48
-        assert config["preprocessing"]["time_series_dim"] == 7411
+        assert config["preprocessing"]["time_series_dim"] == 7749
         assert config["preprocessing"]["time_invariant_dim"] == 97
         assert config["training"]["epochs"] == 20
         assert config["active_learning"]["rounds"] == 6

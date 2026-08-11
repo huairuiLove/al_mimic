@@ -15,6 +15,7 @@ from torch.optim import Adam, AdamW
 from torch.optim.lr_scheduler import LambdaLR
 
 from .config import require_paths
+from .mixup import MixupConfig, label_space_mixup
 from .model import CoMALModule, YangWuBertEncoderClassifier, supervised_contrastive_loss
 from .multimodal_data import YangWuFeatureStore
 
@@ -399,22 +400,61 @@ def train_multimodal_round(
     precision = str(training["precision"])
     history: dict[str, list[float]] = {"classifier_loss": [], "comal_loss": []}
     timings: dict[str, float] = {}
+    mixup = MixupConfig.from_config(config)
+    mixup_generator: np.random.Generator | None = None
+    if mixup.enabled:
+        mixup_generator = np.random.default_rng(model_seed)
+        history["mixup_loss"] = []
+        history["mixup_anchor_positive_mean"] = []
+        history["mixup_mixed_positive_mean"] = []
     start = time.perf_counter()
     classifier.train()
     for _epoch in range(epochs):
         losses = []
+        mixup_losses: list[torch.Tensor] = []
+        anchor_positives: list[float] = []
+        mixed_positives: list[float] = []
         for host_batch in loader:
             batch = _move_batch(host_batch, device)
             optimizer.zero_grad(set_to_none=True)
             with _autocast(device, precision):
-                output = classifier(batch)
-                loss = F.binary_cross_entropy_with_logits(output["logits"], batch["labels"])
+                if mixup.enabled:
+                    # Reuse the encoder pass; only the linear head runs twice.
+                    text, series, static = classifier.encode_modalities(batch)
+                    fused = classifier.gate(text, static, series)
+                    logits = classifier.classifier(fused)
+                else:
+                    logits = classifier(batch)["logits"]
+                loss = F.binary_cross_entropy_with_logits(logits, batch["labels"])
+                if mixup.enabled:
+                    assert mixup_generator is not None
+                    mixed = label_space_mixup(
+                        fused, batch["labels"], mixup, mixup_generator
+                    )
+                    if mixed is not None:
+                        mixup_loss = F.binary_cross_entropy_with_logits(
+                            classifier.classifier(mixed.features), mixed.labels
+                        )
+                        loss = loss + mixup.weight * mixup_loss
+                        mixup_losses.append(mixup_loss.detach())
+                        anchor_positives.append(mixed.diagnostics["anchor_positive_mean"])
+                        mixed_positives.append(mixed.diagnostics["mixed_positive_mean"])
             loss.backward()
             torch.nn.utils.clip_grad_norm_(classifier.parameters(), float(training["gradient_clip"]))
             optimizer.step()
             scheduler.step()
             losses.append(loss.detach())
         history["classifier_loss"].append(float(torch.stack(losses).mean().cpu()))
+        if mixup.enabled:
+            history["mixup_loss"].append(
+                float(torch.stack(mixup_losses).mean().cpu()) if mixup_losses else 0.0
+            )
+            history["mixup_anchor_positive_mean"].append(
+                float(np.mean(anchor_positives)) if anchor_positives else 0.0
+            )
+            history["mixup_mixed_positive_mean"].append(
+                float(np.mean(mixed_positives)) if mixed_positives else 0.0
+            )
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     timings["classifier_training_sec"] = time.perf_counter() - start

@@ -139,6 +139,21 @@ class ActiveLearningExperiment:
                 checkpoint_dir / f"round_{round_index:03d}_modis.pt",
             )
 
+    def _acquire_random(
+        self, candidates: np.ndarray, query_size: int, round_index: int
+    ) -> tuple[list[int], dict[str, Any]]:
+        """Uniform sampling control. Shares the schedule, seed and training path with
+        the informed strategies, so any gap is attributable to acquisition alone."""
+        rng = np.random.default_rng(self.seed + round_index)
+        chosen = rng.choice(candidates, size=query_size, replace=False)
+        queries = sorted(int(value) for value in chosen)
+        return queries, {
+            "method": "uniform random sampling control",
+            "candidate_count": int(candidates.size),
+            "selected_count": len(queries),
+            "score_components": {},
+        }
+
     def _acquire_comal(
         self,
         trained: TrainedMultimodalRound,
@@ -411,7 +426,11 @@ class ActiveLearningExperiment:
             if round_index + 1 < rounds:
                 candidates = train_indices[~labeled_mask[train_indices]]
                 query_size = schedule[round_index + 1] - len(labeled)
-                if strategy == "comal":
+                if strategy == "random":
+                    queries, acquisition = self._acquire_random(
+                        candidates, query_size, round_index
+                    )
+                elif strategy == "comal":
                     queries, acquisition = self._acquire_comal(
                         trained, candidates, query_size
                     )

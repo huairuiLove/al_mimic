@@ -14,7 +14,7 @@ mosaic:
   workset_size: 1000
   synergy_workset_size: 500
   deflation_steps: 1000
-  damping: 0.01
+  damping: 0.1
   fusion_batch_size: 400
   value_batch_size: 400
   synergy_epsilon: 1.0e-8

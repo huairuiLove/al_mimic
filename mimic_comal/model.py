@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -106,7 +107,13 @@ class YangWuBertEncoderClassifier(nn.Module):
             from transformers import BertConfig, BertModel
         except ImportError as exc:  # pragma: no cover - dependency error is environment-specific
             raise RuntimeError("transformers is required for the Yang-Wu baseline") from exc
-        encoder = BertModel(BertConfig())
+        checkpoint_path = Path(checkpoint)
+        config_dir = checkpoint_path.parent if checkpoint_path.is_file() else checkpoint_path
+        config_file = config_dir / "config.json"
+        if config_file.is_file():
+            encoder = BertModel(BertConfig.from_pretrained(config_dir))
+        else:
+            encoder = BertModel(BertConfig())
         try:
             state = torch.load(checkpoint, map_location="cpu", weights_only=True)
         except TypeError:  # pragma: no cover - old torch compatibility
