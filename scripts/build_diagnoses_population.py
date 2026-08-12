@@ -33,12 +33,57 @@ def icd9_top3(code: str) -> str | None:
     return digits[:3]
 
 
+def earliest_note_offset(mimic_dir: Path, stays: pd.DataFrame, chunksize: int) -> pd.Series:
+    """Hours from ICU admission to each stay's first non-negative note.
+
+    Streamed because NOTEEVENTS is 4 GB on disk and several times that in memory;
+    a stay has a note inside [0, T] exactly when this offset is at most T, so one
+    pass answers the question for every candidate window.
+    """
+    keys = stays[["SUBJECT_ID", "HADM_ID", "ICUSTAY_ID", "INTIME"]]
+    earliest: dict[int, float] = {}
+    scanned = 0
+    for chunk in pd.read_csv(
+        mimic_dir / "NOTEEVENTS.csv",
+        usecols=["SUBJECT_ID", "HADM_ID", "CHARTTIME", "ISERROR"],
+        parse_dates=["CHARTTIME"],
+        chunksize=chunksize,
+    ):
+        scanned += len(chunk)
+        chunk = chunk[chunk["ISERROR"].isnull() & chunk["CHARTTIME"].notnull()]
+        if chunk.empty:
+            continue
+        merged = keys.merge(chunk.drop(columns="ISERROR"), on=["SUBJECT_ID", "HADM_ID"], how="inner")
+        if merged.empty:
+            continue
+        offset = (merged["CHARTTIME"] - merged["INTIME"]).dt.total_seconds() / 3600.0
+        merged = merged.assign(offset=offset)
+        merged = merged[merged["offset"] >= 0.0]
+        for stay, value in merged.groupby("ICUSTAY_ID")["offset"].min().items():
+            previous = earliest.get(stay)
+            if previous is None or value < previous:
+                earliest[stay] = float(value)
+        print(f"  scanned {scanned:,} note rows, stays touched={len(earliest):,}", flush=True)
+    return pd.Series(earliest, dtype=float)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--mimic-dir", type=Path, required=True)
     parser.add_argument("--data-dir", type=Path, required=True)
     parser.add_argument("--duration", type=float, default=48.0)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--chunksize", type=int, default=100_000)
+    parser.add_argument(
+        "--require-notes",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "keep only stays with a note inside the window. Dropping the requirement "
+            "admits patients who have no note yet, which at a 12h window is 27%% of the "
+            "cohort and is genuine modality missingness rather than simulated"
+        ),
+    )
     args = parser.parse_args()
 
     mimic = args.mimic_dir
@@ -55,21 +100,15 @@ def main() -> None:
     print(f"LOS>={args.duration}h:", len(icus))
 
     # Notes in [0, T]
-    notes = pd.read_csv(
-        mimic / "NOTEEVENTS.csv",
-        usecols=["SUBJECT_ID", "HADM_ID", "CHARTTIME", "ISERROR", "CATEGORY", "DESCRIPTION", "TEXT"],
-        parse_dates=["CHARTTIME"],
-        low_memory=False,
-    )
-    notes = notes[notes["ISERROR"].isnull() & notes["CHARTTIME"].notnull()]
-    merged = icus[["SUBJECT_ID", "HADM_ID", "ICUSTAY_ID", "INTIME"]].merge(
-        notes, on=["SUBJECT_ID", "HADM_ID"], how="inner"
-    )
-    merged["TIME"] = (merged["CHARTTIME"] - merged["INTIME"]).dt.total_seconds() / 3600.0
-    merged = merged[(merged["TIME"] >= 0.0) & (merged["TIME"] <= args.duration)]
-    with_notes = set(merged["ICUSTAY_ID"].unique())
-    icus = icus[icus["ICUSTAY_ID"].isin(with_notes)].copy()
-    print("with notes in window:", len(icus))
+    first_note = earliest_note_offset(mimic, icus, args.chunksize)
+    offsets = icus["ICUSTAY_ID"].map(first_note)
+    has_notes = offsets.notna() & (offsets <= args.duration)
+    print(f"with notes in window: {int(has_notes.sum())} / {len(icus)}")
+    if args.require_notes:
+        icus = icus[has_notes].copy()
+    else:
+        icus = icus.copy()
+        print(f"keeping {int((~has_notes).sum())} stays whose note has not been charted yet")
 
     # ICD-9 diagnosis groups for the hospital admission
     dx = pd.read_csv(mimic / "DIAGNOSES_ICD.csv", usecols=["HADM_ID", "ICD9_CODE"])
@@ -134,7 +173,11 @@ def main() -> None:
     }
     import json
 
-    (pop_dir / "Diagnoses_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    # Scoped by duration so building a second observation window cannot silently
+    # overwrite the group vocabulary an already-materialised cohort depends on.
+    meta_path = pop_dir / f"Diagnoses_{args.duration}h_meta.json"
+    meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    print("wrote", meta_path)
     print("done")
 
 

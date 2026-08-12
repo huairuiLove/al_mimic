@@ -47,14 +47,21 @@ def _move_batch(batch: dict[str, torch.Tensor], device: torch.device) -> dict[st
 
 
 def build_classifier(
-    config: dict[str, Any], device: torch.device
+    store: YangWuFeatureStore, config: dict[str, Any], device: torch.device
 ) -> YangWuBertEncoderClassifier:
     model = config.get("model", {})
     preprocessing = config.get("preprocessing", {})
     checkpoint = require_paths(config)["clinicalbert_checkpoint"]
+    # The head follows the scenario's label subset, not the raw file dimension.
+    declared = int(model["output_size"])
+    if store.scenario.label_columns is None and declared != store.label_count:
+        raise ValueError(
+            f"model.output_size={declared} does not match the {store.label_count} labels "
+            "in the split artifact"
+        )
     classifier = YangWuBertEncoderClassifier(
         str(checkpoint),
-        num_labels=int(model["output_size"]),
+        num_labels=store.label_count,
         time_invariant_dim=int(preprocessing["time_invariant_dim"]),
         time_invariant_hidden_dim=int(model["time_invariant_hidden_dim"]),
         time_series_dim=int(preprocessing["time_series_dim"]),
@@ -395,7 +402,7 @@ def train_multimodal_round(
     torch.manual_seed(model_seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(model_seed)
-    classifier = build_classifier(config, device)
+    classifier = build_classifier(store, config, device)
     loader = store.make_loader(
         indices,
         batch_size=int(training.get("batch_size", 40)),

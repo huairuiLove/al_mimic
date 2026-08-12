@@ -9,11 +9,66 @@ import yaml
 
 
 FORMAL_STRATEGIES = {"comal", "mm_comal", "modis", "mosaic", "random"}
+DEFAULT_PROTOCOL_PROFILE = "yang_wu_diagnoses_48h"
+PROFILE_KEYS = (
+    "observation_hours",
+    "timestep_hours",
+    "max_note_tokens",
+    "expected_total_samples",
+    "expected_label_count",
+    "time_invariant_dim",
+    "time_series_dim",
+    "note_protocol",
+)
+SCENARIO_SECTIONS = {"name", "label_subset", "missing_notes"}
+LABEL_SUBSET_KEYS = {"drop_top_k", "min_train_positives"}
+MISSING_NOTES_KEYS = {"rate", "bias", "strength", "seed", "splits", "careunit"}
 
 
 def _require_equal(name: str, actual: Any, required: Any) -> None:
     if actual != required:
         raise ValueError(f"formal Yang-Wu protocol requires {name}={required!r}, got {actual!r}")
+
+
+def _load_protocol_profile(name: str) -> dict[str, Any]:
+    path = Path(__file__).resolve().parent.parent / "configs" / "protocol_profiles.yaml"
+    with path.open(encoding="utf-8") as handle:
+        profiles = yaml.safe_load(handle) or {}
+    if name not in profiles:
+        raise ValueError(
+            f"unknown preprocessing.protocol_profile {name!r}; "
+            f"known profiles: {sorted(profiles)}"
+        )
+    profile = profiles[name] or {}
+    unresolved = [key for key in PROFILE_KEYS if profile.get(key) is None]
+    if unresolved:
+        raise ValueError(
+            f"protocol profile {name!r} has unresolved dimensions {unresolved}; "
+            "run scripts/build_scenario.py to materialise the cohort and register them"
+        )
+    return profile
+
+
+def _validate_scenario(config: dict[str, Any]) -> None:
+    """Fail loudly on a mistyped scenario key rather than silently ignoring it."""
+    scenario = config.get("scenario")
+    if scenario is None:
+        return
+    if not isinstance(scenario, dict):
+        raise ValueError("scenario must be a mapping")
+    unknown = set(scenario) - SCENARIO_SECTIONS
+    if unknown:
+        raise ValueError(f"unknown scenario sections: {sorted(unknown)}")
+    for section, allowed in (
+        ("label_subset", LABEL_SUBSET_KEYS),
+        ("missing_notes", MISSING_NOTES_KEYS),
+    ):
+        settings = scenario.get(section) or {}
+        if not isinstance(settings, dict):
+            raise ValueError(f"scenario.{section} must be a mapping")
+        unknown = set(settings) - allowed
+        if unknown:
+            raise ValueError(f"unknown scenario.{section} keys: {sorted(unknown)}")
 
 
 def _reject_shortcuts(value: Any, prefix: str = "") -> None:
@@ -48,6 +103,8 @@ def _validate_yang_wu_protocol(config: dict[str, Any]) -> None:
     model = config.get("model", {})
     training = config.get("training", {})
     active = config.get("active_learning", {})
+    profile_name = str(preprocessing.get("protocol_profile", DEFAULT_PROTOCOL_PROFILE))
+    profile = _load_protocol_profile(profile_name)
 
     required_values = {
         "dataset.split_group": (dataset.get("split_group"), "with_notes"),
@@ -63,7 +120,7 @@ def _validate_yang_wu_protocol(config: dict[str, Any]) -> None:
         ),
         "preprocessing.note_protocol": (
             preprocessing.get("note_protocol"),
-            "latest_per_category_description_within_48h",
+            profile["note_protocol"],
         ),
         "model.architecture": (model.get("architecture"), "yang_wu_bertencoder"),
         "model.initialization": (
@@ -78,27 +135,16 @@ def _validate_yang_wu_protocol(config: dict[str, Any]) -> None:
     for name, (actual, required) in required_values.items():
         _require_equal(name, actual, required)
 
+    # Cohort dimensions come from the named profile: the lock still catches drift,
+    # but a second observation window is a reviewed profile entry, not a loosened check.
     integer_values = {
-        "preprocessing.observation_hours": (preprocessing.get("observation_hours"), 48),
-        "preprocessing.timestep_hours": (preprocessing.get("timestep_hours"), 1),
-        "preprocessing.max_note_tokens": (preprocessing.get("max_note_tokens"), 512),
-        # Local FIDDLE Diagnoses rebuild dims (paper: 10210 / 1042 / 7411).
-        "preprocessing.expected_total_samples": (
-            preprocessing.get("expected_total_samples"),
-            10258,
-        ),
-        "preprocessing.expected_label_count": (
-            preprocessing.get("expected_label_count"),
-            915,
-        ),
-        "preprocessing.time_invariant_dim": (
-            preprocessing.get("time_invariant_dim"),
-            97,
-        ),
-        "preprocessing.time_series_dim": (
-            preprocessing.get("time_series_dim"),
-            7749,
-        ),
+        f"preprocessing.{key}": (preprocessing.get(key), profile[key])
+        for key in PROFILE_KEYS
+        if key != "note_protocol"
+    }
+    integer_values |= {
+        # The head follows the scenario's label subset; this pins the artifact itself.
+        "model.output_size": (model.get("output_size"), profile["expected_label_count"]),
         "model.text_hidden_dim": (model.get("text_hidden_dim"), 768),
         "model.time_invariant_hidden_dim": (
             model.get("time_invariant_hidden_dim"),
@@ -107,7 +153,6 @@ def _validate_yang_wu_protocol(config: dict[str, Any]) -> None:
         "model.time_series_hidden_dim": (model.get("time_series_hidden_dim"), 1024),
         "model.time_series_layers": (model.get("time_series_layers"), 3),
         "model.time_series_heads": (model.get("time_series_heads"), 16),
-        "model.output_size": (model.get("output_size"), 915),
         "training.epochs": (training.get("epochs"), 20),
         "active_learning.rounds": (active.get("rounds"), 6),
     }
@@ -141,6 +186,7 @@ def _validate_yang_wu_protocol(config: dict[str, Any]) -> None:
         raise ValueError("formal protocol forbids cross-round weight inheritance")
     if not str(dataset.get("clinicalbert_checkpoint", "")).strip():
         raise ValueError("dataset.clinicalbert_checkpoint must name the ClinicalBERT source checkpoint")
+    _validate_scenario(config)
     _reject_shortcuts(config)
 
 
@@ -160,12 +206,21 @@ def load_config(path: str | Path) -> dict[str, Any]:
         config = yaml.safe_load(handle) or {}
     if not isinstance(config, dict):
         raise ValueError("configuration root must be a mapping")
-    parent = config.pop("extends", None)
-    if parent:
-        parent_path = Path(parent)
-        if not parent_path.is_absolute():
-            parent_path = path.parent / parent_path
-        config = _merge(load_config(parent_path), config)
+    # A list of parents lets a run combine an orthogonal pair of bases -- the
+    # method's own tuning and a dataset scenario -- without either being
+    # restated, and so without one of them silently going missing.
+    parents = config.pop("extends", None) or []
+    if isinstance(parents, str):
+        parents = [parents]
+    if parents:
+        inherited: dict[str, Any] = {}
+        for entry in parents:
+            parent_path = Path(entry)
+            if not parent_path.is_absolute():
+                parent_path = path.parent / parent_path
+            inherited = _merge(inherited, load_config(parent_path))
+        inherited.pop("_config_path", None)
+        config = _merge(inherited, config)
     config["_config_path"] = str(path.resolve())
     _validate_yang_wu_protocol(config)
     return config
