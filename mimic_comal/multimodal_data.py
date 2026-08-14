@@ -13,10 +13,13 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 from .config import require_paths
+from .scenarios import ScenarioSpec, empty_note, scenario_from_config
 from .tasks import task_manifest, task_spec
 
 
 SPLIT_NAMES = ("train", "val", "test")
+CAREUNIT_ARRAY = "careunit_code"
+NOTES_AVAILABLE_ARRAY = "notes_available"
 REQUIRED_ARRAYS = (
     "X",
     "s",
@@ -219,7 +222,6 @@ class YangWuFeatureStore:
         self.audit = audit
         self.split_counts = audit.split_counts
         self.offsets = np.cumsum([0, *(self.split_counts[name] for name in SPLIT_NAMES)])
-        self.labels = self._load_labels()
         self.subject_ids = self._load_subject_ids()
         self.label_names = audit.label_names or tuple(
             f"{task_spec(config).task_id}:{index}" for index in range(audit.label_count)
@@ -227,6 +229,16 @@ class YangWuFeatureStore:
         self.splits = np.concatenate(
             [np.full(self.split_counts[name], name, dtype=object) for name in SPLIT_NAMES]
         )
+        raw_labels = self._load_labels()
+        self.scenario = scenario_from_config(
+            config,
+            labels=raw_labels,
+            split_names=self.splits,
+            careunit_codes=self._optional_array(CAREUNIT_ARRAY, np.int64),
+            notes_available=self._optional_array(NOTES_AVAILABLE_ARRAY, bool),
+        )
+        self.labels = self.scenario.select_labels(raw_labels)
+        self.label_count = int(self.labels.shape[1])
 
     def _shape_audit(self) -> YangWuDataAudit:
         h5py = _import_h5py()
@@ -267,6 +279,17 @@ class YangWuFeatureStore:
                 ]
             )
 
+    def _optional_array(self, name: str, dtype: Any) -> np.ndarray | None:
+        """Row array the rebuilt cohorts carry and the original 48h artifact does not."""
+        h5py = _import_h5py()
+        with h5py.File(self.path, "r") as handle:
+            root = handle[self.group_name]
+            if any(name not in root[split] for split in SPLIT_NAMES):
+                return None
+            return np.concatenate(
+                [np.asarray(root[split][name], dtype=dtype) for split in SPLIT_NAMES]
+            )
+
     def indices(self, split: str) -> np.ndarray:
         normalized = "val" if split == "validation" else split
         if normalized not in SPLIT_NAMES:
@@ -294,6 +317,7 @@ class YangWuFeatureStore:
             self.group_name,
             np.asarray(list(indices), dtype=np.int64),
             self.offsets,
+            self.scenario,
         )
         options: dict[str, Any] = {
             "batch_size": int(batch_size),
@@ -315,12 +339,15 @@ class YangWuDataset(Dataset[dict[str, torch.Tensor]]):
         group_name: str,
         indices: np.ndarray,
         offsets: np.ndarray,
+        scenario: ScenarioSpec | None = None,
     ) -> None:
         self.path = path
         self.group_name = group_name
         self.indices = indices
         self.offsets = offsets
+        self.scenario = scenario
         self._handle = None
+        self._empty_note: dict[str, np.ndarray] | None = None
 
     def __len__(self) -> int:
         return int(self.indices.size)
@@ -341,17 +368,25 @@ class YangWuDataset(Dataset[dict[str, torch.Tensor]]):
         split = SPLIT_NAMES[split_position]
         local_index = global_index - int(self.offsets[split_position])
         group = self._root()[split]
+        labels = np.asarray(group["label"][local_index], dtype=np.float32)
+        note_missing = self.scenario is not None and self.scenario.note_is_missing(global_index)
+        if note_missing:
+            note = self._withheld_note(int(group["input_ids"].shape[1]))
+        else:
+            note = {
+                name: np.asarray(group[name][local_index], dtype=np.int64)
+                for name in ("input_ids", "token_type_ids", "attention_mask")
+            }
+        if self.scenario is not None:
+            labels = self.scenario.select_labels(labels)
         result = {
             "time_series": torch.from_numpy(np.asarray(group["X"][local_index], dtype=np.float32)),
             "time_invariant": torch.from_numpy(np.asarray(group["s"][local_index], dtype=np.float32)),
-            "input_ids": torch.from_numpy(np.asarray(group["input_ids"][local_index], dtype=np.int64)),
-            "token_type_ids": torch.from_numpy(
-                np.asarray(group["token_type_ids"][local_index], dtype=np.int64)
-            ),
-            "attention_mask": torch.from_numpy(
-                np.asarray(group["attention_mask"][local_index], dtype=np.int64)
-            ),
-            "labels": torch.from_numpy(np.asarray(group["label"][local_index], dtype=np.float32)),
+            "input_ids": torch.from_numpy(note["input_ids"]),
+            "token_type_ids": torch.from_numpy(note["token_type_ids"]),
+            "attention_mask": torch.from_numpy(note["attention_mask"]),
+            "labels": torch.from_numpy(labels),
+            "notes_available": torch.tensor(not note_missing, dtype=torch.bool),
             "subject_id": torch.tensor(
                 int(np.asarray(group[_subject_id_array(group)][local_index])), dtype=torch.long
             ),
@@ -366,6 +401,12 @@ class YangWuDataset(Dataset[dict[str, torch.Tensor]]):
                 int(np.asarray(group["stay_id"][local_index])), dtype=torch.long
             )
         return result
+
+    def _withheld_note(self, length: int) -> dict[str, np.ndarray]:
+        if self._empty_note is None:
+            self._empty_note = empty_note(length)
+        # Copied because torch.from_numpy aliases, and the batch is mutated downstream.
+        return {name: value.copy() for name, value in self._empty_note.items()}
 
 
 def prepare_official_artifacts(

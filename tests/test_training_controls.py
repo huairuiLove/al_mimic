@@ -170,7 +170,7 @@ class _TinyStore:
 def _train_tiny_round(monkeypatch, training_overrides):
     monkeypatch.setattr(
         "mimic_comal.multimodal_training.build_classifier",
-        lambda config, device: _TinyRoundClassifier().to(device),
+        lambda store, config, device: _TinyRoundClassifier().to(device),
     )
     return train_multimodal_round(
         _TinyStore(),

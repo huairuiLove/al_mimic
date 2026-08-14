@@ -1,0 +1,30 @@
+# Locked tensor dimensions per cohort build.
+#
+# The protocol validator refuses to run when a config drifts from the artifact
+# it claims to use. Each profile pins the dimensions of one materialised cohort;
+# scripts/build_scenario.py registers a profile after a rebuild, so a new
+# observation window is an explicit, reviewed entry rather than a loosened check.
+
+yang_wu_diagnoses_48h:
+  observation_hours: 48
+  timestep_hours: 1
+  max_note_tokens: 512
+  expected_total_samples: 10258
+  expected_label_count: 915
+  time_invariant_dim: 97
+  time_series_dim: 7749
+  note_protocol: latest_per_category_description_within_48h
+
+# Populated by scripts/build_scenario.py once the 12h FIDDLE rebuild finishes.
+# Predicted cohort is 16930 stays (scripts/size_cohort.py); the feature
+# dimensions cannot be known until FIDDLE has run, so they stay null and the
+# validator refuses any config that selects this profile before then.
+yang_wu_diagnoses_12h:
+  observation_hours: 12
+  timestep_hours: 1
+  max_note_tokens: 512
+  expected_total_samples: null
+  expected_label_count: null
+  time_invariant_dim: null
+  time_series_dim: null
+  note_protocol: latest_per_category_description_within_12h
