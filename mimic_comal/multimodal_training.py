@@ -1,8 +1,7 @@
-"""Formal round training for the Yang-Wu multimodal diagnosis baseline."""
+"""Formal round training for multimodal MIMIC-III classification tasks."""
 
 from __future__ import annotations
 
-import math
 import time
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -11,10 +10,10 @@ from typing import Any, Iterable
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.optim import Adam, AdamW
+from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 
-from .config import require_paths
+from .config import resolve_path
 from .mixup import MixupConfig, label_space_mixup
 from .model import CoMALModule, YangWuBertEncoderClassifier, supervised_contrastive_loss
 from .multimodal_data import YangWuFeatureStore
@@ -26,6 +25,7 @@ class TrainedMultimodalRound:
     comal: CoMALModule | None
     history: dict[str, list[float]]
     timings: dict[str, float]
+    training_summary: dict[str, Any]
     labeled_outputs: dict[str, torch.Tensor] | None = None
     labeled_own_similarity: torch.Tensor | None = None
     labeled_view_own_similarity: torch.Tensor | None = None
@@ -51,7 +51,11 @@ def build_classifier(
 ) -> YangWuBertEncoderClassifier:
     model = config.get("model", {})
     preprocessing = config.get("preprocessing", {})
-    checkpoint = require_paths(config)["clinicalbert_checkpoint"]
+    checkpoint = resolve_path(
+        config, config.get("dataset", {}).get("clinicalbert_checkpoint", "")
+    )
+    if not checkpoint.is_file():
+        raise FileNotFoundError(f"missing ClinicalBERT checkpoint: {checkpoint}")
     classifier = YangWuBertEncoderClassifier(
         str(checkpoint),
         num_labels=int(model["output_size"]),
@@ -63,6 +67,7 @@ def build_classifier(
         time_series_heads=int(model["time_series_heads"]),
         text_hidden_dim=int(model["text_hidden_dim"]),
         dropout=float(model["dropout"]),
+        time_series_pooling=str(model.get("time_series_pooling", "first")),
     )
     return classifier.to(device)
 
@@ -76,6 +81,158 @@ def _linear_warmup_decay(total_steps: int, warmup_proportion: float):
         return max(0.0, float(total_steps - step) / max(1, total_steps - warmup_steps))
 
     return schedule
+
+
+def _add_optimizer_groups(
+    groups: list[dict[str, Any]],
+    named_parameters: Iterable[tuple[str, torch.nn.Parameter]],
+    *,
+    group_name: str,
+    learning_rate: float,
+    weight_decay: float,
+) -> None:
+    decay: list[torch.nn.Parameter] = []
+    no_decay: list[torch.nn.Parameter] = []
+    for _name, parameter in named_parameters:
+        if not parameter.requires_grad:
+            continue
+        # Biases and normalization scales are one-dimensional and should not decay.
+        target = decay if parameter.ndim > 1 else no_decay
+        target.append(parameter)
+    if decay:
+        groups.append(
+            {
+                "params": decay,
+                "lr": learning_rate,
+                "weight_decay": weight_decay,
+                "group_name": f"{group_name}_decay",
+            }
+        )
+    if no_decay:
+        groups.append(
+            {
+                "params": no_decay,
+                "lr": learning_rate,
+                "weight_decay": 0.0,
+                "group_name": f"{group_name}_no_decay",
+            }
+        )
+
+
+def _classifier_parameter_groups(
+    classifier: YangWuBertEncoderClassifier,
+    training: dict[str, Any],
+) -> list[dict[str, Any]]:
+    base_learning_rate = float(training["learning_rate"])
+    bert_learning_rate = float(training["bert_learning_rate"])
+    layerwise_decay = float(training["bert_layerwise_lr_decay"])
+    weight_decay = float(training["weight_decay"])
+    if base_learning_rate <= 0 or bert_learning_rate <= 0:
+        raise ValueError("classifier and BERT learning rates must be positive")
+    if not 0 < layerwise_decay <= 1:
+        raise ValueError("bert_layerwise_lr_decay must be in (0, 1]")
+    if weight_decay < 0:
+        raise ValueError("weight_decay must be non-negative")
+
+    all_named = list(classifier.named_parameters())
+    names_by_id = {id(parameter): name for name, parameter in all_named}
+    assigned: set[int] = set()
+    groups: list[dict[str, Any]] = []
+
+    def add_module(module: torch.nn.Module, group_name: str, learning_rate: float) -> None:
+        selected = [
+            (names_by_id[id(parameter)], parameter)
+            for parameter in module.parameters()
+            if parameter.requires_grad
+            and id(parameter) in names_by_id
+            and id(parameter) not in assigned
+        ]
+        assigned.update(id(parameter) for _name, parameter in selected)
+        _add_optimizer_groups(
+            groups,
+            selected,
+            group_name=group_name,
+            learning_rate=learning_rate,
+            weight_decay=weight_decay,
+        )
+
+    text_encoder = classifier.text_encoder
+    encoder = getattr(text_encoder, "encoder", None)
+    encoder_layers = list(getattr(encoder, "layer", ()))
+    embeddings = getattr(text_encoder, "embeddings", None)
+    if isinstance(embeddings, torch.nn.Module):
+        add_module(
+            embeddings,
+            "bert_embeddings",
+            bert_learning_rate * layerwise_decay ** len(encoder_layers),
+        )
+    for layer_index, layer in enumerate(encoder_layers):
+        depth_from_top = len(encoder_layers) - layer_index - 1
+        add_module(
+            layer,
+            f"bert_layer_{layer_index}",
+            bert_learning_rate * layerwise_decay**depth_from_top,
+        )
+    add_module(text_encoder, "bert_other", bert_learning_rate)
+
+    non_bert = [
+        (name, parameter)
+        for name, parameter in all_named
+        if parameter.requires_grad and id(parameter) not in assigned
+    ]
+    assigned.update(id(parameter) for _name, parameter in non_bert)
+    _add_optimizer_groups(
+        groups,
+        non_bert,
+        group_name="multimodal",
+        learning_rate=base_learning_rate,
+        weight_decay=weight_decay,
+    )
+    trainable = {id(parameter) for _name, parameter in all_named if parameter.requires_grad}
+    if assigned != trainable:
+        raise RuntimeError("optimizer parameter grouping did not cover every trainable parameter")
+    return groups
+
+
+def _build_classifier_optimizer(
+    classifier: YangWuBertEncoderClassifier,
+    training: dict[str, Any],
+) -> AdamW:
+    groups = _classifier_parameter_groups(classifier, training)
+    return AdamW(groups, lr=float(training["learning_rate"]))
+
+
+def _clone_module_state(module: torch.nn.Module) -> dict[str, torch.Tensor]:
+    return {
+        name: value.detach().cpu().clone()
+        for name, value in module.state_dict().items()
+    }
+
+
+@torch.inference_mode()
+def _validation_loss(
+    classifier: YangWuBertEncoderClassifier,
+    loader: Iterable[dict[str, torch.Tensor]],
+    device: torch.device,
+    precision: str,
+) -> float:
+    was_training = classifier.training
+    classifier.eval()
+    loss_sum = 0.0
+    element_count = 0
+    for host_batch in loader:
+        batch = _move_batch(host_batch, device)
+        with _autocast(device, precision):
+            logits = classifier(batch)["logits"]
+        targets = batch["labels"].float()
+        loss_sum += float(
+            F.binary_cross_entropy_with_logits(
+                logits.float(), targets, reduction="sum"
+            ).cpu()
+        )
+        element_count += targets.numel()
+    classifier.train(was_training)
+    return loss_sum / max(1, element_count)
 
 
 @torch.inference_mode()
@@ -123,7 +280,9 @@ def collect_classifier_outputs(
             result[name] = torch.cat(chunks, dim=0)
         elif name == "modality_tokens":
             result[name] = torch.empty(
-                (0, 3, classifier.feature_dim), dtype=torch.float32, device=device
+                (0, len(classifier.modality_names), classifier.feature_dim),
+                dtype=torch.float32,
+                device=device,
             )
         else:
             if name in {"labels", "probabilities"}:
@@ -286,10 +445,17 @@ def _build_comal(
         int(cfg.get("prototype_dim", 8)),
         num_views=len(classifier.modality_names) + 1 if multi_view else 1,
     ).to(device)
-    optimizer = AdamW(
-        comal.parameters(),
-        lr=float(cfg.get("learning_rate", 1e-3)),
+    comal_groups: list[dict[str, Any]] = []
+    _add_optimizer_groups(
+        comal_groups,
+        comal.named_parameters(),
+        group_name="comal",
+        learning_rate=float(cfg.get("learning_rate", 1e-3)),
         weight_decay=float(training.get("weight_decay", 0.0)),
+    )
+    optimizer = AdamW(
+        comal_groups,
+        lr=float(cfg.get("learning_rate", 1e-3)),
     )
     return comal, optimizer
 
@@ -386,6 +552,8 @@ def train_multimodal_round(
     labeled_indices: Iterable[int],
     config: dict[str, Any],
     device: torch.device,
+    *,
+    validation_indices: Iterable[int] | None = None,
 ) -> TrainedMultimodalRound:
     indices = np.unique(np.asarray(list(labeled_indices), dtype=np.int64))
     if not indices.size:
@@ -403,16 +571,24 @@ def train_multimodal_round(
         num_workers=int(training.get("num_workers", 12)),
         pin_memory=bool(training.get("pin_memory", True)),
     )
-    epochs = int(training["epochs"])
-    total_steps = max(1, epochs * math.ceil(len(indices) / int(training["batch_size"])))
-    optimizer = Adam(
-        classifier.parameters(),
-        lr=float(training["learning_rate"]),
-        weight_decay=float(training["weight_decay"]),
-    )
+    max_epochs = int(training["epochs"])
+    optimizer_step_budget = int(training["optimizer_steps_per_round"])
+    early_stopping_patience = int(training["early_stopping_patience"])
+    early_stopping_min_delta = float(training["early_stopping_min_delta"])
+    if max_epochs < 1 or optimizer_step_budget < 1:
+        raise ValueError("epochs and optimizer_steps_per_round must be positive")
+    if early_stopping_patience < 0 or early_stopping_min_delta < 0:
+        raise ValueError("early stopping patience and min_delta must be non-negative")
+    if max_epochs * len(loader) < optimizer_step_budget:
+        raise ValueError(
+            "epochs is too small to reach optimizer_steps_per_round for this labeled set"
+        )
+    optimizer = _build_classifier_optimizer(classifier, training)
     scheduler = LambdaLR(
         optimizer,
-        _linear_warmup_decay(total_steps, float(training["warmup_proportion"])),
+        _linear_warmup_decay(
+            optimizer_step_budget, float(training["warmup_proportion"])
+        ),
     )
     strategy = str(config["active_learning"]["strategy"]).lower()
     comal: CoMALModule | None = None
@@ -433,13 +609,41 @@ def train_multimodal_round(
     classifier.train()
     if comal is not None:
         comal.train()
-    for _epoch in range(epochs):
+    optimizer_steps = 0
+    best_validation_loss = float("inf")
+    best_epoch = 0
+    best_optimizer_step = 0
+    stale_validation_checks = 0
+    best_classifier_state: dict[str, torch.Tensor] | None = None
+    best_comal_state: dict[str, torch.Tensor] | None = None
+    stop_reason = "max_epochs"
+    validation = (
+        None
+        if validation_indices is None
+        else np.unique(np.asarray(list(validation_indices), dtype=np.int64))
+    )
+    validation_loader = None
+    if validation is not None:
+        if not validation.size:
+            raise ValueError("early stopping requires at least one validation sample")
+        validation_loader = store.make_loader(
+            validation,
+            batch_size=int(training.get("eval_batch_size", 400)),
+            shuffle=False,
+            num_workers=int(training.get("num_workers", 12)),
+            pin_memory=bool(training.get("pin_memory", True)),
+        )
+        history["validation_loss"] = []
+
+    for epoch_index in range(max_epochs):
         classifier_losses: list[torch.Tensor] = []
         comal_losses: list[torch.Tensor] = []
         mixup_losses: list[torch.Tensor] = []
         anchor_positives: list[float] = []
         mixed_positives: list[float] = []
         for host_batch in loader:
+            if optimizer_steps >= optimizer_step_budget:
+                break
             batch = _move_batch(host_batch, device)
             optimizer.zero_grad(set_to_none=True)
             if comal_optimizer is not None:
@@ -476,6 +680,7 @@ def train_multimodal_round(
             if comal_optimizer is not None:
                 comal_optimizer.step()
             scheduler.step()
+            optimizer_steps += 1
             classifier_losses.append(classifier_loss.detach())
             if comal is not None:
                 comal_losses.append(auxiliary_loss.detach())
@@ -492,10 +697,67 @@ def train_multimodal_round(
             history["mixup_mixed_positive_mean"].append(
                 float(np.mean(mixed_positives)) if mixed_positives else 0.0
             )
+        if validation is not None:
+            assert validation_loader is not None
+            current_validation_loss = _validation_loss(
+                classifier,
+                validation_loader,
+                device,
+                precision,
+            )
+            if not np.isfinite(current_validation_loss):
+                raise FloatingPointError("validation BCE became non-finite")
+            history["validation_loss"].append(current_validation_loss)
+            if current_validation_loss < best_validation_loss - early_stopping_min_delta:
+                best_validation_loss = current_validation_loss
+                best_epoch = epoch_index + 1
+                best_optimizer_step = optimizer_steps
+                stale_validation_checks = 0
+                best_classifier_state = _clone_module_state(classifier)
+                best_comal_state = (
+                    _clone_module_state(comal) if comal is not None else None
+                )
+            else:
+                stale_validation_checks += 1
+                if (
+                    early_stopping_patience > 0
+                    and stale_validation_checks >= early_stopping_patience
+                ):
+                    stop_reason = "early_stopping"
+                    break
+        if optimizer_steps >= optimizer_step_budget:
+            stop_reason = "optimizer_step_budget"
+            break
+
+    if best_classifier_state is not None:
+        classifier.load_state_dict(best_classifier_state)
+        if comal is not None and best_comal_state is not None:
+            comal.load_state_dict(best_comal_state)
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     timings["joint_training_sec"] = time.perf_counter() - start
     timings["classifier_training_sec"] = timings["joint_training_sec"]
+    learning_rates = {
+        str(group["group_name"]): float(group["initial_lr"])
+        for group in optimizer.param_groups
+    }
+    training_summary: dict[str, Any] = {
+        "max_epochs": max_epochs,
+        "epochs_ran": len(history["classifier_loss"]),
+        "optimizer_step_budget": optimizer_step_budget,
+        "optimizer_steps": optimizer_steps,
+        "stop_reason": stop_reason,
+        "best_epoch": best_epoch if validation is not None else None,
+        "best_optimizer_step": best_optimizer_step if validation is not None else None,
+        "best_validation_loss": (
+            best_validation_loss if validation is not None else None
+        ),
+        "early_stopping_patience": early_stopping_patience,
+        "early_stopping_min_delta": early_stopping_min_delta,
+        "optimizer": "adamw",
+        "weight_decay": float(training["weight_decay"]),
+        "learning_rates": learning_rates,
+    }
 
     labeled_outputs = None
     labeled_own = None
@@ -535,6 +797,7 @@ def train_multimodal_round(
         comal=comal,
         history=history,
         timings=timings,
+        training_summary=training_summary,
         labeled_outputs=labeled_outputs,
         labeled_own_similarity=labeled_own,
         labeled_view_own_similarity=labeled_view_own,

@@ -35,6 +35,7 @@ def main() -> None:
 
     # Shrink the round so a forward/backward pass fits comfortably on CPU.
     config["training"]["epochs"] = 1
+    config["training"]["optimizer_steps_per_round"] = 1
     config["training"]["batch_size"] = args.rows
     config["training"]["num_workers"] = 0
     config["training"]["pin_memory"] = False

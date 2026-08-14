@@ -56,8 +56,9 @@ The classifier is the paper's best diagnosis model, **BertEncoder**:
 - The clinical-note representation is the main modality. A MAG-style gate uses
   the other two modalities to adjust it.
 - A linear head emits 1,042 diagnosis logits.
-- Dropout is `0.1`, Adam learning rate is `1e-4`, the ClinicalBERT scheduler uses
-  10% linear warmup/decay, and gradient clipping is `1.0`.
+- Dropout is `0.1`. AdamW uses weight decay `0.01`; multimodal layers use learning
+  rate `1e-4`, while ClinicalBERT starts at `2e-5` with `0.95` layer-wise decay.
+  The scheduler uses 10% linear warmup/decay, and gradient clipping is `1.0`.
 
 The paper defines independent binary cross entropy for this multi-label task.
 Therefore, this implementation trains with `BCEWithLogitsLoss` and uses sigmoid
@@ -105,12 +106,15 @@ For every round:
 1. Reload the same ClinicalBERT source checkpoint.
 2. Reinitialize the static encoder, time-series encoder, fusion gate, diagnosis
    head, acquisition auxiliaries, and optimizer.
-3. Train the classifier for exactly 20 epochs.
+3. Train with an 80-epoch ceiling and the same 1,200-optimizer-step budget in
+   every round (roughly the former 20-epoch budget at the largest round); stop
+   early after five validation-loss checks without a `1e-4` improvement and
+   restore the best classifier/acquisition state.
 4. Never load a prior-round checkpoint or inherit optimizer state.
 5. Evaluate on the fixed validation and test splits.
 6. Query 5% of the original train pool unless this is the final round.
 
-There are no smoke, dry-run, row-limit, batch-limit, or shortened-epoch formal
+There are no smoke, dry-run, row-limit, batch-limit, or shortened-budget formal
 configurations.
 
 ## 7. Four acquisition methods
@@ -139,7 +143,7 @@ the auxiliary loss updates only the CoMAL branch; the classifier still receives
 gradients from its BCE objective.
 
 These are acquisition strategies. None may change the baseline classifier,
-cohort, labels, split, epoch count, or evaluation metrics.
+cohort, labels, split, optimization budget, or evaluation metrics.
 
 ## 8. Required private artifacts
 

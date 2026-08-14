@@ -1,4 +1,4 @@
-"""Command-line interface for formal multimodal MIMIC-III active learning."""
+"""Command-line interface for registered multimodal MIMIC-III tasks."""
 
 from __future__ import annotations
 
@@ -14,7 +14,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "command",
-        choices=("prepare", "validate-data", "explore", "features", "active", "visualize", "hardware", "all"),
+        choices=(
+            "tasks", "prepare", "validate-data", "explore", "features", "active", "full-data",
+            "visualize", "hardware", "all",
+        ),
     )
     parser.add_argument("--config", default="configs/mimic_a800_144c.yaml")
     parser.add_argument("--name", help="override experiment.name")
@@ -38,9 +41,11 @@ def _apply_overrides(config: dict, args: argparse.Namespace) -> None:
 def _validate(config: dict) -> dict:
     from .integrity import assert_original_unchanged
     from .multimodal_data import audit_split_hdf5
+    from .tasks import task_manifest
 
     audit = audit_split_hdf5(config)
     return {
+        "task": task_manifest(config),
         "records": audit.total_samples,
         "labels": audit.label_count,
         "split_counts": audit.split_counts,
@@ -58,7 +63,19 @@ def main() -> None:
     _apply_overrides(config, args)
     configure_runtime(config)
     command = args.command
-    if command == "hardware":
+    if command == "tasks":
+        from .tasks import TASKS
+
+        result = {
+            task_id: {
+                "display_name": spec.display_name,
+                "label_count": spec.label_count,
+                "query_unit": spec.query_unit,
+                "primary_metric": spec.primary_metric,
+            }
+            for task_id, spec in TASKS.items()
+        }
+    elif command == "hardware":
         result = hardware_report(config)
     elif command == "prepare":
         from .multimodal_data import prepare_official_artifacts
@@ -78,6 +95,10 @@ def main() -> None:
         from .runner import ActiveLearningExperiment
 
         result = ActiveLearningExperiment(config).run()
+    elif command == "full-data":
+        from .runner import ActiveLearningExperiment
+
+        result = ActiveLearningExperiment(config).run_full_data()
     elif command == "visualize":
         from .visualization import visualize_experiment
 

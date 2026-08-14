@@ -1,43 +1,45 @@
 experiment:
-  name: mimic_iii_yang_wu_bertencoder_comal
+  name: mimic_iii_phenotyping_25_comal
   output_root: experiments
 
 task:
-  id: icd9_diagnoses
+  id: phenotyping_25
   native_multilabel: true
   query_unit: icu_stay
 
 dataset:
-  prepared_dir: prepared/yang_wu_diagnoses_48h
-  split_hdf5: data/yang_wu_mimic/features/outcome=Diagnoses,T=48.0,dt=1.0/splits.hdf5
+  prepared_dir: prepared/mimic_phenotyping_25
+  split_hdf5: data/mimic_phenotyping_25/splits.hdf5
   split_group: with_notes
   clinicalbert_checkpoint: pretrained/clinicalbert/pytorch_model.bin
 
 preprocessing:
-  cohort: metavision
-  task: Diagnoses
-  observation_hours: 48
+  cohort: mimic3_benchmark_multimodal
+  task: Phenotyping
   timestep_hours: 1
+  max_time_steps: 256
   max_note_tokens: 512
-  expected_total_samples: 10258
-  expected_label_count: 915
-  time_invariant_dim: 97
-  time_series_dim: 7749
-  split_protocol: yang_wu_official_7_1.5_1.5
-  label_format: icd9_top3_multihot
-  note_protocol: latest_per_category_description_within_48h
+  expected_total_samples: null
+  expected_label_count: 25
+  time_invariant_dim: 0
+  time_series_dim: 76
+  split_protocol: mimic3_benchmark_subject_split
+  label_format: mimic3_benchmark_acute_care_multihot
+  note_protocol: all_stay_notes_chronological_512
+  require_positive_label_per_sample: false
 
 model:
-  architecture: yang_wu_bertencoder
+  architecture: clinicalbert_measurement_fusion
   initialization: clinicalbert_pretrained_fresh_fusion_each_round
   output_activation: sigmoid
   seed: 1337
   text_hidden_dim: 768
-  time_invariant_hidden_dim: 64
-  time_series_hidden_dim: 1024
+  time_invariant_hidden_dim: 0
+  time_series_hidden_dim: 256
   time_series_layers: 3
-  time_series_heads: 16
-  output_size: 915
+  time_series_heads: 8
+  time_series_pooling: masked_mean
+  output_size: 25
   dropout: 0.1
 
 comal:
@@ -48,7 +50,7 @@ comal:
   reconstruction_weight: 0.2
   classification_weight: 0.5
   anchor_chunk_size: 1024
-  contrastive_label_sample_size: 256
+  contrastive_label_sample_size: 25
   cross_modal_weight: 0.15
   negative_prototype: shared_background
 
@@ -78,16 +80,17 @@ training:
 
 active_learning:
   strategy: comal
-  initial_fraction: 0.10
-  query_fraction: 0.05
+  initial_fraction: 0.01
+  query_fraction: 0.01
   rounds: 6
 
 evaluation:
-  primary_metric: recall_at_30
+  primary_metric: macro_auprc
   metrics:
-    - recall_at_10
-    - recall_at_20
-    - recall_at_30
+    - macro_auprc
+    - micro_auprc
+    - macro_auroc
+    - micro_auroc
 
 acquisition:
   formula: paper

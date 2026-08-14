@@ -1,4 +1,4 @@
-"""Strict loader for the official Yang-Wu MIMIC-III diagnosis tensors."""
+"""Strict unified tensor loader for native multi-label MIMIC-III tasks."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 from .config import require_paths
+from .tasks import task_manifest, task_spec
 
 
 SPLIT_NAMES = ("train", "val", "test")
@@ -25,6 +26,7 @@ REQUIRED_ARRAYS = (
     "label",
 )
 SUBJECT_ID_ARRAYS = ("subject_id", "SUBJECT_ID")
+OPTIONAL_ARRAYS = ("time_series_mask", "stay_id")
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,13 +39,14 @@ class YangWuDataAudit:
     time_invariant_dim: int
     note_tokens: int
     positive_labels: int
+    label_names: tuple[str, ...] = ()
 
 
 def _import_h5py():
     try:
         import h5py
     except ImportError as exc:  # pragma: no cover - dependency error is environment-specific
-        raise RuntimeError("h5py is required to read the official Yang-Wu split artifact") from exc
+        raise RuntimeError("h5py is required to read the MIMIC split artifact") from exc
     return h5py
 
 
@@ -52,7 +55,7 @@ def _subject_id_array(group: Any) -> str:
         if name in group:
             return name
     raise ValueError(
-        "official split artifact must contain a row-aligned subject_id/SUBJECT_ID array "
+        "MIMIC split artifact must contain a row-aligned subject_id/SUBJECT_ID array "
         "for grouped active-learning validation"
     )
 
@@ -60,7 +63,9 @@ def _subject_id_array(group: Any) -> str:
 def audit_split_hdf5(config: dict[str, Any]) -> YangWuDataAudit:
     """Validate every source-aligned tensor before a formal experiment starts."""
     paths = require_paths(config)
+    spec = task_spec(config)
     group_name = str(config.get("dataset", {}).get("split_group", "with_notes"))
+    cohort_mode = str(config.get("dataset", {}).get("cohort_mode", "official")).lower()
     expected = config.get("preprocessing", {})
     split_counts: dict[str, int] = {}
     label_count = time_steps = time_series_dim = time_invariant_dim = note_tokens = -1
@@ -80,15 +85,24 @@ def audit_split_hdf5(config: dict[str, Any]) -> YangWuDataAudit:
             subject_id_name = _subject_id_array(group)
             count = int(group["label"].shape[0])
             shapes = {name: tuple(group[name].shape) for name in REQUIRED_ARRAYS}
+            shapes.update(
+                {
+                    name: tuple(group[name].shape)
+                    for name in OPTIONAL_ARRAYS
+                    if name in group
+                }
+            )
             shapes[subject_id_name] = tuple(group[subject_id_name].shape)
             if any(shape[0] != count for shape in shapes.values()):
                 raise ValueError(f"unaligned rows in {group_name}/{split}: {shapes}")
             if len(shapes["X"]) != 3 or len(shapes["s"]) != 2:
-                raise ValueError("official X and s tensors must have shapes [N,T,D] and [N,D]")
+                raise ValueError("X and s tensors must have shapes [N,T,D] and [N,D]")
             if len(shapes[subject_id_name]) != 1:
                 raise ValueError("subject_id/SUBJECT_ID must have shape [N]")
             if any(len(shapes[name]) != 2 for name in ("input_ids", "token_type_ids", "attention_mask")):
-                raise ValueError("official BERT input tensors must have shape [N,512]")
+                raise ValueError("BERT input tensors must have shape [N,L]")
+            if "time_series_mask" in shapes and shapes["time_series_mask"] != shapes["X"][:2]:
+                raise ValueError("time_series_mask must have shape [N,T] matching X")
             current = (
                 shapes["label"][1],
                 shapes["X"][1],
@@ -99,7 +113,7 @@ def audit_split_hdf5(config: dict[str, Any]) -> YangWuDataAudit:
             if label_count < 0:
                 label_count, time_steps, time_series_dim, time_invariant_dim, note_tokens = current
             elif current != (label_count, time_steps, time_series_dim, time_invariant_dim, note_tokens):
-                raise ValueError(f"feature dimensions differ across official splits: {current}")
+                raise ValueError(f"feature dimensions differ across MIMIC task splits: {current}")
             split_counts[split] = count
             subject_ids = np.asarray(group[subject_id_name], dtype=np.int64)
             if np.any(subject_ids <= 0):
@@ -108,19 +122,23 @@ def audit_split_hdf5(config: dict[str, Any]) -> YangWuDataAudit:
             for start in range(0, count, batch):
                 labels = np.asarray(group["label"][start : start + batch])
                 if not np.logical_or(labels == 0, labels == 1).all():
-                    raise ValueError("diagnosis labels must be a binary multi-hot matrix")
-                if np.any(labels.sum(axis=1) == 0):
-                    raise ValueError("every diagnosis visit must contain at least one ICD-9 group")
+                    raise ValueError("task labels must be a binary multi-hot matrix")
+                if bool(expected.get("require_positive_label_per_sample", True)) and np.any(
+                    labels.sum(axis=1) == 0
+                ):
+                    raise ValueError("this task requires at least one positive label per ICU stay")
                 positive_labels += int(labels.sum())
 
     total = sum(split_counts.values())
     requirements = {
-        "total samples": (total, int(expected.get("expected_total_samples", 10210))),
-        "labels": (label_count, int(expected.get("expected_label_count", 1042))),
-        "time steps": (time_steps, int(expected.get("observation_hours", 48))),
+        "labels": (label_count, int(expected.get("expected_label_count", spec.label_count))),
+        "time steps": (
+            time_steps,
+            int(expected.get("max_time_steps", expected.get("observation_hours", 48))),
+        ),
         "time-series dimension": (
             time_series_dim,
-            int(expected.get("time_series_dim", 7411)),
+            int(expected.get("time_series_dim", 7749)),
         ),
         "time-invariant dimension": (
             time_invariant_dim,
@@ -128,11 +146,19 @@ def audit_split_hdf5(config: dict[str, Any]) -> YangWuDataAudit:
         ),
         "note tokens": (note_tokens, int(expected.get("max_note_tokens", 512))),
     }
+    expected_total = expected.get("expected_total_samples", 10258)
+    if expected_total is not None:
+        requirements["total samples"] = (total, int(expected_total))
     mismatches = [f"{name}: expected {required}, got {actual}" for name, (actual, required) in requirements.items() if actual != required]
     if mismatches:
-        raise ValueError("formal Yang-Wu tensor mismatch: " + "; ".join(mismatches))
+        raise ValueError("formal MIMIC task tensor mismatch: " + "; ".join(mismatches))
     if not all(split_counts.values()):
-        raise ValueError(f"official train/val/test splits must all be non-empty: {split_counts}")
+        raise ValueError(f"MIMIC train/val/test splits must all be non-empty: {split_counts}")
+    if cohort_mode == "full_cohort" and total <= 10258:
+        raise ValueError(
+            "full_cohort requires a source artifact larger than the 10,258-row local rebuild; "
+            f"got {total} rows"
+        )
     with h5py.File(paths["split_hdf5"], "r") as handle:
         root = handle[group_name]
         split_subjects = {
@@ -148,7 +174,26 @@ def audit_split_hdf5(config: dict[str, Any]) -> YangWuDataAudit:
         if split_subjects[left] & split_subjects[right]
     }
     if overlap:
-        raise ValueError(f"subject leakage across official splits: {overlap}")
+        raise ValueError(f"subject leakage across MIMIC task splits: {overlap}")
+    label_names: tuple[str, ...] = ()
+    with h5py.File(paths["split_hdf5"], "r") as handle:
+        root = handle[group_name]
+        artifact_task = root.attrs.get("task_id")
+        if isinstance(artifact_task, bytes):
+            artifact_task = artifact_task.decode("utf-8")
+        if artifact_task is not None and str(artifact_task) != spec.task_id:
+            raise ValueError(
+                f"artifact task_id={artifact_task!r} does not match config task.id={spec.task_id!r}"
+            )
+        if "label_names" in root:
+            label_names = tuple(
+                value.decode("utf-8") if isinstance(value, bytes) else str(value)
+                for value in np.asarray(root["label_names"])
+            )
+            if len(label_names) != label_count:
+                raise ValueError(
+                    f"label_names contains {len(label_names)} entries for {label_count} labels"
+                )
     return YangWuDataAudit(
         split_counts,
         total,
@@ -158,11 +203,12 @@ def audit_split_hdf5(config: dict[str, Any]) -> YangWuDataAudit:
         time_invariant_dim,
         note_tokens,
         positive_labels,
+        label_names,
     )
 
 
 class YangWuFeatureStore:
-    """Global row view over the three official HDF5 split groups."""
+    """Global row view over three task HDF5 split groups."""
 
     def __init__(self, config: dict[str, Any], *, validate: bool = True) -> None:
         self.config = config
@@ -175,6 +221,9 @@ class YangWuFeatureStore:
         self.offsets = np.cumsum([0, *(self.split_counts[name] for name in SPLIT_NAMES)])
         self.labels = self._load_labels()
         self.subject_ids = self._load_subject_ids()
+        self.label_names = audit.label_names or tuple(
+            f"{task_spec(config).task_id}:{index}" for index in range(audit.label_count)
+        )
         self.splits = np.concatenate(
             [np.full(self.split_counts[name], name, dtype=object) for name in SPLIT_NAMES]
         )
@@ -194,6 +243,7 @@ class YangWuFeatureStore:
                 int(group["s"].shape[1]),
                 int(group["input_ids"].shape[1]),
                 0,
+                (),
             )
 
     def _load_labels(self) -> np.ndarray:
@@ -291,7 +341,7 @@ class YangWuDataset(Dataset[dict[str, torch.Tensor]]):
         split = SPLIT_NAMES[split_position]
         local_index = global_index - int(self.offsets[split_position])
         group = self._root()[split]
-        return {
+        result = {
             "time_series": torch.from_numpy(np.asarray(group["X"][local_index], dtype=np.float32)),
             "time_invariant": torch.from_numpy(np.asarray(group["s"][local_index], dtype=np.float32)),
             "input_ids": torch.from_numpy(np.asarray(group["input_ids"][local_index], dtype=np.int64)),
@@ -307,21 +357,33 @@ class YangWuDataset(Dataset[dict[str, torch.Tensor]]):
             ),
             "index": torch.tensor(global_index, dtype=torch.long),
         }
+        if "time_series_mask" in group:
+            result["time_series_mask"] = torch.from_numpy(
+                np.asarray(group["time_series_mask"][local_index], dtype=np.bool_)
+            )
+        if "stay_id" in group:
+            result["stay_id"] = torch.tensor(
+                int(np.asarray(group["stay_id"][local_index])), dtype=torch.long
+            )
+        return result
 
 
 def prepare_official_artifacts(
     config: dict[str, Any], output_dir: str | Path | None = None
 ) -> dict[str, Any]:
-    """Audit official tensors and write a provenance manifest, never synthetic data."""
+    """Audit task tensors and write a provenance manifest, never synthetic data."""
     audit = audit_split_hdf5(config)
     dataset = config.get("dataset", {})
     output = Path(output_dir or dataset.get("prepared_dir", "prepared/yang_wu_diagnoses_48h"))
     output.mkdir(parents=True, exist_ok=True)
     paths = require_paths(config)
+    cohort_mode = str(dataset.get("cohort_mode", "official")).lower()
+    spec = task_spec(config)
     payload = {
-        "format_version": 1,
-        "protocol": "Yang and Wu (EMNLP 2021) MIMIC-III Diagnoses 48h",
-        "source_repository": "https://github.com/emnlp-mimic/mimic",
+        "format_version": 2,
+        "task": task_manifest(config),
+        "protocol": spec.display_name,
+        "cohort_mode": cohort_mode,
         "split_hdf5": str(paths["split_hdf5"].resolve()),
         "clinicalbert_checkpoint": str(paths["clinicalbert_checkpoint"].resolve()),
         "split_group": str(dataset.get("split_group", "with_notes")),
@@ -333,9 +395,15 @@ def prepare_official_artifacts(
         "time_invariant_dim": audit.time_invariant_dim,
         "note_tokens": audit.note_tokens,
         "positive_labels": audit.positive_labels,
+        "label_names": list(audit.label_names),
     }
     (output / "manifest.json").write_text(
         json.dumps(payload, indent=2, ensure_ascii=False, allow_nan=False) + "\n",
         encoding="utf-8",
     )
     return payload | {"output_dir": str(output)}
+
+
+# Backward-compatible names retained for scripts built around the original task.
+MimicDataAudit = YangWuDataAudit
+MimicFeatureStore = YangWuFeatureStore

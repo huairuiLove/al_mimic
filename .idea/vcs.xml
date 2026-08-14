@@ -2,5 +2,8 @@
 <project version="4">
   <component name="VcsDirectoryMappings">
     <mapping directory="" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/third_party/mimic3-benchmarks" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/third_party/multimodal-clinical-pretraining" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/third_party/notes_benchmark" vcs="Git" />
   </component>
 </project>

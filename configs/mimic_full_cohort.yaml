@@ -1,0 +1,20 @@
+extends: mimic_a800_144c.yaml
+
+# Use only with a separately rebuilt Yang-Wu HDF5 for a larger, subject-grouped
+# cohort. This is the same Diagnoses task and BertEncoder, not another coding
+# mode. The local 10,258-row rebuild remains on the default configuration.
+experiment:
+  name: mimic_iii_yang_wu_bertencoder_full_cohort
+
+dataset:
+  prepared_dir: prepared/yang_wu_diagnoses_48h_full_cohort
+  split_hdf5: data/yang_wu_full_cohort/features/outcome=Diagnoses,T=48.0,dt=1.0/splits.hdf5
+  cohort_mode: full_cohort
+
+preprocessing:
+  cohort: mimic_iii_all_icu
+  split_protocol: yang_wu_full_cohort_grouped
+  expected_total_samples: null
+
+active_learning:
+  strategy: random

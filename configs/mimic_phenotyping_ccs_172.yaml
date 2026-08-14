@@ -1,0 +1,23 @@
+extends: mimic_phenotyping_25.yaml
+
+experiment:
+  name: mimic_iii_phenotyping_ccs_172_comal
+
+task:
+  id: phenotyping_ccs_172
+
+dataset:
+  prepared_dir: prepared/mimic_phenotyping_ccs_172
+  split_hdf5: data/mimic_phenotyping_ccs_172/splits.hdf5
+
+preprocessing:
+  cohort: notes_benchmark_multimodal
+  expected_label_count: 172
+  split_protocol: notes_benchmark_subject_split
+  label_format: hcup_ccs_2015_multihot_172
+
+model:
+  output_size: 172
+
+comal:
+  contrastive_label_sample_size: 172

@@ -1,4 +1,4 @@
-"""Six-round active learning on the Yang-Wu MIMIC-III diagnosis baseline."""
+"""Active learning on registered native multi-label MIMIC-III tasks."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ import numpy as np
 import torch
 
 from .integrity import assert_original_unchanged
-from .metrics import multilabel_metrics
+from .metrics import task_multilabel_metrics
 from .model import (
     estimate_mm_comal_statistics,
     mm_comal_acquisition_scores,
@@ -26,6 +26,7 @@ from .multimodal_training import (
     collect_classifier_outputs,
     train_multimodal_round,
 )
+from .tasks import task_manifest, task_spec
 
 
 def _write_json(path: Path, value: Any) -> None:
@@ -86,6 +87,7 @@ def _score_summary(
 class ActiveLearningExperiment:
     def __init__(self, config: dict[str, Any]) -> None:
         self.config = config
+        self.task = task_spec(config)
         self.training = config.get("training", {})
         self.active = config.get("active_learning", {})
         self.store = YangWuFeatureStore(config, validate=True)
@@ -112,10 +114,11 @@ class ActiveLearningExperiment:
                 key: value.detach().cpu()
                 for key, value in trained.classifier.state_dict().items()
             },
-            "target_model": "Yang-Wu BertEncoder (EMNLP 2021)",
-            "task": "MIMIC-III Diagnoses 48h, 1,042 ICD-9 groups",
+            "target_model": str(self.config.get("model", {}).get("architecture")),
+            "task": task_manifest(self.config),
             "initialization": "fresh from the same ClinicalBERT source checkpoint",
-            "classifier_epochs": int(self.training["epochs"]),
+            "classifier_epochs": int(trained.training_summary["epochs_ran"]),
+            "training_summary": trained.training_summary,
         }
         if trained.comal is not None:
             payload["comal"] = {
@@ -201,7 +204,7 @@ class ActiveLearningExperiment:
             "combined": parts.combined,
         }
         return queries, {
-            "method": "CoMAL paper score on Yang-Wu fused features",
+            "method": "CoMAL paper score on fused multimodal features",
             "candidate_count": int(candidates.size),
             "selected_count": len(queries),
             "score_components": _score_summary(components, order),
@@ -381,6 +384,74 @@ class ActiveLearningExperiment:
             "method_diagnostics": result.diagnostics,
         }
 
+    def run_full_data(self) -> dict[str, Any]:
+        """Train once on every row in the configured train split."""
+        train_indices = self.store.indices("train")
+        validation_indices = self.store.indices("val")
+        test_indices = self.store.indices("test")
+        start = time.perf_counter()
+        trained = train_multimodal_round(
+            self.store,
+            train_indices.tolist(),
+            self.config,
+            self.device,
+            validation_indices=validation_indices,
+        )
+        validation = collect_classifier_outputs(
+            trained.classifier, self.store, validation_indices, self.config, self.device,
+            return_tokens=False,
+        )
+        test = collect_classifier_outputs(
+            trained.classifier, self.store, test_indices, self.config, self.device,
+            return_tokens=False,
+        )
+        validation_metrics = task_multilabel_metrics(
+            self.config,
+            _host(validation["labels"]), _host(validation["probabilities"])
+        )
+        test_metrics = task_multilabel_metrics(
+            self.config,
+            _host(test["labels"]), _host(test["probabilities"])
+        )
+        output_dir = self.output_dir / "full_data"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        data_usage = {
+            "task_id": self.task.task_id,
+            "cohort": str(self.config.get("preprocessing", {}).get("cohort", "")),
+            "total_multimodal_visits": self.store.audit.total_samples,
+            "train_pool": int(train_indices.size),
+            "validation": int(validation_indices.size),
+            "test": int(test_indices.size),
+            "labeled_train_fraction": 1.0,
+        }
+        np.savez(
+            output_dir / "final_predictions.npz",
+            validation_labels=_host(validation["labels"]),
+            validation_probabilities=_host(validation["probabilities"]),
+            test_labels=_host(test["labels"]),
+            test_probabilities=_host(test["probabilities"]),
+        )
+        final = {
+            "validation": validation_metrics,
+            "test": test_metrics,
+            "data_usage": data_usage,
+            "strategy": "full_data_upper_bound",
+        }
+        _write_json(
+            output_dir / "full_data_state.json",
+            {
+                "format_version": 1,
+                "protocol": task_manifest(self.config),
+                "training_summary": trained.training_summary,
+                "timing": trained.timings | {"total_sec": time.perf_counter() - start},
+                "data_usage": data_usage,
+                "metrics": final,
+            },
+        )
+        _write_json(output_dir / "final_metrics.json", final)
+        _write_json(output_dir / "resolved_config.json", self.config)
+        return {"output_dir": str(output_dir), "final_metrics": final}
+
     def run(self) -> dict[str, Any]:
         random.seed(self.seed)
         np.random.seed(self.seed)
@@ -411,7 +482,11 @@ class ActiveLearningExperiment:
                 )
             round_start = time.perf_counter()
             trained = train_multimodal_round(
-                self.store, labeled, self.config, self.device
+                self.store,
+                labeled,
+                self.config,
+                self.device,
+                validation_indices=validation_indices,
             )
             validation = collect_classifier_outputs(
                 trained.classifier,
@@ -430,10 +505,12 @@ class ActiveLearningExperiment:
                 return_tokens=False,
             )
             final_validation, final_test = validation, test
-            validation_metrics = multilabel_metrics(
+            validation_metrics = task_multilabel_metrics(
+                self.config,
                 _host(validation["labels"]), _host(validation["probabilities"])
             )
-            test_metrics = multilabel_metrics(
+            test_metrics = task_multilabel_metrics(
+                self.config,
                 _host(test["labels"]), _host(test["probabilities"])
             )
             queries: list[int] = []
@@ -481,9 +558,18 @@ class ActiveLearningExperiment:
                     "test_metrics": test_metrics,
                     "training_history": trained.history,
                     "training_plan": {
-                        "target_model": "Yang-Wu BertEncoder",
+                        "target_model": str(
+                            self.config.get("model", {}).get("architecture")
+                        ),
                         "initialization": "fresh from ClinicalBERT source checkpoint",
-                        "classifier_epochs": int(self.training["epochs"]),
+                        "classifier_max_epochs": int(self.training["epochs"]),
+                        "optimizer_step_budget": int(
+                            self.training["optimizer_steps_per_round"]
+                        ),
+                        "optimizer": "AdamW",
+                        "weight_decay": float(self.training["weight_decay"]),
+                        "bert_layerwise_learning_rate": True,
+                        "early_stopping": "validation_bce",
                         "comal_training": (
                             "joint_with_classifier_stop_gradient"
                             if strategy in {"comal", "mm_comal"}
@@ -495,6 +581,7 @@ class ActiveLearningExperiment:
                             else "none"
                         ),
                     },
+                    "training_summary": trained.training_summary,
                     "timing": trained.timings
                     | {"round_total_sec": time.perf_counter() - round_start},
                     "acquisition": acquisition,
@@ -505,20 +592,29 @@ class ActiveLearningExperiment:
                 labeled = sorted([*labeled, *queries])
 
         assert final_validation is not None and final_test is not None
+        cohort_mode = self.config.get("dataset", {}).get("cohort_mode")
         data_usage = {
-            "paper_total_multimodal_visits": self.store.audit.total_samples,
-            "official_train_pool": int(train_indices.size),
-            "official_validation_evaluation_only": int(validation_indices.size),
-            "official_test_evaluation_only": int(test_indices.size),
+            "task_id": self.task.task_id,
+            "cohort": str(self.config.get("preprocessing", {}).get("cohort", "")),
+            "total_multimodal_visits": self.store.audit.total_samples,
+            "train_pool": int(train_indices.size),
+            "validation_model_selection": int(validation_indices.size),
+            "test_evaluation_only": int(test_indices.size),
             "initial_labeled": len(initial),
             "newly_queried": len(labeled) - len(initial),
             "final_labeled": len(labeled),
             "final_fraction_of_train": len(labeled) / train_indices.size,
-            "cumulative_fraction_targets": [0.10, 0.15, 0.20, 0.25, 0.30, 0.35],
+            "cumulative_fraction_targets": [
+                count / float(train_indices.size) for count in schedule
+            ],
         }
+        if cohort_mode is not None:
+            data_usage["cohort_mode"] = str(cohort_mode)
+        if self.task.task_id == "icd9_diagnoses" and cohort_mode == "official":
+            data_usage["local_yang_wu_rebuild_visits"] = self.store.audit.total_samples
         state = {
-            "format_version": 3,
-            "protocol": "Yang and Wu 2021 BertEncoder, MIMIC-III Diagnoses 48h",
+            "format_version": 4,
+            "protocol": task_manifest(self.config),
             "strategy": strategy,
             "seed": self.seed,
             "labeled_schedule": schedule,

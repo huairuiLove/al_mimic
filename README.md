@@ -4,7 +4,9 @@
 
 | Base | Dataset and target | Specification |
 |---|---|---|
-| Yang-Wu BertEncoder | MIMIC-III, 1,042 ICD-9 groups | [`BASE_TASK_MIMIC_III_MULTIMODAL.md`](BASE_TASK_MIMIC_III_MULTIMODAL.md) |
+| Yang-Wu BertEncoder | MIMIC-III, 915 local ICD-9 groups (1,042 in paper) | [`BASE_TASK_MIMIC_III_MULTIMODAL.md`](BASE_TASK_MIMIC_III_MULTIMODAL.md) |
+| Acute-care phenotyping | MIMIC-III, 25 native multi-hot phenotypes | [`BASE_TASK_MIMIC_III_PHENOTYPING.md`](BASE_TASK_MIMIC_III_PHENOTYPING.md) |
+| Broad CCS phenotyping | MIMIC-III, 172 native multi-hot phenotypes | [`BASE_TASK_MIMIC_III_PHENOTYPING.md`](BASE_TASK_MIMIC_III_PHENOTYPING.md) |
 | MDS-ED S4 + MLP | MIMIC-IV/ECG, 1,428 ICD-10-CM labels | [`BASE_TASK_MIMIC_IV_MDS_ED.md`](BASE_TASK_MIMIC_IV_MDS_ED.md) |
 | BRSET ResNet-50 + metadata fusion | BRSET v1.0.2, 13 retinal disease labels | [`BASE_TASK_BRSET_MULTIMODAL.md`](BASE_TASK_BRSET_MULTIMODAL.md) |
 
@@ -20,6 +22,21 @@ The complete fixed protocol is documented in
 
 The MDS-ED task remains a separate integration target; its data and labels are
 never passed through this MIMIC-III runner.
+
+## MIMIC-III task registry
+
+The MIMIC runner now exposes three native multi-label tasks:
+
+```bash
+uv run python main.py tasks --config configs/mimic_comal.yaml
+```
+
+`icd9_diagnoses` preserves the existing 48-hour Yang-Wu protocol and
+Recall@10/20/30 evaluation. `phenotyping_25` and `phenotyping_ccs_172` use one
+complete ICU-stay label vector per query and are evaluated primarily by
+macro-AUPRC. Their author repositories, preprocessing adapters, provenance
+requirements, base-model adaptation boundary, and commands are documented in
+[`BASE_TASK_MIMIC_III_PHENOTYPING.md`](BASE_TASK_MIMIC_III_PHENOTYPING.md).
 
 Run MDS-ED only from its own directory after preparing its ECG memmap:
 
@@ -59,8 +76,10 @@ bash scripts/run_brset_four_methods.sh
 
 Every method runs six cold-start rounds at 10%, 15%, 20%, 25%, 30%, and 35% of
 the actual official train split. Each round reloads the same ClinicalBERT source,
-reinitializes every other model/optimizer parameter, and trains for exactly 20
-epochs. Evaluation reports only Recall@10, Recall@20, and Recall@30.
+reinitializes every other model/optimizer parameter, and uses the same 1,200-step
+optimization budget (roughly the former 20-epoch budget at the largest round)
+with an 80-epoch ceiling and validation-loss early stopping.
+Evaluation reports only Recall@10, Recall@20, and Recall@30.
 
 ## Required data
 
@@ -82,6 +101,22 @@ paper dimensions: 10,210 visits total, 1,042 labels, `[48,7411]` time series,
 `subject_id`) array. The subject identifier is used for MoDIS grouped OOF
 folds; global row indices are rejected as a substitute. No fallback or
 synthetic data path exists.
+
+The current executable artifact is the local Yang-Wu rebuild: 10,258 visits,
+915 diagnosis groups, and `[48,7749]` time-series tensors. The paper's
+10,210/1,042/7,411 dimensions above remain reference values, not the dimensions
+reported for local runs.
+
+`configs/mimic_full_cohort.yaml` is still the same Yang-Wu task and BertEncoder.
+It accepts only a separately rebuilt, larger Yang-Wu HDF5 that freezes the same
+48-hour input contract and 915-label vocabulary, with disjoint subject-grouped
+train/validation/test splits. Its cohort includes all MIMIC-III ICU care systems,
+so it is an extended-cohort Yang-Wu result rather than a reproduction of the
+paper's MetaVision cohort. Run that full-data upper bound with:
+
+```bash
+uv run python main.py full-data --config configs/mimic_full_cohort.yaml
+```
 
 ## Run
 

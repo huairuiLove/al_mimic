@@ -13,6 +13,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
 from .multimodal_data import YangWuFeatureStore
+from .tasks import task_manifest
 
 
 COLORS = ("#287271", "#d9895b", "#5b6f9c", "#b35c44")
@@ -33,7 +34,7 @@ def explore_dataset(config: dict[str, Any], output_dir: str | Path | None = None
     output.mkdir(parents=True, exist_ok=True)
     store = YangWuFeatureStore(config, validate=True)
     labels = store.labels
-    label_names = tuple(f"ICD9-group-{index:04d}" for index in range(labels.shape[1]))
+    label_names = store.label_names
     files: dict[str, str] = {}
 
     positives = labels.sum(axis=0)
@@ -41,7 +42,7 @@ def explore_dataset(config: dict[str, Any], output_dir: str | Path | None = None
     fig, axis = plt.subplots(figsize=(9, 12))
     axis.barh(np.arange(len(order)), positives[order], color=COLORS[0])
     axis.set_yticks(np.arange(len(order)), [label_names[index] for index in order])
-    axis.set_xlabel("ICU visits with positive three-digit ICD-9 group (top 50)")
+    axis.set_xlabel("ICU stays with a positive label (top 50)")
     axis.grid(axis="x", alpha=0.2)
     fig.tight_layout()
     files["label_prevalence"] = "label_prevalence.png"
@@ -52,7 +53,7 @@ def explore_dataset(config: dict[str, Any], output_dir: str | Path | None = None
     bins = np.arange(cardinality.max() + 2) - 0.5
     fig, axis = plt.subplots(figsize=(8, 4.5))
     axis.hist(cardinality, bins=bins, color=COLORS[1], edgecolor="white")
-    axis.set(xlabel="Positive ICD-9 groups per ICU visit", ylabel="ICU visits")
+    axis.set(xlabel="Positive labels per ICU stay", ylabel="ICU stays")
     axis.grid(axis="y", alpha=0.2)
     fig.tight_layout()
     files["cardinality"] = "label_cardinality.png"
@@ -68,7 +69,7 @@ def explore_dataset(config: dict[str, Any], output_dir: str | Path | None = None
     names = [label_names[index] for index in top]
     axis.set_xticks(np.arange(len(names)), names, rotation=60, ha="right")
     axis.set_yticks(np.arange(len(names)), names)
-    axis.set_title("ICD-9 co-occurrence cosine (top labels)")
+    axis.set_title("Label co-occurrence cosine (top labels)")
     fig.colorbar(image, ax=axis, label="cosine")
     fig.tight_layout()
     files["cooccurrence"] = "label_cooccurrence.png"
@@ -91,7 +92,7 @@ def explore_dataset(config: dict[str, Any], output_dir: str | Path | None = None
     plt.close(fig)
 
     audit: dict[str, Any] = {
-        "protocol": "Yang-Wu Diagnoses 48h",
+        "protocol": task_manifest(config),
         "records": store.audit.total_samples,
         "labels": store.audit.label_count,
         "split_counts": store.audit.split_counts,
@@ -131,18 +132,19 @@ def visualize_experiment(experiment_dir: str | Path, output_dir: str | Path | No
     rounds = [record["round_index"] for record in records]
     labeled = [record["labeled_count"] for record in records]
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.4))
+    metric_names = [
+        name
+        for name, value in records[0]["test_metrics"].items()
+        if isinstance(value, (int, float))
+    ]
     for index, split in enumerate(("validation", "test")):
-        for metric, color in (
-            ("recall_at_10", COLORS[0]),
-            ("recall_at_20", COLORS[1]),
-            ("recall_at_30", COLORS[2]),
-        ):
+        for metric_index, metric in enumerate(metric_names):
             axes[index].plot(
                 labeled,
                 [record[f"{split}_metrics"][metric] for record in records],
                 marker="o",
                 label=metric,
-                color=color,
+                color=COLORS[metric_index % len(COLORS)],
             )
         axes[index].set(xlabel="Labeled admissions", ylabel="Metric", title=split.title())
         axes[index].grid(alpha=0.2)
@@ -194,16 +196,33 @@ def visualize_experiment(experiment_dir: str | Path, output_dir: str | Path | No
 
     test_labels = prediction["test_labels"]
     test_probs = prediction["test_probabilities"]
-    top_30 = np.argsort(-test_probs, axis=1, kind="stable")[:, :30]
-    hits = np.take_along_axis(test_labels, top_30, axis=1).sum(axis=1)
-    visit_recall = hits / test_labels.sum(axis=1)
     fig, axis = plt.subplots(figsize=(9, 5))
-    axis.hist(visit_recall, bins=40, range=(0, 1), color=COLORS[2], edgecolor="white")
-    axis.set(xlabel="Per-visit test Recall@30", ylabel="ICU visits", xlim=(0, 1))
+    if "recall_at_30" in metric_names:
+        top_30 = np.argsort(-test_probs, axis=1, kind="stable")[:, :30]
+        hits = np.take_along_axis(test_labels, top_30, axis=1).sum(axis=1)
+        visit_recall = hits / test_labels.sum(axis=1)
+        values = visit_recall
+        xlabel = "Per-stay test Recall@30"
+        filename = "test_per_stay_recall_at_30.png"
+    else:
+        from sklearn.metrics import average_precision_score
+
+        positives = test_labels.sum(axis=0)
+        valid = positives > 0
+        values = np.asarray(
+            [
+                average_precision_score(test_labels[:, index], test_probs[:, index])
+                for index in np.flatnonzero(valid)
+            ]
+        )
+        xlabel = "Per-label test AUPRC"
+        filename = "test_per_label_auprc.png"
+    axis.hist(values, bins=40, range=(0, 1), color=COLORS[2], edgecolor="white")
+    axis.set(xlabel=xlabel, ylabel="Count", xlim=(0, 1))
     axis.grid(axis="y", alpha=0.2)
     fig.tight_layout()
-    files["per_visit"] = "test_per_visit_recall_at_30.png"
-    fig.savefig(output / files["per_visit"], dpi=_SAVE_DPI)
+    files["score_distribution"] = filename
+    fig.savefig(output / filename, dpi=_SAVE_DPI)
     plt.close(fig)
 
     report = {"experiment": str(experiment), "output_dir": str(output), "files": files}
@@ -217,15 +236,37 @@ def compare_experiments(
     if len(experiment_dirs) != len(names):
         raise ValueError("one display name is required for each experiment")
     curves: dict[str, Any] = {}
+    primary_metric: str | None = None
     fig, axis = plt.subplots(figsize=(8, 5))
     for position, (directory, name) in enumerate(zip(experiment_dirs, names)):
         state = json.loads((Path(directory) / "active_state.json").read_text(encoding="utf-8"))
+        protocol = state.get("protocol", {})
+        current_metric = (
+            str(protocol.get("primary_metric"))
+            if isinstance(protocol, dict) and protocol.get("primary_metric")
+            else "recall_at_30"
+        )
+        if primary_metric is None:
+            primary_metric = current_metric
+        elif current_metric != primary_metric:
+            raise ValueError(
+                f"cannot compare experiments with different primary metrics: "
+                f"{primary_metric} and {current_metric}"
+            )
         x = [record["labeled_count"] for record in state["records"]]
-        y = [record["test_metrics"]["recall_at_30"] for record in state["records"]]
+        y = [record["test_metrics"][current_metric] for record in state["records"]]
         area = float(np.trapezoid(y, x) / max(x[-1] - x[0], 1)) if len(x) > 1 else y[0]
-        curves[name] = {"labeled": x, "test_recall_at_30": y, "normalised_area": area}
+        curves[name] = {
+            "labeled": x,
+            f"test_{current_metric}": y,
+            "normalised_area": area,
+        }
         axis.plot(x, y, marker="o", label=name, color=COLORS[position % len(COLORS)])
-    axis.set(xlabel="Labeled ICU visits", ylabel="Test Recall@30", title="Active-learning comparison")
+    axis.set(
+        xlabel="Labeled ICU stays",
+        ylabel=f"Test {primary_metric}",
+        title="Active-learning comparison",
+    )
     axis.grid(alpha=0.2)
     axis.legend()
     fig.tight_layout()
