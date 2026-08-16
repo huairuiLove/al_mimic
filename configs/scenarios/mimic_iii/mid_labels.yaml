@@ -1,0 +1,18 @@
+# Scenario B: drop the head of the label distribution.
+#
+# On the full 915-group task the label prior alone reaches R@30 0.4597 against a
+# full-pool ceiling of 0.5418, so 85% of the metric is available without
+# learning anything and every arm collects it equally. Dropping the 30 most
+# frequent groups takes the prior to 0.3405 and leaves the mid-frequency band,
+# where recall is still 0.358 (ranks 31-100) and 0.078 (ranks 101-300), as the
+# part of the metric that acquisition can actually move.
+#
+# Frequency is ranked on train rows only, so the subset carries no test
+# information.
+
+extends: ../../tasks/mimic_iii/icd9_diagnoses.yaml
+
+scenario:
+  name: mid_labels_drop_top30
+  label_subset:
+    drop_top_k: 30

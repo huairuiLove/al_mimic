@@ -1,163 +1,152 @@
-# Base task: MIMIC-III multimodal multi-label diagnosis prediction
+# Base task: MIMIC-III multimodal diagnosis
 
-## 1. Baseline source
+## Scope and status
 
-The common classifier for every active-learning method is **BertEncoder** from:
+This task is the `mimic_iii` plugin with native task ID `icd9_diagnoses`. One
+query labels one ICU stay. The first-party implementation is under
+`src/al_mimic/tasks/mimic_iii`, and all supported operations use `al-mimic`.
 
-- Bo Yang and Lijun Wu. *How to Leverage Multimodal EHR Data for Better Medical Predictions?*
-  EMNLP 2021: https://aclanthology.org/2021.emnlp-main.329/
-- Official implementation: https://github.com/emnlp-mimic/mimic
+The current executable contract is a local Yang-Wu/FIDDLE rebuild, not an exact
+copy of the artifact reported in the paper:
 
+| Item | Paper reference | Current local contract |
+|---|---:|---:|
+| ICU visits | 10,210 | 10,258 |
+| diagnosis labels | 1,042 | 915 |
+| hourly feature width | 7,411 | 7,749 |
+| time-invariant width | 97 | 97 |
+| observation window | 48 hours | 48 hours |
+| note length | 512 tokens | 512 tokens |
 
-## 2. Cohort and prediction target
+Completed six-round experiment directories for Random, CoMAL, MM-CoMAL, MoDIS,
+and MoSAIC are present locally under `experiments/`. They contain checkpoints,
+state, final metrics, predictions, and resolved configs. They are ignored by Git.
+The configured HDF5 target is currently a broken symbolic link to an absolute
+path on another host. A fresh `validate-data` therefore fails in this workspace,
+so the recorded outputs should not be treated as proof that the current data
+layout is immediately rerunnable.
 
-The formal task is the paper's **Diagnoses** task, not CAML full-label coding:
+## Provenance and reproduction boundary
 
-| Item | Formal setting |
+The task follows Yang and Wu, *How to Leverage Multimodal EHR Data for Better
+Medical Predictions?*
+
+- Paper: https://aclanthology.org/2021.emnlp-main.329/
+- Author code: https://github.com/emnlp-mimic/mimic
+- FIDDLE: https://github.com/MLD3/FIDDLE
+
+The maintained classifier, loaders, metrics, and acquisition adapters are
+package-local. Upstream work is a conceptual and protocol source; no external
+source checkout is imported or executed. Because the local dimensions differ,
+results must be described as the 915-label local rebuild, not as a numerical
+reproduction of the 1,042-label paper task.
+
+## Cohort, target, and inputs
+
+The formal configuration uses MIMIC-III v1.4 MetaVision ICU stays, a 48-hour
+observation window, and a fixed train/validation/test partition. The target is a
+915-dimensional multi-hot vector of current-visit three-digit ICD-9 diagnosis
+groups.
+
+Every sample requires all three modalities:
+
+1. Clinical notes within the 48-hour window, tokenized to 512 WordPiece tokens.
+2. FIDDLE hourly time-series tensors with shape `[48, 7749]` in the local build.
+3. A 97-dimensional FIDDLE time-invariant vector.
+
+The HDF5 group is `with_notes/{train,val,test}`. It must contain `X`, `s`,
+`input_ids`, `token_type_ids`, `attention_mask`, `label`, and a row-aligned
+`SUBJECT_ID` or `subject_id`. MoDIS uses the subject identifier for grouped
+out-of-fold probes; a global row index is not an acceptable substitute.
+
+`al-mimic prepare` audits an already-built HDF5 and ClinicalBERT checkpoint and
+writes a provenance manifest. It does not reconstruct FIDDLE tensors from raw
+MIMIC tables.
+
+## Classifier
+
+`YangWuBertEncoderClassifier` implements the task-owned classifier:
+
+- ClinicalBERT produces the note representation and is fine-tuned;
+- a linear/ReLU path encodes the 97 time-invariant features;
+- a projected three-layer, 16-head Transformer encodes the hourly features;
+- a MAG-style gate fuses structured paths into the note representation;
+- a linear head emits 915 independent logits.
+
+Training uses BCE with logits and sigmoid probabilities. This follows the
+multi-label objective rather than reproducing an upstream softmax-before-BCE
+inconsistency. Each active-learning round starts from the same ClinicalBERT
+source and freshly initializes the other model, method, and optimizer state.
+
+## Active-learning protocol
+
+The configured diagnosis experiments use six cold-start rounds at cumulative
+fractions 10%, 15%, 20%, 25%, 30%, and 35% of the actual train pool. Counts use
+half-up rounding. Validation and test rows are fixed and never queried.
+
+The task plugin declares support for all five registered methods:
+
+| Method | Task-provided inputs |
 |---|---|
-| Database | MIMIC-III v1.4 |
-| Source system | MetaVision, 2008-2012 |
-| Observation window | First 48 hours of an ICU visit |
-| Samples after filtering | 10,210 ICU visits |
-| Split | Official 7:1.5:1.5 train/validation/test partition |
-| Target | Current-visit diagnoses |
-| Labels | 1,042 three-digit ICD-9 diagnosis groups |
-| Target representation | Multi-hot vector |
+| `random` | ICU-stay IDs and query budget |
+| `comal` | fused probabilities and label-prototype evidence |
+| `mm_comal` | note, time-series, time-invariant, and fused views |
+| `modis` | modality tokens, grouped probes, and token interventions |
+| `mosaic` | modality coalitions, labeled outputs, and fixed validation reference outputs |
 
-The exact train/validation/test row counts are read from the official
-`splits.hdf5/with_notes` artifact. They are not estimated or replaced with a new
-random split. Their sum must equal 10,210 or preparation fails.
+Every round has an 80-epoch ceiling, a 1,200 optimizer-step budget, and
+validation-loss early stopping. No prior-round classifier or optimizer state is
+inherited.
 
-## 3. Input modalities
+## Evaluation
 
-All three paper modalities are mandatory:
+The native metrics are Recall@10, Recall@20, and Recall@30. Recall is calculated
+per ICU stay as the fraction of positive diagnoses found in the top-k scores and
+then averaged. Recall@30 is the primary metric.
 
-1. **Clinical notes**: notes charted in `[0, 48]` hours. The latest note for each
-   `CATEGORY/DESCRIPTION` group is concatenated and tokenized to 512 WordPiece
-   tokens by the official preprocessing code.
-2. **Time-series data**: FIDDLE hourly features with shape `[48, 7411]`, including
-   vital signs, laboratory measurements, medications, and missingness/value
-   encodings produced by FIDDLE.
-3. **Time-invariant data**: FIDDLE vector with 97 dimensions.
+The paper's full-data values are references only. They are not repository
+results and are not directly comparable to a 915-label local rebuild.
 
-Only `splits.hdf5` group `with_notes` is accepted. Visits shorter than 48 hours,
-incorrect notes, and visits without notes have already been excluded by the
-official preprocessing protocol.
+## Data and artifacts
 
-## 4. Classifier
+The task config names:
 
-The classifier is the paper's best diagnosis model, **BertEncoder**:
+- a processed split HDF5 under `dataset/processed/`;
+- a ClinicalBERT checkpoint under `dataset/pretrained/`;
+- a preparation manifest directory under `dataset/prepared/`;
+- an experiment name below `experiments/`.
 
-- ClinicalBERT/BERT-base encodes the clinical note into 768 dimensions and is
-  fully fine-tuned.
-- A linear layer plus ReLU maps 97 time-invariant inputs to 64 dimensions.
-- A linear projection and a 3-layer, 16-head Transformer encoder map the 7,411
-  hourly features to a 1,024-dimensional time-series representation.
-- The clinical-note representation is the main modality. A MAG-style gate uses
-  the other two modalities to adjust it.
-- A linear head emits 1,042 diagnosis logits.
-- Dropout is `0.1`. AdamW uses weight decay `0.01`; multimodal layers use learning
-  rate `1e-4`, while ClinicalBERT starts at `2e-5` with `0.95` layer-wise decay.
-  The scheduler uses 10% linear warmup/decay, and gradient clipping is `1.0`.
+An active run writes:
 
-The paper defines independent binary cross entropy for this multi-label task.
-Therefore, this implementation trains with `BCEWithLogitsLoss` and uses sigmoid
-probabilities. The released upstream code applies a softmax before BCE, which is
-inconsistent with both Equation 7 and multi-label semantics; that coding
-inconsistency is deliberately not reproduced.
+- `checkpoints/round_000.pt` through `round_005.pt` and `checkpoints/final.pt`;
+- `active_state.json` with round records, selected IDs, and data usage;
+- `final_metrics.json` with validation/test recall values;
+- `final_predictions.npz` with aligned final predictions and labels;
+- `resolved_config.json`.
 
-## 5. Evaluation
+A full-data run writes equivalent final outputs below the experiment's
+`full_data/` directory. A visualization run consumes `active_state.json` and
+writes figures below `figures/`.
 
-Validation and test report exactly the diagnosis metrics in the paper:
+## Commands
 
-- Recall@10
-- Recall@20
-- Recall@30
+Use runnable configs under `configs/experiments/mimic_iii/`:
 
-Recall is computed per ICU visit as the fraction of its positive diagnoses found
-in the top-k predictions, then averaged across visits. AUROC, AUPRC, F1, and
-Precision@k are not formal result columns for this task.
+```bash
+uv run al-mimic validate-data \
+  --task mimic_iii \
+  --config configs/experiments/mimic_iii/random.yaml
 
-The paper's full-data reference values for BertEncoder are Recall@30 `0.587`,
-Recall@20 `0.490`, and Recall@10 `0.334`. These are reference values, not results
-claimed by this repository.
+uv run al-mimic active \
+  --task mimic_iii \
+  --method random \
+  --config configs/experiments/mimic_iii/random.yaml
 
-## 6. Active-learning protocol
+uv run al-mimic full-data \
+  --task mimic_iii \
+  --config configs/experiments/mimic_iii/full_cohort_random.yaml
+```
 
-Each method uses the same official training pool and the same seeded initial
-indices. The labeled schedule is calculated from the **actual official train
-split size**:
-
-| Round | Cumulative labeled fraction |
-|---:|---:|
-| 0 | 10% |
-| 1 | 15% |
-| 2 | 20% |
-| 3 | 25% |
-| 4 | 30% |
-| 5 | 35% |
-
-Counts use half-up rounding. The run output records the exact schedule, initial
-count, queried count, final labeled count, validation count, test count, and
-total 10,210-visit cohort size.
-
-For every round:
-
-1. Reload the same ClinicalBERT source checkpoint.
-2. Reinitialize the static encoder, time-series encoder, fusion gate, diagnosis
-   head, acquisition auxiliaries, and optimizer.
-3. Train with an 80-epoch ceiling and the same 1,200-optimizer-step budget in
-   every round (roughly the former 20-epoch budget at the largest round); stop
-   early after five validation-loss checks without a `1e-4` improvement and
-   restore the best classifier/acquisition state.
-4. Never load a prior-round checkpoint or inherit optimizer state.
-5. Evaluate on the fixed validation and test splits.
-6. Query 5% of the original train pool unless this is the final round.
-
-There are no smoke, dry-run, row-limit, batch-limit, or shortened-budget formal
-configurations.
-
-## 7. Four acquisition methods
-
-All four methods receive the same classifier outputs. For modality-aware methods,
-the frozen classifier exposes three 768-dimensional path-contribution tokens
-(notes, time series, time invariant) whose sum is exactly its fused feature.
-
-- **CoMAL**: one prototype per positive diagnosis group plus one shared negative
-  background prototype, so `1,042 + 1` prototypes.
-- **MM-CoMAL**: separate prototype banks for notes, time series, time invariant,
-  and fused views, so `4 x (1,042 + 1)` prototypes; reliability-weighted evidence
-  and cross-view dispersion determine acquisition.
-- **MoDIS**: stop-gradient per-modality probes, `SUBJECT_ID`-grouped
-  out-of-fold reliability, modality disagreement, intervention instability,
-  and a sufficiency penalty.
-- **MoSAIC**: Fisher-design screening, eight coalitions over three modalities,
-  on-manifold token interventions, Mobius additive/synergy decomposition, and
-  greedy Fisher deflation. Its Fisher residual reference set is the fixed
-  validation split; the labeled train set supplies the information matrix, and
-  the test split is never used for acquisition.
-
-For CoMAL and MM-CoMAL, the auxiliary branch is optimized jointly with the
-classifier on each labeled batch. Its input feature/tokens are detached, so
-the auxiliary loss updates only the CoMAL branch; the classifier still receives
-gradients from its BCE objective.
-
-These are acquisition strategies. None may change the baseline classifier,
-cohort, labels, split, optimization budget, or evaluation metrics.
-
-## 8. Required private artifacts
-
-Formal execution requires:
-
-1. The official Yang-Wu/FIDDLE diagnosis artifact at
-   `features/outcome=Diagnoses,T=48.0,dt=1.0/splits.hdf5`.
-2. Group `with_notes` containing `train`, `val`, and `test` with arrays `X`, `s`,
-   `input_ids`, `token_type_ids`, `attention_mask`, `label`, and a row-aligned
-   `SUBJECT_ID` (or `subject_id`) array. The identifier is required for
-   patient-grouped MoDIS OOF folds; global row indices are not valid substitutes.
-3. The ClinicalBERT BERT-base state dictionary used as the common source
-   initialization.
-4. CUDA hardware capable of training the approximately 150M-parameter model.
-
-The repository fails loudly if these private inputs or their exact dimensions
-are missing. It never substitutes synthetic tensors or a smaller model.
+Run `validate-data` successfully before starting a new training run. Fix the
+local dataset/config path mismatch rather than pointing execution at an
+upstream source directory.

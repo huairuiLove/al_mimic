@@ -1,0 +1,27 @@
+experiment:
+  name: mds_ed_diagnoses_native_temporal_adapter
+  output_dir: ../../../experiments/mds_ed/diagnoses_native_temporal_adapter
+
+task:
+  family: mds_ed
+  id: diagnoses
+  native_multilabel: true
+  query_unit: ecg_study
+
+dataset:
+  release_csv: ../../../dataset/raw/mds-ed-1.0.0/mds_ed.csv
+  ecg_root: ../../../dataset/raw/mimic-iv-ecg-1.0
+  prepared_dir: ../../../dataset/prepared/mds_ed
+
+training:
+  task: diagnoses
+  epochs: 20
+  batch_size: 64
+  learning_rate: 0.001
+  weight_decay: 0.001
+  device: cuda
+  num_workers: 12
+  model_dim: 512
+  temporal_layers: 4
+  tabular_dim: 128
+  dropout: 0.1

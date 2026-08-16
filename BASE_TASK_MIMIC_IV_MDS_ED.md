@@ -1,137 +1,128 @@
-# Base task: MIMIC-IV-Ext-MDS-ED multimodal diagnosis prediction
+# Base task: MIMIC-IV MDS-ED diagnosis prediction
 
-This is a separate base task from the MIMIC-III Yang-Wu task. It follows
-Lopez Alcaraz et al., *MIMIC-IV-Ext-MDS-ED: Multimodal Decision Support in the
-Emergency Department*, and the released benchmark implementation:
+## Scope and current status
+
+This task is the `mds_ed` plugin. It prepares the MIMIC-IV-Ext-MDS-ED release
+and trains a package-local supervised diagnosis model. One row maps an ECG study
+to a 1,428-dimensional ICD-10-CM multi-hot target.
+
+The current plugin is explicitly `supervised_only`. Its actions are `prepare`,
+`validate-data`, `train`, and `hardware`; it has no `active` action and supports
+none of the acquisition methods. The local release CSV and extracted
+MIMIC-IV-ECG source are present, but `dataset/prepared/mds_ed/` and supervised
+training outputs are not present.
+
+## Sources and MIT provenance
 
 - Paper: https://arxiv.org/abs/2407.17856
-- PhysioNet release: https://physionet.org/content/multimodal-emergency-benchmark/1.0.0/
-- Code: https://github.com/AI4HealthUOL/MDS-ED
+- MDS-ED release: https://physionet.org/content/multimodal-emergency-benchmark/1.0.0/
+- Author code: https://github.com/AI4HealthUOL/MDS-ED
+- MIMIC-IV-ECG: https://physionet.org/content/mimic-iv-ecg/1.0/
 
-## 1. Formal target
+The package-local preparation and task integration preserve the upstream MIT
+license and notice in `src/al_mimic/tasks/mds_ed/LICENSE` and
+`src/al_mimic/tasks/mds_ed/NOTICE`. Runtime code uses only the package-local
+implementation and official data files.
 
-The diagnosis task is multi-label ICD-10-CM prediction. Each ECG/ED encounter
-has a 1,428-dimensional multi-hot target. Codes are converted to five digits
-and parent codes are propagated through the third digit, following
-MIMIC-IV-ECG-Ext-ICD. This is not the MIMIC-III ICD-9/CAML task and must not be
-merged with the 1,042-label Yang-Wu configuration.
+## Important model boundary
 
-The official paper cohort contains 71,098 patients, 121,195 visits and 129,057
-ECG samples. The PhysioNet table should be audited at runtime because release
-metadata reports a slightly different row/column count across versions. The
-actual CSV dimensions, label count and fold counts are recorded by the
-preparation command rather than guessed.
+The published deep-learning baseline uses an S4 waveform encoder. The current
+`NativeMdsEdTemporalAdapter` instead uses four residual depthwise/pointwise
+convolutional temporal blocks, mean pooling, and a three-layer tabular MLP.
 
-## 2. Data to download
+It preserves the broad four-layer temporal plus tabular fusion shape, but it is
+**not a word-for-word, operator-for-operator, or numerically equivalent
+implementation of the upstream S4 benchmark**. Its checkpoint records backend
+`native_temporal_adapter`. Results must use that name and must not be reported as
+an exact S4 reproduction, even though the current config and output directory
+names retain `s4` as historical protocol naming.
 
-### Recommended training path
+## Data contract
 
-Download the prepared MDS-ED table and the fully extracted ECG waveform directory:
+The recommended inputs are:
 
-1. `mds_ed.csv` from MIMIC-IV-Ext-MDS-ED v1.0.0.
-2. The extracted `mimic-iv-ecg_1.0/` directory from MIMIC-IV-ECG v1.0.
+- `dataset/raw/mds-ed-1.0.0/mds_ed.csv` from MDS-ED v1.0.0;
+- the extracted `dataset/raw/mimic-iv-ecg-1.0/` waveform tree.
 
-The prepared table already contains the MIMIC-IV and MIMIC-IV-ED-derived
-demographics, biometrics, vital-sign trends, laboratory-value trends, labels,
-and official fold assignment. Raw MIMIC-IV tables are not needed again for
-training when this table is used.
+The prepared MDS-ED table already contains engineered demographics, biometrics,
+vital/laboratory trends, labels, study/subject IDs, and fold assignments. Raw
+MIMIC-IV and MIMIC-IV-ED tables are not read by the current `prepare` action.
+They are needed only to reconstruct the release table outside this runtime path.
 
-Prepare the ECG memmap and audit the table with:
+The release audit verifies required columns, 470 raw clinical features, 1,428
+diagnosis labels, fold values, and study identifiers. Preparation then:
+
+1. Discovers every ECG study referenced by the release CSV.
+2. Resamples each 12-lead waveform to 100 Hz and produces 1,000 samples.
+3. Interpolates internal missing values, zero-fills boundary gaps, and clips
+   amplitude to 3 mV.
+4. Builds ECG memmaps and a study-to-record index.
+5. Fits tabular medians and categorical values on training folds only.
+6. Writes continuous/categorical feature shards, missingness masks, labels, and
+   provenance manifests.
+
+The official 20-fold split is preserved: folds 0-17 train, 18 validation, and 19
+test. Validation and test retain only the first ECG within a stay; all training
+ECGs are retained.
+
+## Training and evaluation status
+
+The native trainer uses AdamW, BCE with logits, learning rate `1e-3`, weight
+decay `1e-3`, batch size 64, 20 epochs, model dimension 512, four temporal
+blocks, and a 128-dimensional tabular branch.
+
+The published diagnosis endpoint uses macro AUROC with a 1,000-sample empirical
+bootstrap confidence interval. The current package trainer does **not** yet
+implement that benchmark evaluation: it records train and validation BCE loss,
+saves the final checkpoint, and does not produce test macro AUROC or bootstrap
+intervals. Consequently, the current MDS-ED integration is a preparation and
+native supervised-training adapter, not a completed published benchmark or an
+active-learning result.
+
+## Commands
+
+Install optional data dependencies, then prepare from the configured release and
+ECG paths:
 
 ```bash
-cd MDS-ED-main/src
-python prepare_release.py \
-  --mdsed-csv data/mds_ed.csv \
-  --ecg-path data/mimic-iv-ecg_1.0 \
-  --output data/memmap
+uv sync --dev --extra mds-ed
+
+uv run al-mimic prepare \
+  --task mds_ed \
+  --config configs/experiments/mds_ed/diagnoses.yaml
 ```
 
-`prepare_release.py` requires an already extracted `mimic-iv-ecg_1.0`
-directory via `--ecg-path` and auto-discovers the extracted layout when the
-complete `MDS-ED-main` directory is uploaded. ZIP files are not supported. The release
-contains 129,057 ECG rows and 1,428 diagnosis columns; rows with no positive
-diagnosis code are valid negative examples and are retained.
-
-After conversion, validate the row-to-waveform mapping and metadata:
+Preparation writes under `dataset/prepared/mds_ed/` and can resume by default.
+Use `--no-resume` to rebuild waveform preparation. CLI path overrides are
+available when official files are stored elsewhere:
 
 ```bash
-python prepare_release.py \
-  --mdsed-csv data/memmap/mds_ed.csv \
-  --output data/memmap \
-  --validate-prepared
+uv run al-mimic prepare \
+  --task mds_ed \
+  --config configs/experiments/mds_ed/diagnoses.yaml \
+  --release-csv /path/to/mds_ed.csv \
+  --ecg-root /path/to/mimic-iv-ecg-1.0 \
+  --prepared-dir /path/to/prepared-mds-ed
 ```
 
-Do not pass MDS-ED files to `main.py` or `mimic_comal`; those commands belong to
-the independent MIMIC-III Yang-Wu task.
+Validate the release and prepared memmap, then train:
 
-### Optional raw reconstruction path
+```bash
+uv run al-mimic validate-data \
+  --task mds_ed \
+  --config configs/experiments/mds_ed/diagnoses.yaml
 
-Only use this when reproducing the dataset table itself. It requires the
-credentialed parent releases and the exact files consumed by the upstream
-preprocessor:
+uv run al-mimic train \
+  --task mds_ed \
+  --config configs/experiments/mds_ed/diagnoses.yaml
+```
 
-| Source | Required files |
-|---|---|
-| MIMIC-IV-ECG-Ext-ICD v1.0.1 | `records_w_diag_icd10.csv` |
-| MIMIC-IV-ECG v1.0 | extracted matched-subset waveform directory (`.hea`/`.dat`) |
-| MIMIC-IV v2.2 | `admissions.csv.gz`, `diagnoses_icd.csv.gz`, `d_labitems.csv.gz`, `labevents.csv.gz`, `icustays.csv.gz`, `procedures_icd.csv.gz`, `omr.csv.gz` |
-| MIMIC-IV-ED v2.2 | `edstays.csv.gz`, `diagnosis.csv.gz`, `pyxis.csv.gz`, `vitalsign.csv.gz`, `triage.csv.gz` |
+## Artifacts
 
-All four source releases require PhysioNet credentialing, CITI training and a
-data-use agreement. Pin these versions; do not mix MIMIC-IV v3.x or another
-ECG-Ext-ICD release with the v1.0.0 benchmark.
+Preparation writes `mds_ed.csv`, waveform memmap files, `memmap_meta.npz`,
+`df_memmap.pkl`, `ecg_prepare_manifest.jsonl`, `tabular_spec.json`, tabular NPZ
+shards, `tabular_manifest.json`, and `manifest.json` in the prepared directory.
 
-## 3. Inputs and preprocessing
-
-Each sample uses a single 10-second, 12-lead ECG and 470 engineered clinical
-features from the first 90 minutes after ED arrival:
-
-- demographics;
-- biometrics (height, weight, BMI);
-- vital parameters and trends;
-- laboratory values and trends.
-
-Chief complaints and prior medications are excluded. ECG is resampled to 100 Hz,
-missing signal values are linearly interpolated, boundary gaps are zero-filled,
-and amplitude is clipped to 3 mV. Tabular missing values are median-imputed from
-the training folds only, with one binary mask feature for each imputed variable.
-
-## 4. Official split and evaluation
-
-The supplied `general_strat_fold` has 20 stratified folds: folds `0..17` are
-training, `18` validation/model selection, and `19` test. Training retains all
-ECGs; validation and test retain only the first ECG in each stay, identified by
-`general_ecg_no_within_stay == 0`, to avoid repeated-ECG evaluation bias.
-
-The formal diagnosis metric is macro AUROC with 1,000 empirical bootstrap
-iterations and a 95% confidence interval. Binary cross-entropy with logits is
-used for the 1,428 independent labels. Recall@K, F1 and thresholded accuracy
-are not substitutes for the published primary metric.
-
-## 5. Published multimodal base model
-
-The paper's multimodal deep-learning base is:
-
-- four-layer S4 waveform encoder, state size 8, model dimension 512;
-- three-layer tabular MLP;
-- embedding layers for categorical gender, race and acuity, then concatenation
-  of ECG and tabular representations;
-- AdamW, learning rate `1e-3`, weight decay `1e-3`, constant schedule,
-  batch size `64`, 20 epochs;
-- model selection by validation macro AUROC.
-
-The corrected diagnosis config is
-`MDS-ED-main/src/conf/config_supervised_multimodal_mdsed_diagnoses_s4.yaml`.
-The upstream YAML previously used 250 ECG samples, batch 32, 40 epochs and no
-missingness columns; those values are not the paper base.
-
-## 6. Active-learning adapter contract
-
-For comparison with the existing active-learning experiments, the MDS-ED
-adapter must keep the base task fixed and apply the same six cold-start rounds:
-10%, 15%, 20%, 25%, 30%, 35% of the official training pool, with a fresh model
-and optimizer each round and a 5% query increment. Acquisition methods may
-rank training ECG encounters, but may not alter the 1,428-label target, fold
-assignment, 90-minute observation window, waveform preprocessing, or macro
-AUROC evaluation. This adapter is a separate integration target; the current
-Yang-Wu runner does not silently treat MDS-ED as MIMIC-III data.
+Training writes `native_temporal_adapter.pt` and `training_summary.json` below
+the configured experiment output. No active-learning state or query artifacts
+are expected for this task in its current supervised-only form.

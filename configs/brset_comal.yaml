@@ -1,7 +1,0 @@
-extends: brset_base.yaml
-
-experiment:
-  name: brset_v1_0_2_resnet50_metadata_comal
-
-active_learning:
-  strategy: comal

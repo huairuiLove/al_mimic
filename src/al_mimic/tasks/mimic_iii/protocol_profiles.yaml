@@ -1,0 +1,19 @@
+yang_wu_diagnoses_48h:
+  observation_hours: 48
+  timestep_hours: 1
+  max_note_tokens: 512
+  expected_total_samples: 10258
+  expected_label_count: 915
+  time_invariant_dim: 97
+  time_series_dim: 7749
+  note_protocol: latest_per_category_description_within_48h
+
+yang_wu_diagnoses_12h:
+  observation_hours: 12
+  timestep_hours: 1
+  max_note_tokens: 512
+  expected_total_samples: null
+  expected_label_count: null
+  time_invariant_dim: null
+  time_series_dim: null
+  note_protocol: latest_per_category_description_within_12h

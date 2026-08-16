@@ -1,0 +1,4 @@
+extends: ../../methods/brset/mosaic.yaml
+
+task:
+  family: brset

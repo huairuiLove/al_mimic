@@ -7,32 +7,21 @@ __pycache__/
 build/
 dist/
 *.egg-info/
-prepared/
-experiments/
-data/
-pretrained/
+/dataset/prepared/
+/experiments/
+/dataset/processed/
+/dataset/pretrained/
+/dataset/raw/
 tmp/
 .cursor/
+.zcode/
 mimic-iii-clinical-database-1.4/
 mimic-iii-clinical-database-1.4.zip
-brazilian-ophthalmological_1.0.2/
-# Duplicate of third_party/FIDDLE-experiments; keep one copy in git.
-FIDDLE-experiments-master/
-FIDDLE-experiments-master.zip
+dataset/raw/brset-1.0.2/
 
-# Credentialed MIMIC-IV/MDS-ED releases stay on the data server, not GitHub.
-MDS-ED-main/mimic-iv-*/
-MDS-ED-main/mimic-iv-*.zip
-MDS-ED-main/mimic-iv-ext-*/
-MDS-ED-main/mimic-iv-ext-*.zip
-
-# Upstream CoMAL caches/weights are too large for GitHub's 100MB blob limit.
-CoMAL-main/data/
-CoMAL-main/dataset/
-CoMAL-main/bert/**/*.bin
-CoMAL-main/bert/**/*.safetensors
-CoMAL-main/__pycache__/
-CoMAL-main/model_saved/
-
-CoMAL-main/.idea/
-CoMAL-main/.claude/
+# Local upstream checkouts are for manual comparison only. Runtime code must
+# never import or execute files from these directories.
+/thirdparty/
+/third_party/
+/CoMAL-main/
+/MDS-ED-main/

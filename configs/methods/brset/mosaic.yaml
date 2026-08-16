@@ -1,0 +1,20 @@
+extends: ../../tasks/brset/base.yaml
+
+experiment:
+  name: brset_v1_0_2_resnet50_metadata_mosaic
+
+active_learning:
+  strategy: mosaic
+
+mosaic:
+  eta: 0.25
+  partners: 4
+  lambda_alpha: null
+  mixup_closure_samples: 2048
+  workset_size: 1000
+  synergy_workset_size: 500
+  deflation_steps: 1000
+  damping: 0.01
+  fusion_batch_size: 512
+  value_batch_size: 512
+  synergy_epsilon: 1.0e-8

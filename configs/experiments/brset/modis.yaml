@@ -1,0 +1,4 @@
+extends: ../../methods/brset/modis.yaml
+
+task:
+  family: brset

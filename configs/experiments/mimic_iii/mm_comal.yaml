@@ -1,0 +1,4 @@
+extends: ../../methods/mimic_iii/mm_comal.yaml
+
+task:
+  family: mimic_iii

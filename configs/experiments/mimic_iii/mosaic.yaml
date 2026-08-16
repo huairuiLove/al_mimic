@@ -1,0 +1,4 @@
+extends: ../../methods/mimic_iii/mosaic.yaml
+
+task:
+  family: mimic_iii

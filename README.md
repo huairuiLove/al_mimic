@@ -1,131 +1,189 @@
-# Multimodal active learning on MIMIC EHR benchmarks
+# al-mimic
 
-## Base tasks
+`al-mimic` is a first-party Python package for multimodal active-learning
+experiments on clinical prediction tasks. The maintained implementation lives
+under `src/al_mimic`; installed commands, task plugins, method plugins, data
+preparation, and experiment outputs all use that package.
 
-| Base | Dataset and target | Specification |
-|---|---|---|
-| Yang-Wu BertEncoder | MIMIC-III, 915 local ICD-9 groups (1,042 in paper) | [`BASE_TASK_MIMIC_III_MULTIMODAL.md`](BASE_TASK_MIMIC_III_MULTIMODAL.md) |
-| Acute-care phenotyping | MIMIC-III, 25 native multi-hot phenotypes | [`BASE_TASK_MIMIC_III_PHENOTYPING.md`](BASE_TASK_MIMIC_III_PHENOTYPING.md) |
-| Broad CCS phenotyping | MIMIC-III, 172 native multi-hot phenotypes | [`BASE_TASK_MIMIC_III_PHENOTYPING.md`](BASE_TASK_MIMIC_III_PHENOTYPING.md) |
-| MDS-ED S4 + MLP | MIMIC-IV/ECG, 1,428 ICD-10-CM labels | [`BASE_TASK_MIMIC_IV_MDS_ED.md`](BASE_TASK_MIMIC_IV_MDS_ED.md) |
-| BRSET ResNet-50 + metadata fusion | BRSET v1.0.2, 13 retinal disease labels | [`BASE_TASK_BRSET_MULTIMODAL.md`](BASE_TASK_BRSET_MULTIMODAL.md) |
+The project has one public command-line entry point: `al-mimic`. Old root
+scripts, legacy package commands, and commands executed from local upstream
+checkouts are not part of the supported interface.
 
-## MIMIC-III Yang-Wu base
+## Install and inspect
 
-The formal base classifier is Yang and Wu's **BertEncoder** for the MIMIC-III
-48-hour multi-label Diagnoses task. It jointly uses ClinicalBERT notes, FIDDLE
-hourly time-series features, and FIDDLE time-invariant features to predict 1,042
-three-digit ICD-9 groups. CAML is not used by any formal experiment.
-
-The complete fixed protocol is documented in
-[`BASE_TASK_MIMIC_III_MULTIMODAL.md`](BASE_TASK_MIMIC_III_MULTIMODAL.md).
-
-The MDS-ED task remains a separate integration target; its data and labels are
-never passed through this MIMIC-III runner.
-
-## MIMIC-III task registry
-
-The MIMIC runner now exposes three native multi-label tasks:
-
-```bash
-uv run python main.py tasks --config configs/mimic_comal.yaml
-```
-
-`icd9_diagnoses` preserves the existing 48-hour Yang-Wu protocol and
-Recall@10/20/30 evaluation. `phenotyping_25` and `phenotyping_ccs_172` use one
-complete ICU-stay label vector per query and are evaluated primarily by
-macro-AUPRC. Their author repositories, preprocessing adapters, provenance
-requirements, base-model adaptation boundary, and commands are documented in
-[`BASE_TASK_MIMIC_III_PHENOTYPING.md`](BASE_TASK_MIMIC_III_PHENOTYPING.md).
-
-Run MDS-ED only from its own directory after preparing its ECG memmap:
-
-```bash
-cd MDS-ED-main/src
-python prepare_release.py --audit-only
-python prepare_release.py --validate-prepared --output data/memmap
-python main_all.py --config-name config_supervised_multimodal_mdsed_diagnoses_s4
-```
-
-The root `main.py` and `mimic-comal` CLI are intentionally MIMIC-III-only; the
-MDS-ED loader, folds, labels and macro-AUROC evaluation stay under
-`MDS-ED-main/`.
-
-## BRSET multimodal base
-
-BRSET is implemented as an independent full-data runner. It fuses an ImageNet
-ResNet-50 fundus branch with pre-diagnostic clinical metadata and predicts 13
-independent disease labels. Its active-learning unit is the patient, so paired
-eye images remain together. The complete protocol, data counts, leakage rules,
-metrics, and commands are documented in
-[`BASE_TASK_BRSET_MULTIMODAL.md`](BASE_TASK_BRSET_MULTIMODAL.md).
-
-```bash
-python -m brset_al.cli prepare --config configs/brset_comal.yaml
-bash scripts/run_brset_four_methods.sh
-```
-
-## Formal methods
-
-| Config | Acquisition method |
-|---|---|
-| `configs/mimic_comal.yaml` | CoMAL |
-| `configs/mimic_mm_comal.yaml` | MM-CoMAL |
-| `configs/mimic_modis.yaml` | MoDIS |
-| `configs/mimic_mosaic.yaml` | MoSAIC |
-
-Every method runs six cold-start rounds at 10%, 15%, 20%, 25%, 30%, and 35% of
-the actual official train split. Each round reloads the same ClinicalBERT source,
-reinitializes every other model/optimizer parameter, and uses the same 1,200-step
-optimization budget (roughly the former 20-epoch budget at the largest round)
-with an 80-epoch ceiling and validation-loss early stopping.
-Evaluation reports only Recall@10, Recall@20, and Recall@30.
-
-## Required data
-
-Generate the official Yang-Wu/FIDDLE MIMIC-III artifact with the upstream code:
-
-https://github.com/emnlp-mimic/mimic
-
-Then set these paths in `configs/mimic_a800_144c.yaml`:
-
-```yaml
-dataset:
-  split_hdf5: data/yang_wu_mimic/features/outcome=Diagnoses,T=48.0,dt=1.0/splits.hdf5
-  clinicalbert_checkpoint: pretrained/clinicalbert/pytorch_model.bin
-```
-
-The loader requires `splits.hdf5/with_notes/{train,val,test}` and validates the
-paper dimensions: 10,210 visits total, 1,042 labels, `[48,7411]` time series,
-97 static features, 512 note tokens, and a row-aligned `SUBJECT_ID` (or
-`subject_id`) array. The subject identifier is used for MoDIS grouped OOF
-folds; global row indices are rejected as a substitute. No fallback or
-synthetic data path exists.
-
-The current executable artifact is the local Yang-Wu rebuild: 10,258 visits,
-915 diagnosis groups, and `[48,7749]` time-series tensors. The paper's
-10,210/1,042/7,411 dimensions above remain reference values, not the dimensions
-reported for local runs.
-
-`configs/mimic_full_cohort.yaml` is still the same Yang-Wu task and BertEncoder.
-It accepts only a separately rebuilt, larger Yang-Wu HDF5 that freezes the same
-48-hour input contract and 915-label vocabulary, with disjoint subject-grouped
-train/validation/test splits. Its cohort includes all MIMIC-III ICU care systems,
-so it is an extended-cohort Yang-Wu result rather than a reproduction of the
-paper's MetaVision cohort. Run that full-data upper bound with:
-
-```bash
-uv run python main.py full-data --config configs/mimic_full_cohort.yaml
-```
-
-## Run
+Python 3.10-3.13 is supported. From the repository root:
 
 ```bash
 uv sync --dev
-uv run python main.py validate-data --config configs/mimic_comal.yaml
-uv run scripts/run_four_methods.sh active
+uv run al-mimic tasks
+uv run al-mimic methods
+uv run al-mimic capabilities
 ```
 
-Each experiment writes six checkpoints, per-round metrics and queries,
-`active_state.json`, `final_metrics.json`, and final validation/test predictions.
-The `data_usage` block records the exact amount of data used.
+MDS-ED preparation additionally needs the optional data dependencies:
+
+```bash
+uv sync --dev --extra mds-ed
+```
+
+Every task command has the same shape:
+
+```text
+al-mimic ACTION --task TASK --config CONFIG [task-specific path options]
+al-mimic active --task TASK --method METHOD --config CONFIG
+```
+
+`--method` is required for `active` and rejected for all other actions. It must
+match `active_learning.strategy` in the resolved YAML.
+
+## Current task status
+
+The table separates implemented interfaces from artifacts observed in this
+workspace on 2026-08-16. Credentialed datasets and generated outputs are ignored
+by Git, so another checkout can have a different local-data status.
+
+| Task plugin | Native task | Query unit | Implemented actions | Local status |
+|---|---|---|---|---|
+| `mimic_iii` | `icd9_diagnoses` (915 labels) | ICU stay | `prepare`, `validate-data`, `explore`, `active`, `full-data`, `visualize`, `hardware` | Yang-Wu/FIDDLE tensors, ClinicalBERT, and completed six-round Random/CoMAL/MM-CoMAL/MoDIS/MoSAIC outputs are present; the configured HDF5 target is currently a broken cross-host symlink |
+| `mimic_iii` | `phenotyping_25` | ICU stay | same MIMIC-III actions | adapter and configs implemented; no task-specific processed HDF5, prepared manifest, or experiment output is present |
+| `mimic_iii` | `phenotyping_ccs_172` | ICU stay | same MIMIC-III actions | adapter and configs implemented; no task-specific processed HDF5, prepared manifest, or experiment output is present |
+| `brset` | BRSET v1.0.2, 13 labels | patient | `prepare`, `validate-data`, `active`, `full-data`, `hardware` | source release is present; prepared split and experiment outputs are not present |
+| `mds_ed` | MDS-ED diagnoses, 1,428 labels | ECG study | `prepare`, `validate-data`, `train`, `hardware` | release CSV and ECG source are present; prepared memmap and supervised output are not present |
+
+Task protocols and reproduction boundaries are detailed in:
+
+- [MIMIC-III multimodal diagnosis](BASE_TASK_MIMIC_III_MULTIMODAL.md)
+- [MIMIC-III phenotyping](BASE_TASK_MIMIC_III_PHENOTYPING.md)
+- [BRSET multimodal diagnosis](BASE_TASK_BRSET_MULTIMODAL.md)
+- [MIMIC-IV MDS-ED](BASE_TASK_MIMIC_IV_MDS_ED.md)
+
+## Capability matrix
+
+This is the compatibility declared by the task and method plugins. MDS-ED is
+currently supervised-only and therefore accepts no acquisition method.
+
+| Task | Random | CoMAL | MM-CoMAL | MoDIS | MoSAIC |
+|---|:---:|:---:|:---:|:---:|:---:|
+| `mimic_iii` | yes | yes | yes | yes | yes |
+| `brset` | yes | yes | yes | yes | yes |
+| `mds_ed` | no | no | no | no | no |
+
+Method requirements are explicit:
+
+| Method | Required task capabilities |
+|---|---|
+| `random` | candidate IDs and a query budget only |
+| `comal` | multi-label probabilities and label prototypes |
+| `mm_comal` | multi-label probabilities, modality tokens, and label prototypes |
+| `modis` | multi-label probabilities, modality tokens, and token fusion |
+| `mosaic` | multi-label probabilities, modality tokens, token fusion, and reference labels |
+
+The CLI validates the task action, method allow-list, required capabilities, and
+the method named in the resolved config before starting an experiment.
+
+## Run examples
+
+Validate and run one MIMIC-III experiment:
+
+```bash
+uv run al-mimic validate-data \
+  --task mimic_iii \
+  --config configs/experiments/mimic_iii/comal.yaml
+
+uv run al-mimic active \
+  --task mimic_iii \
+  --method comal \
+  --config configs/experiments/mimic_iii/comal.yaml
+```
+
+Prepare BRSET and run one declared method:
+
+```bash
+uv run al-mimic prepare \
+  --task brset \
+  --config configs/experiments/brset/random.yaml
+
+uv run al-mimic active \
+  --task brset \
+  --method random \
+  --config configs/experiments/brset/random.yaml
+```
+
+Prepare, validate, and train the package-local MDS-ED supervised adapter:
+
+```bash
+uv run al-mimic prepare \
+  --task mds_ed \
+  --config configs/experiments/mds_ed/diagnoses.yaml
+
+uv run al-mimic validate-data \
+  --task mds_ed \
+  --config configs/experiments/mds_ed/diagnoses.yaml
+
+uv run al-mimic train \
+  --task mds_ed \
+  --config configs/experiments/mds_ed/diagnoses.yaml
+```
+
+Build a metric matrix from completed experiment directories:
+
+```bash
+uv run al-mimic matrix \
+  --experiment experiments/mimic_iii_yang_wu_bertencoder_random \
+  --experiment experiments/mimic_iii_yang_wu_bertencoder_comal \
+  --output experiments/evaluation_matrix.csv
+```
+
+## Configuration
+
+Configuration is organized by responsibility:
+
+```text
+configs/
+|-- tasks/          # dataset, model, protocol, and task-owned training defaults
+|-- methods/        # acquisition-method overlays for a task family
+|-- scenarios/      # MIMIC-III missing-modality and label-subset overlays
+`-- experiments/    # runnable compositions passed to al-mimic
+```
+
+Use a file under `configs/experiments/` for normal runs. Its `extends` chain
+resolves task and method definitions. Paths without a `./` prefix are resolved
+from the repository working directory by the MIMIC-III loader; BRSET paths are
+resolved from the runnable config location. Run commands from the repository
+root and keep the checked-in config layout intact.
+
+## Data and outputs
+
+Local assets live under `dataset/`:
+
+```text
+dataset/raw/         credentialed source releases
+dataset/processed/   derived tensors and intermediate tables
+dataset/prepared/    validated manifests, splits, and MDS-ED memmaps
+dataset/pretrained/  external model checkpoints
+```
+
+See [dataset/README.md](dataset/README.md) for task-specific inputs, preparation
+outputs, and Git policy. Formal runs fail on missing or incompatible artifacts;
+they do not replace clinical data with synthetic examples.
+
+MIMIC-III and BRSET active/full-data runs write below the configured experiment
+directory. The active runners produce `checkpoints/`, `active_state.json`,
+`final_metrics.json`, `final_predictions.npz`, and `resolved_config.json`;
+task-specific audit/provenance files may also be present. MIMIC-III `visualize`
+writes `figures/`. MDS-ED preparation writes memmap and tabular manifests to its
+prepared directory, while supervised training writes
+`native_temporal_adapter.pt` and `training_summary.json`.
+
+`experiments/` and generated dataset directories are local outputs and are not
+tracked by Git. Do not infer benchmark completion from the presence of a config.
+
+## Architecture and provenance
+
+[ARCHITECTURE.md](ARCHITECTURE.md) defines the `tasks`, `methods`, `core`, and
+`utils` boundaries and gives extension checklists. [THIRD_PARTY_SOURCES.md](THIRD_PARTY_SOURCES.md)
+records conceptual sources, upstream URLs, and license provenance.
+
+Any local `thirdparty/` directory is an ignored, manual-comparison workspace.
+Production execution and tests have zero references to it. It is neither a data
+directory nor a supported execution path.

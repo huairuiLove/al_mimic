@@ -1,0 +1,21 @@
+extends: ../../methods/mimic_iii/random.yaml
+
+experiment:
+  name: mimic_iii_yang_wu_bertencoder_random_mixup
+
+active_learning:
+  strategy: random
+
+# Isolates the mixup contribution from the acquisition contribution: compared
+# against the plain random control, any gap here is due to mixup alone.
+# Settings match comal_mixup.yaml so the two arms stay comparable.
+mixup:
+  enabled: true
+  alpha: 1.0
+  weight: 1.0
+  pairing: targeted
+  anchor_quantile: 0.5
+  keep_anchor: true
+
+task:
+  family: mimic_iii

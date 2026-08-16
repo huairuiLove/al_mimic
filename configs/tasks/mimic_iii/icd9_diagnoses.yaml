@@ -1,0 +1,94 @@
+experiment:
+  name: mimic_iii_yang_wu_bertencoder_comal
+  output_root: ../../../experiments
+
+task:
+  family: mimic_iii
+  id: icd9_diagnoses
+  native_multilabel: true
+  query_unit: icu_stay
+
+dataset:
+  prepared_dir: ../../../dataset/prepared/yang_wu_diagnoses_48h
+  split_hdf5: ../../../dataset/processed/yang_wu_mimic/features/outcome=Diagnoses,T=48.0,dt=1.0/splits.hdf5
+  split_group: with_notes
+  clinicalbert_checkpoint: ../../../dataset/pretrained/clinicalbert/pytorch_model.bin
+
+preprocessing:
+  cohort: metavision
+  task: Diagnoses
+  observation_hours: 48
+  timestep_hours: 1
+  max_note_tokens: 512
+  expected_total_samples: 10258
+  expected_label_count: 915
+  time_invariant_dim: 97
+  time_series_dim: 7749
+  split_protocol: yang_wu_official_7_1.5_1.5
+  label_format: icd9_top3_multihot
+  note_protocol: latest_per_category_description_within_48h
+
+model:
+  architecture: yang_wu_bertencoder
+  initialization: clinicalbert_pretrained_fresh_fusion_each_round
+  output_activation: sigmoid
+  seed: 1337
+  text_hidden_dim: 768
+  time_invariant_hidden_dim: 64
+  time_series_hidden_dim: 1024
+  time_series_layers: 3
+  time_series_heads: 16
+  output_size: 915
+  dropout: 0.1
+
+comal:
+  label_dim: 8
+  prototype_dim: 8
+  temperature: 0.07
+  learning_rate: 0.001
+  reconstruction_weight: 0.2
+  classification_weight: 0.5
+  anchor_chunk_size: 1024
+  contrastive_label_sample_size: 256
+  cross_modal_weight: 0.15
+  negative_prototype: shared_background
+
+training:
+  seed: 17
+  device: cuda
+  precision: fp32
+  optimizer: adamw
+  loss: binary_cross_entropy
+  batch_size: 40
+  eval_batch_size: 400
+  epochs: 80
+  optimizer_steps_per_round: 1200
+  early_stopping_patience: 5
+  early_stopping_min_delta: 0.0001
+  learning_rate: 0.0001
+  bert_learning_rate: 0.00002
+  bert_layerwise_lr_decay: 0.95
+  weight_decay: 0.01
+  warmup_proportion: 0.1
+  gradient_clip: 1.0
+  inherit_across_rounds: false
+  num_workers: 12
+  pin_memory: true
+  allow_tf32: false
+  cudnn_benchmark: false
+
+active_learning:
+  strategy: comal
+  initial_fraction: 0.10
+  query_fraction: 0.05
+  rounds: 6
+
+evaluation:
+  primary_metric: recall_at_30
+  metrics:
+    - recall_at_10
+    - recall_at_20
+    - recall_at_30
+
+acquisition:
+  formula: paper

@@ -1,0 +1,18 @@
+extends: ../../tasks/mimic_iii/icd9_diagnoses.yaml
+
+experiment:
+  name: mimic_iii_yang_wu_bertencoder_mm_comal
+
+active_learning:
+  strategy: mm_comal
+
+acquisition:
+  formula: paper_mm
+  mm:
+    alpha: 1.0
+    reliability_shrinkage: 10.0
+    threshold_shrinkage: 10.0
+    threshold_estimator: shrunk
+    include_fused_in_weights: false
+    equal_weights: false
+    dispersion: weighted_mad

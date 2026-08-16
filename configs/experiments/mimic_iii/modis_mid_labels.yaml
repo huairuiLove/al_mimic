@@ -1,0 +1,11 @@
+# Dataset scenario first, method second: later parents win, so the method's own
+# strategy and tuning override the defaults the scenario base inherits.
+extends:
+  - ../../scenarios/mimic_iii/mid_labels.yaml
+  - ../../methods/mimic_iii/modis.yaml
+
+experiment:
+  name: mimic_iii_yang_wu_bertencoder_modis_mid_labels
+
+task:
+  family: mimic_iii

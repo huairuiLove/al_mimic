@@ -1,125 +1,125 @@
-# MIMIC-III native multi-label phenotyping tasks
+# Base tasks: MIMIC-III multimodal phenotyping
 
-This repository registers two phenotyping tasks alongside the existing ICD-9
-diagnosis task. In every task, one active-learning query is one ICU stay and the
-annotation returned by that query is one native multi-hot vector.
+## Scope and status
 
-## Task definitions
+The `mimic_iii` plugin includes two phenotyping task IDs alongside diagnosis:
 
-| Task id | Labels | Label source | Primary metric | Config |
+| Task ID | Labels | Label definition | Primary metric | Runnable configs |
 |---|---:|---|---|---|
-| `phenotyping_25` | 25 | MIMIC-III Benchmark acute-care groups | macro-AUPRC | `configs/mimic_phenotyping_25.yaml` |
-| `phenotyping_ccs_172` | 172 | HCUP CCS 2015 groups occurring in at least 30 episodes | macro-AUPRC | `configs/mimic_phenotyping_ccs_172.yaml` |
-| `icd9_diagnoses` | 915 | Three-digit ICD-9 groups in the local Yang-Wu rebuild | Recall@30 | `configs/mimic_comal.yaml` |
+| `phenotyping_25` | 25 | MIMIC-III Benchmark acute-care groups | macro-AUPRC | `configs/experiments/mimic_iii/phenotyping_25_*.yaml` |
+| `phenotyping_ccs_172` | 172 | HCUP CCS 2015 groups represented in at least 30 episodes | macro-AUPRC | `configs/experiments/mimic_iii/phenotyping_ccs_172_*.yaml` |
 
-The phenotype tasks also report micro-AUPRC, macro-AUROC, and micro-AUROC.
-Recall@30 is deliberately not computed for the 25-label task.
+One active-learning query is one ICU stay and returns its complete native
+multi-hot vector. The first-party task specs, adapters, preprocessing modules,
+model, metrics, and configs exist. In this workspace, neither task has its
+configured processed HDF5, prepared manifest, or experiment output. These tasks
+are implemented integration targets, not locally completed benchmarks.
 
-## Fixed upstream sources
+## Provenance and reproduction boundary
 
-The author repositories are checked out as Git submodules:
+The task definitions draw on:
 
-| Source | Pinned revision | Purpose |
-|---|---|---|
-| `third_party/mimic3-benchmarks` | `ea0314c7cbd369f62e2237ace6f683740f867e3a` | 25-label definitions, patient split, 76-feature structured preprocessing |
-| `third_party/multimodal-clinical-pretraining` | `655c26a23880950cc270df5681b981e6869e26df` | Published multimodal pretraining and phenotyping reference implementation |
-| `third_party/notes_benchmark` | `fa378b828fb1f832635c4259c3dff97ab81bd19d` | 172-label paper implementation and HCUP CCS definitions |
+- MIMIC-III Benchmark: https://github.com/YerevaNN/mimic3-benchmarks
+- Multimodal clinical pretraining: https://arxiv.org/abs/2312.06855
+- Its author code: https://github.com/kingrc15/multimodal-clinical-pretraining
+- 172-label multimodal phenotyping paper:
+  https://pmc.ncbi.nlm.nih.gov/articles/PMC8378600/
+- Its author code: https://github.com/amoldwin/notes_benchmark
 
-Initialize them after cloning this repository:
+Reference revisions are recorded in [THIRD_PARTY_SOURCES.md](THIRD_PARTY_SOURCES.md).
+They are provenance metadata, not runtime dependencies.
 
-```bash
-git submodule update --init --recursive
+The released multimodal-pretraining downstream script and this active-learning
+classifier are not identical. The package-local classifier keeps both note and
+measurement representations so multimodal methods can inspect and intervene on
+them. Results must not be described as a numerical reproduction of an upstream
+downstream script.
+
+The 172-label paper code also needs careful interpretation: its checked-in CCS
+definitions mark the original 25 benchmark groups by default. The package-local
+label builder enforces the paper's broader rule of CCS groups occurring in at
+least 30 episodes and fails unless the result contains exactly 172 labels.
+
+## Artifact contract
+
+Both tasks consume one HDF5 with `with_notes/{train,val,test}`. Each row contains:
+
+- hourly structured measurements and a time-series padding mask;
+- chronological notes from the ICU stay, tokenized to 512 tokens;
+- one native multi-hot label vector;
+- stable `subject_id` and `stay_id` values;
+- task and label-name metadata.
+
+The 25-label task uses the official 76-feature one-hour discretization and
+subject split. The 172-label task uses the notes-benchmark subject split and an
+explicit 172-column CCS label table. The adapter validates split leakage, binary
+labels, label width, feature width, and identifiers.
+
+The prepared HDF5 is expected at the path in the selected task config:
+
+```text
+dataset/processed/mimic_phenotyping_25/splits.hdf5
+dataset/processed/mimic_phenotyping_ccs_172/splits.hdf5
 ```
 
-MIMIC data, derived listfiles, HDF5 files, note indexes, and model weights are
-not stored in Git.
+`al-mimic prepare` validates that already-created HDF5 and ClinicalBERT
+checkpoint and writes `manifest.json` below the configured `dataset/prepared/`
+directory. The public CLI does not currently expose raw-table-to-HDF5
+construction as an action. Creating those HDF5 inputs is therefore a separate
+first-party preprocessing step that must be completed before the documented
+runtime commands can succeed.
 
-The task definitions are grounded in the
-[MIMIC-III Benchmark](https://github.com/YerevaNN/mimic3-benchmarks), the
-[multimodal pretraining paper](https://arxiv.org/abs/2312.06855) and its
-[author code](https://github.com/kingrc15/multimodal-clinical-pretraining), and
-the [172-label multimodal phenotyping paper](https://pmc.ncbi.nlm.nih.gov/articles/PMC8378600/)
-with its [author code](https://github.com/amoldwin/notes_benchmark).
+## Model and training
 
-The released 2023 downstream script disables its notes branch and fine-tunes
-only the measurement encoder. It is therefore pinned here as a published
-pretraining/architecture reference, not as an exact executable downstream
-baseline. The runner-native phenotype classifier instead uses ClinicalBERT
-notes, the official 76-feature hourly measurements, a structured Transformer,
-and a fusion gate. Keeping both modality representations is necessary for
-multimodal active acquisition. Results from this runner must not be described
-as a numerical reproduction of that upstream downstream script.
+The native classifier combines:
 
-## Important 172-label upstream detail
+- ClinicalBERT notes;
+- the 76-feature hourly measurement sequence;
+- a three-layer structured Transformer with masked mean pooling;
+- a fusion gate and independent sigmoid label head.
 
-The `notes_benchmark` repository is the code URL named by the 172-label paper,
-but its checked-in `hcup_ccs_2015_definitions.yaml` still marks only the original
-25 benchmark groups with `use_in_benchmark: True`. Running its default
-`create_phenotyping.py` therefore produces 25 labels, not 172.
+The 25-label head emits 25 logits; the CCS head emits 172. Training uses BCE with
+logits and the same cold-start rule as the diagnosis runner: each round reloads
+the same ClinicalBERT source and freshly initializes all other state.
 
-The paper defines the broader target as CCS groups represented by at least 30
-episodes. Build that label matrix from the author's filtered cohort tables with:
+The current phenotyping configs use six low-budget rounds with a 1% initial
+fraction and 1% increments, ending at 6% of the train pool. This differs from
+the 10%-35% schedule used by the MIMIC-III diagnosis and BRSET configs.
 
-```bash
-uv run python scripts/build_ccs_172_labels.py \
-  --stays-csv /path/to/notes_benchmark/root/all_stays.csv \
-  --diagnoses-csv /path/to/notes_benchmark/root/all_diagnoses.csv \
-  --output data/mimic_phenotyping_ccs_172/labels.csv
-```
+The task plugin declares Random, CoMAL, MM-CoMAL, MoDIS, and MoSAIC capability.
+Checked-in runnable phenotyping configs currently cover Random and CoMAL only.
+Other methods require a matching experiment config before they are runnable.
 
-The command fails unless the rule yields exactly 172 labels. It writes label
-names, positive counts, source revision, and threshold to a JSON manifest.
+## Evaluation
 
-## Unified multimodal artifact
+Both tasks report macro-AUPRC, micro-AUPRC, macro-AUROC, and micro-AUROC.
+Macro-AUPRC is primary. Recall@30 is not used as the primary phenotyping metric
+and is not computed for the 25-label task merely to resemble diagnosis.
 
-First run the upstream benchmark preprocessing and patient split. The resulting
-phenotyping directory must contain `train_listfile.csv`, `val_listfile.csv`,
-`test_listfile.csv`, and the corresponding per-stay time-series CSV files. The
-subject root must retain each `episode*.csv` file so the adapter can recover the
-true `ICUSTAY_ID` rather than treating a row index as a patient identifier.
+## Commands
 
-Build the 25-label HDF5:
+After the configured HDF5 and ClinicalBERT files exist:
 
 ```bash
-uv run python scripts/build_mimic_phenotyping_hdf5.py \
-  --task phenotyping_25 \
-  --task-root /path/to/mimic3-benchmark/phenotyping \
-  --subject-root /path/to/mimic3-benchmark/root \
-  --mimic-root /path/to/mimic-iii-clinical-database-1.4 \
-  --tokenizer /path/to/Bio_ClinicalBERT \
-  --output data/mimic_phenotyping_25/splits.hdf5
+uv run al-mimic prepare \
+  --task mimic_iii \
+  --config configs/experiments/mimic_iii/phenotyping_25_random.yaml
+
+uv run al-mimic validate-data \
+  --task mimic_iii \
+  --config configs/experiments/mimic_iii/phenotyping_25_random.yaml
+
+uv run al-mimic active \
+  --task mimic_iii \
+  --method random \
+  --config configs/experiments/mimic_iii/phenotyping_25_random.yaml
 ```
 
-Build the 172-label HDF5 using the explicit label table:
+For 172 labels, use
+`configs/experiments/mimic_iii/phenotyping_ccs_172_random.yaml`. CoMAL variants
+use the corresponding `_comal.yaml` config and `--method comal`.
 
-```bash
-uv run python scripts/build_mimic_phenotyping_hdf5.py \
-  --task phenotyping_ccs_172 \
-  --task-root /path/to/notes-benchmark/phenotyping \
-  --subject-root /path/to/notes-benchmark/root \
-  --mimic-root /path/to/mimic-iii-clinical-database-1.4 \
-  --tokenizer /path/to/Bio_ClinicalBERT \
-  --ccs-labels-csv data/mimic_phenotyping_ccs_172/labels.csv \
-  --output data/mimic_phenotyping_ccs_172/splits.hdf5
-```
-
-The adapter uses the official one-hour discretizer and normalizer, keeps the
-first 256 structured timesteps, concatenates notes charted during the same ICU
-stay in chronological order, tokenizes to 512 tokens, and removes rows without
-an ICU-window note. It records `subject_id`, `stay_id`, label names, a time-series
-padding mask, and the task id in the artifact. Validation rejects split leakage,
-wrong label widths, non-binary labels, and feature dimension drift.
-
-## Run
-
-```bash
-uv run python main.py tasks --config configs/mimic_phenotyping_25.yaml
-uv run python main.py validate-data --config configs/mimic_phenotyping_25.yaml
-uv run python main.py active --config configs/mimic_phenotyping_25.yaml
-
-uv run python main.py validate-data --config configs/mimic_phenotyping_ccs_172.yaml
-uv run python main.py active --config configs/mimic_phenotyping_ccs_172.yaml
-```
-
-Random baselines are available in `configs/mimic_phenotyping_25_random.yaml`
-and `configs/mimic_phenotyping_ccs_172_random.yaml`.
+The output contract is the same as other MIMIC-III active runs:
+`checkpoints/`, `active_state.json`, `final_metrics.json`,
+`final_predictions.npz`, and `resolved_config.json` below the configured
+experiment directory.
