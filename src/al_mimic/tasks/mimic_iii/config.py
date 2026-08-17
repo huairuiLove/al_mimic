@@ -270,6 +270,8 @@ def _validate_common_task_protocol(config: dict[str, Any]) -> None:
             spec.label_format,
         ),
         "model.output_activation": (model.get("output_activation"), "sigmoid"),
+        "training.device": (training.get("device"), "cuda"),
+        "training.precision": (training.get("precision"), "fp32"),
         "training.optimizer": (training.get("optimizer"), "adamw"),
         "training.loss": (training.get("loss"), "binary_cross_entropy"),
         "evaluation.primary_metric": (

@@ -1,11 +1,12 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
-  <component name="PublishConfigData" serverName="a800_1" remoteFilesAllowedToDisappearOnAutoupload="false">
+  <component name="PublishConfigData" serverName="a800_1">
     <serverData>
       <paths name="a800_1">
         <serverdata>
           <mappings>
             <mapping deploy="/autodl-tmp/al_mimic-master" local="$PROJECT_DIR$" web="/" />
+            <mapping deploy="/autodl-tmp/al_mimic-master" local="$PROJECT_DIR$" />
           </mappings>
         </serverdata>
       </paths>

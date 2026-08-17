@@ -4,10 +4,12 @@
 
 ## 运行环境
 
-- 整个项目运行在单张 **NVIDIA A800 80G** GPU 上（Ampere，支持 TF32 / BF16）。
+- 整个项目运行在单张 **NVIDIA A800 80G** GPU 上（Ampere，正式训练使用 FP32；硬件支持 FP16 / BF16 / TF32 张量核）。
 - 代码在 macOS 本地开发，正式实验在 A800 服务器上执行；涉及数据路径的验证以服务器上的
   `dataset/` 目录为准（本地可能是断链的 symlink）。
 - 正式实验要求 CUDA（`ActiveLearningExperiment` 在无 CUDA 时直接报错）。
+- **所有环境安装配置必须在开启显卡之前做好**：驱动、CUDA 工具链、`uv sync` 依赖安装、
+  数据准备与校验等，一律在显卡启用（上电/接入）之前完成；显卡开启后不再执行任何安装或配置操作。
 
 ## 当前任务优先级（2026-08）
 
@@ -51,9 +53,11 @@ uv run pytest tests/unit -x -q # 快速单元测试
   不要用合成数据兜底。
 - `experiments/`、`dataset/` 下的生成物不进 Git。
 
-## 性能相关现状（A800）
+## 性能相关现状（A800 80G，FP32）
 
-- MIMIC-III 任务配置目前是 `precision: fp32`、`allow_tf32: false`、
-  `cudnn_benchmark: false`（`configure_runtime` 已支持这些开关，CLI 每次运行都会应用）。
-  如需提速，BF16 autocast 与 TF32 是最大的两个杠杆，但会改变数值结果，
-  切换前需要用户确认可比性策略。
+- MIMIC-III 正式训练配置统一使用 **FP32** 精度计算（`training.device: cuda`、
+  `training.precision: fp32`）；`allow_tf32: false` 与 `cudnn_benchmark: false` 由
+  `configure_runtime` 在每次运行时应用。
+- FP32 是当前正式实验的既定计算精度，不要擅自切换到 FP16、BF16 或开启 TF32：
+  精度和运行时设置属于训练协议字段，改动会影响与已完成实验的可比性。
+- A800 仅作为正式实验硬件，macOS 本地只用于代码和单元测试；正式任务运行必须具备 CUDA。

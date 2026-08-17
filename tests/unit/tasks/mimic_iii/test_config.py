@@ -135,3 +135,43 @@ def test_mistyped_scenario_section_is_rejected(tmp_path: Path) -> None:
     )
     with pytest.raises(ValueError, match="unknown scenario sections"):
         load_config(child)
+
+
+def test_mimic_native_tasks_use_the_same_cuda_fp32_runtime_protocol() -> None:
+    configs = (
+        load_config(CONFIG_DIR / "random.yaml"),
+        load_config(CONFIG_DIR / "phenotyping_25_random.yaml"),
+        load_config(CONFIG_DIR / "phenotyping_ccs_239_random.yaml"),
+    )
+
+    assert {
+        (
+            config["task"]["id"],
+            config["training"]["device"],
+            config["training"]["precision"],
+            config["training"]["allow_tf32"],
+            config["training"]["cudnn_benchmark"],
+        )
+        for config in configs
+    } == {
+        ("icd9_diagnoses", "cuda", "fp32", False, False),
+        ("phenotyping_25", "cuda", "fp32", False, False),
+        ("phenotyping_ccs_239", "cuda", "fp32", False, False),
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (("device", "cpu"), ("precision", "fp16"), ("precision", "bf16")),
+)
+def test_formal_mimic_runtime_overrides_are_rejected(
+    tmp_path: Path, field: str, value: str
+) -> None:
+    child = tmp_path / "child.yaml"
+    child.write_text(
+        f"extends: {CONFIG_DIR / 'random.yaml'}\ntraining:\n  {field}: {value}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=rf"training\.{field}"):
+        load_config(child)
