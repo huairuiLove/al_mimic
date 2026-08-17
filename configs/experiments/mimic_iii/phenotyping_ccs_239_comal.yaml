@@ -1,0 +1,4 @@
+extends: ../../tasks/mimic_iii/phenotyping_ccs_239.yaml
+
+task:
+  family: mimic_iii

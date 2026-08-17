@@ -1,0 +1,4 @@
+extends: ../../methods/brset/random.yaml
+
+task:
+  family: brset

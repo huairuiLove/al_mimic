@@ -3,9 +3,10 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "mimic-iii-comal"
-version = "0.1.0"
-description = "Multimodal active learning for MIMIC and BRSET diagnosis prediction"
+name = "al-mimic"
+version = "0.2.0"
+description = "Extensible multimodal active learning for clinical prediction tasks"
+readme = "README.md"
 requires-python = ">=3.10,<3.14"
 dependencies = [
   "torch>=2.1",
@@ -20,22 +21,33 @@ dependencies = [
   "torchvision>=0.16",
   "Pillow>=10",
   "iterative-stratification>=0.1.9",
+  "pandas>=2.0",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "ruff>=0.12"]
+mds-ed = ["pandas>=2.0", "wfdb>=4.1"]
+dev = ["build>=1.2", "pytest>=8.0", "ruff>=0.12"]
 
 [project.scripts]
-mimic-comal = "mimic_comal.cli:main"
-brset-al = "brset_al.cli:main"
+al-mimic = "al_mimic.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["mimic_comal*", "brset_al*", "modis*", "mosaic*"]
+where = ["src"]
+include = ["al_mimic*"]
+
+[tool.setuptools.package-data]
+"al_mimic.tasks.mds_ed" = ["LICENSE", "NOTICE"]
+"al_mimic.tasks.mimic_iii" = ["protocol_profiles.yaml"]
+"al_mimic.tasks.mimic_iii.preprocessing" = ["resources/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["."]
+pythonpath = ["src"]
 
 [tool.ruff]
 line-length = 110
 target-version = "py310"
+exclude = ["thirdparty", "third_party", "CoMAL-main", "MDS-ED-main"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]

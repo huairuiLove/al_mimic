@@ -1,0 +1,30 @@
+extends: ../../tasks/mimic_iii/icd9_diagnoses.yaml
+
+experiment:
+  name: mimic_iii_yang_wu_bertencoder_modimix
+
+active_learning:
+  strategy: modimix
+
+modimix:
+  beta: [1.0, 1.0, 1.0]
+  oof_folds: 5
+  probe_epochs: 20
+  probe_batch_size: 40
+  probe_eval_batch_size: 400
+  probe_learning_rate: 0.0001
+  probe_weight_decay: 0.0
+  prototype: mean
+  grid_k: 8
+  bisect_steps: 0
+  workset_size: 5000
+  fusion_batch_size: 400
+
+mixup:
+  enabled: true
+  space: modalities
+  alpha: 1.0
+  weight: 1.0
+  pairing: targeted
+  anchor_quantile: 0.5
+  keep_anchor: true

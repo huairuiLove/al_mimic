@@ -1,0 +1,7 @@
+extends: ../../tasks/mimic_iii/icd9_diagnoses.yaml
+
+experiment:
+  name: mimic_iii_yang_wu_bertencoder_random
+
+active_learning:
+  strategy: random

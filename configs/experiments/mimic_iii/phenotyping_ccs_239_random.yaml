@@ -1,0 +1,10 @@
+extends: ../../tasks/mimic_iii/phenotyping_ccs_239.yaml
+
+experiment:
+  name: mimic_iii_phenotyping_ccs_239_random
+
+active_learning:
+  strategy: random
+
+task:
+  family: mimic_iii

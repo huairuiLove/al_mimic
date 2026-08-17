@@ -1,0 +1,4 @@
+extends: ../../tasks/mds_ed/diagnoses.yaml
+
+task:
+  family: mds_ed

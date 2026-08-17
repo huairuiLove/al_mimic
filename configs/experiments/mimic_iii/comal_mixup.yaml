@@ -1,0 +1,28 @@
+extends: ../../methods/mimic_iii/comal.yaml
+
+experiment:
+  name: mimic_iii_yang_wu_bertencoder_comal_mixup
+
+active_learning:
+  strategy: comal
+
+# CoMAL selects the sparsest visits of the four strategies (13.8 positives per
+# visit against 16.3 for never-selected ones), so it is the arm where restoring
+# positive-label mass should matter most.
+#
+# alpha=1 with keep_anchor makes lambda uniform on [0.5, 1]; simulated on the
+# real train label counts that lifts the positive mass of a mixed anchor by
+# 16.4%, which matches the 18% deficit the strategies introduce. Smaller alpha
+# pins lambda near 1 and barely mixes (+6.6% at alpha=0.2); dropping
+# keep_anchor centres lambda at 0.5 and yields a blend that no longer
+# resembles a real annotation.
+mixup:
+  enabled: true
+  alpha: 1.0
+  weight: 1.0
+  pairing: targeted
+  anchor_quantile: 0.5
+  keep_anchor: true
+
+task:
+  family: mimic_iii

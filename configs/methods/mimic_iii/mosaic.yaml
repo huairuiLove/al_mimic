@@ -1,0 +1,20 @@
+extends: ../../tasks/mimic_iii/icd9_diagnoses.yaml
+
+experiment:
+  name: mimic_iii_yang_wu_bertencoder_mosaic
+
+active_learning:
+  strategy: mosaic
+
+mosaic:
+  eta: 0.25
+  partners: 4
+  lambda_alpha: null
+  mixup_closure_samples: 2048
+  workset_size: 1000
+  synergy_workset_size: 500
+  deflation_steps: 1000
+  damping: 0.1
+  fusion_batch_size: 400
+  value_batch_size: 400
+  synergy_epsilon: 1.0e-8

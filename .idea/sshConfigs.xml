@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="SshConfigs">
+    <configs>
+      <sshConfig host="connect.bjb1.seetacloud.com" id="4afc359e-19ca-4ebb-ac97-7a96189eb4c8" keyPath="$USER_HOME$/.ssh/id_ed25519_autodl" port="36296" nameFormat="DESCRIPTIVE" username="root" useOpenSSHConfig="true" />
+    </configs>
+  </component>
+</project>

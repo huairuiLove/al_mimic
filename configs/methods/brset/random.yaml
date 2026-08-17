@@ -1,0 +1,7 @@
+extends: ../../tasks/brset/base.yaml
+
+experiment:
+  name: brset_v1_0_2_resnet50_metadata_random
+
+active_learning:
+  strategy: random

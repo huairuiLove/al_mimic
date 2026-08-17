@@ -1,0 +1,4 @@
+extends: ../../methods/mimic_iii/random.yaml
+
+task:
+  family: mimic_iii

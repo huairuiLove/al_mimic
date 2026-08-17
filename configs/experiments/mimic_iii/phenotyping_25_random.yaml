@@ -1,0 +1,10 @@
+extends: ../../tasks/mimic_iii/phenotyping_25.yaml
+
+experiment:
+  name: mimic_iii_phenotyping_25_random
+
+active_learning:
+  strategy: random
+
+task:
+  family: mimic_iii

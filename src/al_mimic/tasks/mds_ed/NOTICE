@@ -1,0 +1,9 @@
+This package contains a native reimplementation of data-preparation and task
+integration behavior from MDS-ED by AI4HealthUOL.
+
+Upstream project: https://github.com/AI4HealthUOL/MDS-ED
+Upstream copyright: Copyright (c) 2024 AI4HealthUOL
+License: MIT (see LICENSE in this directory)
+
+The implementation in this directory is first-party al_mimic code. It does not
+import or execute the repository's thirdparty/mds-ed checkout at runtime.
