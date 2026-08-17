@@ -81,7 +81,7 @@ active_learning:
   strategy: comal
   initial_fraction: 0.10
   query_fraction: 0.05
-  rounds: 6
+  rounds: 9
 
 evaluation:
   primary_metric: recall_at_30
@@ -89,6 +89,10 @@ evaluation:
     - recall_at_10
     - recall_at_20
     - recall_at_30
+    - macro_auprc
+    - micro_auprc
+    - macro_auroc
+    - micro_auroc
 
 acquisition:
   formula: paper

@@ -9,7 +9,7 @@ from al_mimic.tasks.mimic_iii.config import load_config
 ROOT = Path(__file__).resolve().parents[4]
 CONFIG_DIR = ROOT / "configs" / "experiments" / "mimic_iii"
 SCENARIOS = ("missing_notes", "mid_labels")
-STRATEGIES = ("comal", "mm_comal", "modis", "mosaic", "random")
+STRATEGIES = ("comal", "modis", "modimix", "mosaic", "random")
 
 
 def _scenario_configs() -> list[tuple[str, str, Path]]:
@@ -42,7 +42,7 @@ def test_scenario_config_keeps_method_tuning(strategy: str, scenario: str, path:
     """Method-specific blocks must survive the merge with the scenario base."""
     config = load_config(path)
     baseline = load_config(CONFIG_DIR / f"{strategy}.yaml")
-    for section in ("mosaic", "modis", "comal", "acquisition"):
+    for section in ("mosaic", "modis", "modimix", "comal", "acquisition"):
         if section in baseline:
             assert config.get(section) == baseline[section], section
 
@@ -63,6 +63,37 @@ def test_single_parent_string_still_works() -> None:
     config = load_config(CONFIG_DIR / "mosaic.yaml")
     assert config["active_learning"]["strategy"] == "mosaic"
     assert config["mosaic"]["damping"] == 0.1
+
+
+def test_modimix_config_is_independent_from_modis_and_enables_modality_mixup() -> None:
+    modimix = load_config(CONFIG_DIR / "modimix.yaml")
+    modis = load_config(CONFIG_DIR / "modis.yaml")
+
+    assert modimix["active_learning"]["strategy"] == "modimix"
+    assert "modimix" in modimix
+    assert "modis" not in modimix
+    assert modimix["mixup"] == {
+        "enabled": True,
+        "space": "modalities",
+        "alpha": 1.0,
+        "weight": 1.0,
+        "pairing": "targeted",
+        "anchor_quantile": 0.5,
+        "keep_anchor": True,
+    }
+    assert modis["active_learning"]["strategy"] == "modis"
+    assert "mixup" not in modis
+
+
+def test_modimix_rejects_a_disabled_training_mixup(tmp_path: Path) -> None:
+    child = tmp_path / "modimix_without_mixup.yaml"
+    child.write_text(
+        f"extends: {CONFIG_DIR / 'modimix.yaml'}\nmixup:\n  enabled: false\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="requires enabled modality-space mixup"):
+        load_config(child)
 
 
 def test_unknown_protocol_profile_is_rejected(tmp_path: Path) -> None:

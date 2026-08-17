@@ -56,12 +56,29 @@ The exact HDF5 location is controlled by the resolved config. The file must have
 local rebuild contract is 10,258 stays, 915 labels, 48 hourly steps, 7,749
 hourly features, 97 invariant features, and 512 note tokens.
 
-This workspace contains a FIDDLE-derived HDF5 under a different local processed
-subdirectory and historical completed experiment outputs. The configured HDF5
-path is a broken symbolic link to an absolute path on another host, so a fresh
-`validate-data` cannot open it. Replace that local link with the intended local
-artifact before rerunning; do not treat historical outputs as a validation
-substitute.
+The final assembly step is `build_splits`. From a FIDDLE working directory
+holding `population/`, `prep/icustays_MV.csv`, and
+`features/outcome=Diagnoses,T=48.0,dt=1.0/` with `IDs.csv`, `notes.hdf5`, and
+the dense `Xs.hdf5`:
+
+```bash
+PYTHONPATH=src python -m al_mimic.tasks.mimic_iii.preprocessing.build_splits \
+  --data-dir dataset/processed/fiddle_processed --duration 48.0
+```
+
+An older artifact that already carries the tensors but predates the subject_id
+contract is patched in place instead of being rewritten (labels are verified
+row by row before anything is written):
+
+```bash
+PYTHONPATH=src python -m al_mimic.tasks.mimic_iii.preprocessing.build_splits \
+  --data-dir dataset/processed/fiddle_processed --duration 48.0 --attach-only
+```
+
+This step needs pandas, which is not part of the core runtime dependencies;
+run it with an interpreter that has pandas and h5py available. The configured
+`yang_wu_mimic` path is a relative symlink to the patched FIDDLE artifact, so
+`validate-data` opens the same bytes from both local subdirectories.
 
 ## MIMIC-III phenotyping
 
@@ -69,19 +86,61 @@ The native phenotyping configs expect:
 
 ```text
 dataset/processed/mimic_phenotyping_25/splits.hdf5
-dataset/processed/mimic_phenotyping_ccs_172/splits.hdf5
+dataset/processed/mimic_phenotyping_ccs_239/splits.hdf5
 
 dataset/prepared/mimic_phenotyping_25/manifest.json
-dataset/prepared/mimic_phenotyping_ccs_172/manifest.json
+dataset/prepared/mimic_phenotyping_ccs_239/manifest.json
 ```
 
 The HDF5 files contain task-native multi-hot labels, structured measurements,
-notes, masks, `subject_id`, `stay_id`, and label metadata. `al-mimic prepare`
-audits an existing HDF5 and writes the corresponding prepared manifest; it does
-not expose raw-table-to-HDF5 construction as a public task action.
+notes, masks, `subject_id`, `stay_id`, and label metadata. The complete
+first-party raw-table pipeline does not execute FIDDLE, mimic3-benchmarks,
+notes_benchmark, or any checkout under `thirdparty/`. It uses only the raw
+MIMIC-III v1.4 CSVs, the materialised resources under
+`src/al_mimic/tasks/mimic_iii/preprocessing/resources/`, and the project Python
+dependencies.
 
-Neither phenotyping HDF5 nor its prepared manifest or experiment output is
-present in this workspace as of 2026-08-16.
+Run the stages from the repository root:
+
+```bash
+# 1. Build the adult, single-stay benchmark cohort and ICD-9/CCS sidecar.
+PYTHONPATH=src python -m al_mimic.tasks.mimic_iii.preprocessing.build_phenotyping_cohort \
+  --mimic-dir dataset/raw/mimic-iii-clinical-database-1.4 \
+  --data-dir dataset/processed/mimic_phenotyping_25
+
+# 2. Extract all stay notes in chronological order. The same command can be
+#    pointed at mimic_phenotyping_ccs_239 for the 239-label task.
+PYTHONPATH=src python -m al_mimic.tasks.mimic_iii.preprocessing.extract_notes \
+  --mimic-dir dataset/raw/mimic-iii-clinical-database-1.4 \
+  --data-dir dataset/processed/mimic_phenotyping_25 \
+  --task Phenotyping --duration 256.0 --protocol all_stay_chronological \
+  --stays-csv dataset/processed/mimic_phenotyping_25/prep/benchmark_icustays.csv \
+  --vocab-dir dataset/pretrained/clinicalbert
+
+# 3. Stream the structured event tables and build the 76-feature tensors.
+PYTHONPATH=src python -m al_mimic.tasks.mimic_iii.preprocessing.build_phenotyping_features \
+  --mimic-dir dataset/raw/mimic-iii-clinical-database-1.4 \
+  --data-dir dataset/processed/mimic_phenotyping_25 \
+  --task-id phenotyping_25
+
+# 4. Assemble the final loader artifact.
+PYTHONPATH=src python -m al_mimic.tasks.mimic_iii.preprocessing.build_splits \
+  --data-dir dataset/processed/mimic_phenotyping_25 \
+  --task Phenotyping --duration 256.0 --timestep 1.0 \
+  --stays-csv dataset/processed/mimic_phenotyping_25/prep/benchmark_icustays.csv
+
+# 5. Audit and prepare it with the normal CLI.
+uv run al-mimic prepare --task mimic_iii \
+  --config configs/experiments/mimic_iii/phenotyping_25_random.yaml
+```
+
+For `phenotyping_ccs_239`, repeat stages 1 and 2 in a separate
+`dataset/processed/mimic_phenotyping_ccs_239` directory, run stage 3 with
+`--task-id phenotyping_ccs_239` (it requires the extracted notes and enforces
+exactly 239 CCS groups occurring in at least 30 episodes), then assemble with
+the same `--task Phenotyping --duration 256.0` arguments. `al-mimic prepare`
+audits an existing HDF5 and writes the corresponding prepared manifest; it does
+not synthesize data itself.
 
 ## BRSET v1.0.2
 

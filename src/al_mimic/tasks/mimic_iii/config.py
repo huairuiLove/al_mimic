@@ -9,7 +9,7 @@ import yaml
 
 from .tasks import task_spec
 
-FORMAL_STRATEGIES = {"comal", "mm_comal", "modis", "mosaic", "random"}
+FORMAL_STRATEGIES = {"comal", "modis", "modimix", "mosaic", "random"}
 DEFAULT_PROTOCOL_PROFILE = "yang_wu_diagnoses_48h"
 PROFILE_KEYS = (
     "observation_hours",
@@ -191,7 +191,7 @@ def _validate_yang_wu_protocol(config: dict[str, Any]) -> None:
             training.get("early_stopping_patience"),
             5,
         ),
-        "active_learning.rounds": (active.get("rounds"), 6),
+        "active_learning.rounds": (active.get("rounds"), 9),
     }
     for name, (actual, required) in integer_values.items():
         try:
@@ -294,6 +294,12 @@ def _validate_common_task_protocol(config: dict[str, Any]) -> None:
     strategy = str(active.get("strategy", "")).lower()
     if strategy not in FORMAL_STRATEGIES:
         raise ValueError(f"active_learning.strategy must be one of {sorted(FORMAL_STRATEGIES)}")
+    if strategy == "modimix":
+        mixup = config.get("mixup") or {}
+        if not isinstance(mixup, dict):
+            raise ValueError("ModiMix requires mixup to be a mapping")
+        if not bool(mixup.get("enabled", False)) or str(mixup.get("space", "")).lower() != "modalities":
+            raise ValueError("ModiMix requires enabled modality-space mixup")
     if bool(training.get("inherit_across_rounds", False)):
         raise ValueError("formal protocol forbids cross-round weight inheritance")
     _reject_shortcuts(config)
@@ -324,7 +330,7 @@ def _validate_phenotyping_protocol(config: dict[str, Any]) -> None:
     }
     expected_split = {
         "phenotyping_25": "mimic3_benchmark_subject_split",
-        "phenotyping_ccs_172": "notes_benchmark_subject_split",
+        "phenotyping_ccs_239": "notes_benchmark_subject_split",
     }[spec.task_id]
     required_values["preprocessing.split_protocol"] = (
         preprocessing.get("split_protocol"),

@@ -12,7 +12,7 @@ from al_mimic.methods.registry import available_methods, get_method
 
 ROOT = Path(__file__).resolve().parents[3]
 SOURCE_ROOT = ROOT / "src" / "al_mimic" / "methods"
-METHOD_NAMES = {"random", "comal", "mm_comal", "modis", "mosaic"}
+METHOD_NAMES = {"random", "comal", "modis", "modimix", "mosaic"}
 
 
 def _run_isolated(source: str) -> subprocess.CompletedProcess[str]:
@@ -36,7 +36,7 @@ def test_registry_is_lazy_until_a_method_is_requested() -> None:
         "loaded = sorted(name for name in sys.modules "
         "if name.startswith('al_mimic.methods.') and name != 'al_mimic.methods.registry'); "
         "assert loaded == [], loaded; assert methods.available_methods() == "
-        "('comal', 'mm_comal', 'modis', 'mosaic', 'random')"
+        "('comal', 'modimix', 'modis', 'mosaic', 'random')"
     )
     assert completed.returncode == 0, completed.stderr
 
@@ -78,7 +78,6 @@ def test_method_sources_have_no_legacy_or_cross_method_imports() -> None:
 
 def test_registry_loads_uniform_plugin_api_and_aliases() -> None:
     assert set(available_methods()) == METHOD_NAMES
-    assert get_method("MM-CoMAL") is get_method("mm_comal")
     for method_name in METHOD_NAMES:
         plugin = get_method(method_name)
         assert plugin.method_id == method_name
@@ -91,9 +90,8 @@ def test_registry_loads_uniform_plugin_api_and_aliases() -> None:
 def test_only_stateful_methods_expose_fit_hooks() -> None:
     assert callable(get_method("comal").fit)
     assert callable(get_method("comal").prepare_context)
-    assert callable(get_method("mm_comal").fit)
-    assert callable(get_method("mm_comal").prepare_context)
     assert callable(get_method("modis").fit)
+    assert callable(get_method("modimix").fit)
     assert not hasattr(get_method("random"), "fit")
     assert not hasattr(get_method("mosaic"), "fit")
 

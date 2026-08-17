@@ -1,13 +1,22 @@
 #!/usr/bin/env python
 """Build notes.hdf5 for a cohort without loading NOTEEVENTS into memory.
 
-Reproduces the Yang-Wu note protocol -- keep the latest note per
-(ICU stay, CATEGORY/DESCRIPTION), join a stay's notes with newlines in sorted
-variable order, then tokenize to a fixed 512-token window -- but streams the
-4 GB CSV in chunks instead of reading it whole. MimicDataModule.note_feats()
-materialises every note column at once, which needs tens of gigabytes; this
-keeps only the notes that survive the per-variable latest-wins rule.
+Two note protocols share the streaming and tokenization machinery:
 
+latest (default, the Yang-Wu diagnosis protocol)
+    Keep the latest note per (ICU stay, CATEGORY/DESCRIPTION) charted inside
+    the fixed [0, duration] window, join a stay's notes with newlines in
+    sorted variable order, then tokenize to a fixed 512-token window.
+
+all_stay_chronological (the phenotyping protocol)
+    Keep every note of the ICU stay: categories in the multimodal benchmark's
+    used-note list charted inside [INTIME, OUTTIME], plus the admission's
+    discharge summaries regardless of chart time. Notes are joined
+    chronologically (chart time, then source row order for ties) and
+    tokenized to the same fixed window.
+
+MimicDataModule.note_feats() materialises every note column at once, which
+needs tens of gigabytes; both modes stream the 4 GB CSV in chunks instead.
 Output is the same frame MimicDataModule.split() reads: one row per stay with
 ICUSTAY_ID, input_ids, token_type_ids and attention_mask.
 """
@@ -25,6 +34,26 @@ import numpy as np
 import pandas as pd
 
 NOTE_COLUMNS = ["SUBJECT_ID", "HADM_ID", "CHARTTIME", "ISERROR", "CATEGORY", "DESCRIPTION", "TEXT"]
+# The multimodal benchmark's used-note categories, spelled exactly as they
+# appear in NOTEEVENTS (note the trailing spaces on three of them); discharge
+# summaries are re-added separately regardless of their chart time.
+USED_NOTE_CATEGORIES = (
+    "Echo",
+    "ECG",
+    "Nursing",
+    "Physician ",
+    "Rehab Services",
+    "Case Management ",
+    "Respiratory ",
+    "Nutrition",
+    "General",
+    "Social Work",
+    "Pharmacy",
+    "Consult",
+    "Radiology",
+    "Nursing/other",
+)
+DISCHARGE_CATEGORY = "Discharge summary"
 
 
 def clean(text: str) -> str:
@@ -98,6 +127,63 @@ def join_texts(kept: dict[int, dict[str, tuple[float, int, str]]]) -> pd.DataFra
     return pd.DataFrame(rows, columns=["ICUSTAY_ID", "TEXT"])
 
 
+def collect_chronological_notes(
+    mimic_dir: Path,
+    stays: pd.DataFrame,
+    chunksize: int,
+    max_chars: int | None,
+) -> dict[int, list[tuple[float, int, str]]]:
+    """All stay notes in chart-time order, streamed over NOTEEVENTS."""
+    keys = stays[["SUBJECT_ID", "HADM_ID", "ICUSTAY_ID", "INTIME", "OUTTIME"]]
+    kept: dict[int, list[tuple[float, int, str]]] = {}
+    scanned = 0
+    for chunk in pd.read_csv(
+        mimic_dir / "NOTEEVENTS.csv",
+        usecols=NOTE_COLUMNS,
+        parse_dates=["CHARTTIME"],
+        chunksize=chunksize,
+    ):
+        scanned += len(chunk)
+        chunk = chunk[chunk["ISERROR"].isnull() & chunk["CHARTTIME"].notna()]
+        if chunk.empty:
+            continue
+        # pandas keeps a global row index across chunks, so ties between notes
+        # charted at the same minute resolve to source order on every run.
+        chunk = chunk.assign(_row=chunk.index)
+        merged = keys.merge(chunk.drop(columns=["ISERROR"]), on=["SUBJECT_ID", "HADM_ID"], how="inner")
+        if merged.empty:
+            continue
+        categories = merged["CATEGORY"].astype(str)
+        in_window = (merged["CHARTTIME"] >= merged["INTIME"]) & (merged["CHARTTIME"] <= merged["OUTTIME"])
+        discharge = categories == DISCHARGE_CATEGORY
+        merged = merged[
+            (categories.isin(USED_NOTE_CATEGORIES) & in_window) | discharge
+        ]
+        if merged.empty:
+            continue
+        for stay, moment, row, text in zip(
+            merged["ICUSTAY_ID"].to_numpy(),
+            merged["CHARTTIME"].to_numpy(),
+            merged["_row"].to_numpy(),
+            merged["TEXT"].fillna(" ").to_numpy(),
+            strict=True,
+        ):
+            body = clean(str(text))
+            kept.setdefault(int(stay), []).append(
+                (np.datetime64(moment, "ns").astype("datetime64[ns]").astype(np.int64), int(row), body)
+            )
+        print(f"  scanned {scanned:,} note rows, stays with notes={len(kept):,}", flush=True)
+    for slot in kept.values():
+        slot.sort(key=lambda item: (item[0], item[1]))
+    return kept
+
+
+def join_chronological_texts(kept: dict[int, list[tuple[float, int, str]]]) -> pd.DataFrame:
+    """One text per stay, notes joined in chart-time order."""
+    rows = [(stay, "\n".join(body for _, _, body in slot)) for stay, slot in sorted(kept.items())]
+    return pd.DataFrame(rows, columns=["ICUSTAY_ID", "TEXT"])
+
+
 def tokenize_to_hdf5(
     frame: pd.DataFrame,
     output: Path,
@@ -160,6 +246,19 @@ def main() -> None:
     parser.add_argument("--duration", type=float, required=True)
     parser.add_argument("--timestep", type=float, default=1.0)
     parser.add_argument(
+        "--protocol",
+        choices=("latest", "all_stay_chronological"),
+        default="latest",
+        help="note selection rule: latest-per-variable inside a fixed window, or all stay notes",
+    )
+    parser.add_argument(
+        "--stays-csv",
+        type=Path,
+        default=None,
+        help="cohort table with INTIME/OUTTIME columns; required by all_stay_chronological "
+        "(default: population + ICUSTAYS lookup of the latest protocol)",
+    )
+    parser.add_argument(
         "--vocab-dir",
         type=Path,
         required=True,
@@ -187,26 +286,41 @@ def main() -> None:
     task_dir.mkdir(parents=True, exist_ok=True)
     output = args.output or task_dir / "notes.hdf5"
 
-    population = pd.read_hdf(args.data_dir / "population/population.hdf5", f"{args.task}_{args.duration}h")
-    cohort = population["ID"].astype(np.int64)
+    if args.protocol == "all_stay_chronological":
+        if args.stays_csv is None:
+            raise SystemExit("all_stay_chronological needs --stays-csv (the cohort table with stay windows)")
+        stays = pd.read_csv(args.stays_csv, parse_dates=["INTIME", "OUTTIME"])
+    else:
+        population = pd.read_hdf(
+            args.data_dir / "population/population.hdf5", f"{args.task}_{args.duration}h"
+        )
+        cohort = population["ID"].astype(np.int64)
+        if args.limit_stays is not None:
+            cohort = cohort.iloc[: args.limit_stays]
+        icus = pd.read_csv(args.mimic_dir / "ICUSTAYS.csv", parse_dates=["INTIME"])
+        stays = icus[icus["ICUSTAY_ID"].isin(set(cohort))][["SUBJECT_ID", "HADM_ID", "ICUSTAY_ID", "INTIME"]]
     if args.limit_stays is not None:
-        cohort = cohort.iloc[: args.limit_stays]
-    print(f"cohort stays: {len(cohort):,}", flush=True)
+        stays = stays.iloc[: args.limit_stays]
+    print(f"cohort stays: {len(stays):,}", flush=True)
 
-    icus = pd.read_csv(args.mimic_dir / "ICUSTAYS.csv", parse_dates=["INTIME"])
-    stays = icus[icus["ICUSTAY_ID"].isin(set(cohort))][["SUBJECT_ID", "HADM_ID", "ICUSTAY_ID", "INTIME"]]
-    print(f"resolved INTIME for {len(stays):,} stays", flush=True)
-
-    kept = collect_latest_notes(args.mimic_dir, stays, args.duration, args.chunksize, args.max_chars)
-    per_stay = np.array([len(slot) for slot in kept.values()])
-    print(
-        f"stays with >=1 note: {len(kept):,} / {len(stays):,}; "
-        f"notes per stay mean={per_stay.mean():.1f} max={per_stay.max()}",
-        flush=True,
-    )
-
-    frame = join_texts(kept)
-    kept.clear()
+    if args.protocol == "all_stay_chronological":
+        kept = collect_chronological_notes(args.mimic_dir, stays, args.chunksize, args.max_chars)
+        print(
+            f"stays with >=1 note: {len(kept):,} / {len(stays):,}",
+            flush=True,
+        )
+        frame = join_chronological_texts(kept)
+        kept.clear()
+    else:
+        kept = collect_latest_notes(args.mimic_dir, stays, args.duration, args.chunksize, args.max_chars)
+        per_stay = np.array([len(slot) for slot in kept.values()])
+        print(
+            f"stays with >=1 note: {len(kept):,} / {len(stays):,}; "
+            f"notes per stay mean={per_stay.mean():.1f} max={per_stay.max()}",
+            flush=True,
+        )
+        frame = join_texts(kept)
+        kept.clear()
     lengths = frame["TEXT"].str.len()
     print(
         f"joined text chars: median={int(lengths.median()):,} p95={int(lengths.quantile(0.95)):,} "

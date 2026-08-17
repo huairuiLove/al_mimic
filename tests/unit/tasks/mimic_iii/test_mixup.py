@@ -6,7 +6,11 @@ import numpy as np
 import pytest
 import torch
 
-from al_mimic.tasks.mimic_iii.mixup import MixupConfig, label_space_mixup
+from al_mimic.tasks.mimic_iii.mixup import (
+    MixupConfig,
+    label_space_mixup,
+    modality_space_mixup,
+)
 
 
 def _batch(seed: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
@@ -95,6 +99,8 @@ def test_invalid_settings_are_rejected() -> None:
     with pytest.raises(ValueError):
         MixupConfig.from_config({"mixup": {"enabled": True, "alpha": 0.0}})
     with pytest.raises(ValueError):
+        MixupConfig.from_config({"mixup": {"enabled": True, "space": "pixels"}})
+    with pytest.raises(ValueError):
         MixupConfig.from_config({"mixup": {"enabled": True, "pairing": "nearest"}})
     with pytest.raises(ValueError):
         MixupConfig.from_config({"mixup": {"enabled": True, "anchor_quantile": 0.0}})
@@ -103,7 +109,45 @@ def test_invalid_settings_are_rejected() -> None:
 
 
 def test_defaults_keep_mixup_off_for_the_formal_protocol() -> None:
-    assert MixupConfig.from_config({}).enabled is False
+    config = MixupConfig.from_config({})
+    assert config.enabled is False
+    assert config.space == "fused"
+
+
+def test_modality_mixup_uses_one_shared_plan_for_all_views_and_labels() -> None:
+    labels = torch.eye(8)
+    first = torch.arange(16, dtype=torch.float32).reshape(8, 2)
+    second = first * 10.0 + 3.0
+    config = MixupConfig(
+        enabled=True,
+        space="modalities",
+        pairing="random",
+        anchor_quantile=1.0,
+        keep_anchor=False,
+    )
+
+    mixed = modality_space_mixup((first, second, None), labels, config, np.random.default_rng(9))
+
+    assert mixed is not None
+    mixed_first, mixed_second, mixed_static = mixed.modalities
+    assert mixed_first is not None and mixed_second is not None
+    assert mixed_static is None
+    assert torch.allclose(mixed_second, mixed_first * 10.0 + 3.0, atol=1e-6)
+    assert float(mixed.labels.min()) >= 0.0
+    assert float(mixed.labels.max()) <= 1.0
+    assert mixed.diagnostics["virtual_samples"] == mixed.labels.shape[0]
+
+
+def test_modality_mixup_rejects_misaligned_views() -> None:
+    config = MixupConfig(enabled=True, space="modalities")
+    labels = torch.ones(4, 2)
+    with pytest.raises(ValueError, match="same batch dimension"):
+        modality_space_mixup(
+            (torch.randn(4, 3), torch.randn(3, 5)),
+            labels,
+            config,
+            np.random.default_rng(0),
+        )
 
 
 class _TinyBert(torch.nn.Module):
@@ -148,12 +192,11 @@ def _tiny_classifier():
 
 
 def test_explicit_encoder_path_matches_the_plain_forward() -> None:
-    """The mixup branch re-implements the forward to expose the fused tensor."""
     model, batch = _tiny_classifier()
     reference = model(batch)["logits"]
     text, series, static = model.encode_modalities(batch)
-    fused = model.gate(text, static, series)
-    assert torch.allclose(reference, model.classifier(fused), atol=1e-6)
+    explicit = model.forward_from_modalities(text, series, static)["logits"]
+    assert torch.allclose(reference, explicit, atol=1e-6)
 
 
 def test_mixup_term_produces_finite_gradients_through_the_head() -> None:
@@ -175,3 +218,33 @@ def test_mixup_term_produces_finite_gradients_through_the_head() -> None:
     assert torch.isfinite(loss)
     assert torch.isfinite(model.classifier.weight.grad).all()
     assert torch.isfinite(model.time_series_projection.weight.grad).all()
+
+
+def test_modality_mixup_backpropagates_through_all_encoders_and_gate() -> None:
+    import torch.nn.functional as F
+
+    model, batch = _tiny_classifier()
+    text, series, static = model.encode_modalities(batch)
+    mixed = modality_space_mixup(
+        (text, series, static),
+        batch["labels"],
+        MixupConfig(
+            enabled=True,
+            space="modalities",
+            pairing="random",
+            anchor_quantile=1.0,
+            keep_anchor=False,
+        ),
+        np.random.default_rng(4),
+    )
+    assert mixed is not None
+    output = model.forward_from_modalities(*mixed.modalities)
+    loss = F.binary_cross_entropy_with_logits(output["logits"], mixed.labels)
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert torch.isfinite(model.text_encoder.embedding.weight.grad).all()
+    assert torch.isfinite(model.time_series_projection.weight.grad).all()
+    assert model.time_invariant_encoder is not None
+    assert torch.isfinite(model.time_invariant_encoder.weight.grad).all()
+    assert torch.isfinite(model.gate.time_series_weight.weight.grad).all()

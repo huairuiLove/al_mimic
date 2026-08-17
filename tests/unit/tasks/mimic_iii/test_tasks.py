@@ -13,7 +13,7 @@ from al_mimic.tasks.mimic_iii.config import load_config
 from al_mimic.tasks.mimic_iii.data import audit_split_hdf5
 from al_mimic.tasks.mimic_iii.metrics import ranking_metrics, task_multilabel_metrics
 from al_mimic.tasks.mimic_iii.model import YangWuBertEncoderClassifier
-from al_mimic.tasks.mimic_iii.preprocessing.build_ccs_172_labels import build_ccs_labels
+from al_mimic.tasks.mimic_iii.preprocessing.build_ccs_239_labels import build_ccs_labels
 from al_mimic.tasks.mimic_iii.tasks import TASKS, task_spec
 
 ROOT = Path(__file__).parents[4]
@@ -43,9 +43,9 @@ class _TinyBert(torch.nn.Module):
             "macro_auprc",
         ),
         (
-            "configs/experiments/mimic_iii/phenotyping_ccs_172_comal.yaml",
-            "phenotyping_ccs_172",
-            172,
+            "configs/experiments/mimic_iii/phenotyping_ccs_239_comal.yaml",
+            "phenotyping_ccs_239",
+            239,
             "macro_auprc",
         ),
     ],
@@ -61,7 +61,7 @@ def test_registered_task_configs(path, task_id, labels, metric) -> None:
 
 
 def test_all_three_tasks_are_registered() -> None:
-    assert set(TASKS) == {"icd9_diagnoses", "phenotyping_25", "phenotyping_ccs_172"}
+    assert set(TASKS) == {"icd9_diagnoses", "phenotyping_25", "phenotyping_ccs_239"}
 
 
 def test_phenotyping_metrics_are_ranking_metrics_not_top_k() -> None:
@@ -73,6 +73,26 @@ def test_phenotyping_metrics_are_ranking_metrics_not_top_k() -> None:
     assert result["macro_auprc"] == pytest.approx(direct["macro_auprc"])
     assert result["macro_auroc"] == pytest.approx(1.0)
     assert "recall_at_30" not in result
+
+
+def test_icd9_metrics_report_recall_and_macro_ranking() -> None:
+    labels = np.asarray([[1, 0], [0, 1], [1, 1], [0, 1]], dtype=np.int8)
+    probabilities = np.asarray([[0.9, 0.1], [0.2, 0.8], [0.7, 0.6], [0.1, 0.2]], dtype=np.float32)
+    config = load_config(ROOT / "configs/experiments/mimic_iii/comal.yaml")
+    result = task_multilabel_metrics(config, labels, probabilities)
+    assert set(result) == {
+        "recall_at_10",
+        "recall_at_20",
+        "recall_at_30",
+        "macro_auprc",
+        "micro_auprc",
+        "macro_auroc",
+        "micro_auroc",
+        "metric_label_coverage",
+    }
+    direct = ranking_metrics(labels, probabilities)
+    assert result["macro_auprc"] == pytest.approx(direct["macro_auprc"])
+    assert result["macro_auroc"] == pytest.approx(1.0)
 
 
 def test_two_modality_model_exposes_no_static_token() -> None:

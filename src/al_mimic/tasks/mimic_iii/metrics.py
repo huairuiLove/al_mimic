@@ -75,9 +75,15 @@ def task_multilabel_metrics(
     config: dict[str, Any], labels: np.ndarray, probabilities: np.ndarray
 ) -> dict[str, Any]:
     spec = task_spec(config)
-    if spec.task_id == "icd9_diagnoses":
-        return multilabel_metrics(labels, probabilities)
-    calculated = ranking_metrics(labels, probabilities)
-    selected = {name: calculated[name] for name in spec.metrics}
-    selected["metric_label_coverage"] = calculated["metric_label_coverage"]
+    if spec.task_id != "icd9_diagnoses":
+        calculated = ranking_metrics(labels, probabilities)
+        selected = {name: calculated[name] for name in spec.metrics}
+        selected["metric_label_coverage"] = calculated["metric_label_coverage"]
+        return selected
+    # Diagnoses keeps Recall@k as the locked primary family and adds macro
+    # ranking metrics so rare-label separation between acquisition methods is
+    # visible; recall alone is head-label dominated.
+    combined = multilabel_metrics(labels, probabilities) | ranking_metrics(labels, probabilities)
+    selected = {name: combined[name] for name in spec.metrics}
+    selected["metric_label_coverage"] = combined["metric_label_coverage"]
     return selected

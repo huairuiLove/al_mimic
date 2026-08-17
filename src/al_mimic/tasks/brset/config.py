@@ -7,7 +7,7 @@ from typing import Any
 
 import yaml
 
-FORMAL_STRATEGIES = {"comal", "mm_comal", "modis", "mosaic", "random"}
+FORMAL_STRATEGIES = {"comal", "modis", "mosaic", "random"}
 POST_DIAGNOSTIC_FIELDS = {
     "optic_disc",
     "vessels",

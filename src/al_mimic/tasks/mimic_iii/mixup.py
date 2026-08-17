@@ -23,6 +23,7 @@ import torch
 @dataclass(frozen=True)
 class MixupConfig:
     enabled: bool = False
+    space: str = "fused"
     alpha: float = 0.4
     weight: float = 1.0
     pairing: str = "targeted"
@@ -36,6 +37,7 @@ class MixupConfig:
             raise ValueError("mixup section must be a mapping")
         parsed = cls(
             enabled=bool(section.get("enabled", False)),
+            space=str(section.get("space", "fused")).lower(),
             alpha=float(section.get("alpha", 0.4)),
             weight=float(section.get("weight", 1.0)),
             pairing=str(section.get("pairing", "targeted")).lower(),
@@ -44,6 +46,8 @@ class MixupConfig:
         )
         if parsed.alpha <= 0.0:
             raise ValueError("mixup.alpha must be positive")
+        if parsed.space not in {"fused", "modalities"}:
+            raise ValueError("mixup.space must be 'fused' or 'modalities'")
         if parsed.weight < 0.0:
             raise ValueError("mixup.weight must be non-negative")
         if parsed.pairing not in {"targeted", "random"}:
@@ -57,7 +61,23 @@ class MixupConfig:
 class MixupBatch:
     features: torch.Tensor
     labels: torch.Tensor
-    diagnostics: dict[str, float]
+    diagnostics: dict[str, float | int]
+
+
+@dataclass
+class ModalityMixupBatch:
+    modalities: tuple[torch.Tensor | None, ...]
+    labels: torch.Tensor
+    diagnostics: dict[str, float | int]
+
+
+@dataclass(frozen=True)
+class _MixupPlan:
+    anchors: torch.Tensor
+    partners: torch.Tensor
+    weights: torch.Tensor
+    labels: torch.Tensor
+    diagnostics: dict[str, float | int]
 
 
 def _anchor_mask(positives: torch.Tensor, quantile: float) -> torch.Tensor:
@@ -69,19 +89,63 @@ def _anchor_mask(positives: torch.Tensor, quantile: float) -> torch.Tensor:
 
 def _partner_positions(
     positives: torch.Tensor,
-    anchor_count: int,
+    anchors: torch.Tensor,
     pairing: str,
     generator: "np.random.Generator",
 ) -> torch.Tensor:
     count = int(positives.numel())
     if pairing == "random":
-        drawn = generator.integers(count, size=anchor_count)
+        offsets = generator.integers(1, count, size=int(anchors.numel()))
+        drawn = (anchors.detach().cpu().numpy() + offsets) % count
     else:
         # Targeted: sample partners in proportion to their positive-label mass so
         # the mixed target gains positives the sparse anchor is missing.
         weights = positives.detach().cpu().numpy().clip(min=1.0)
-        drawn = generator.choice(count, size=anchor_count, p=weights / weights.sum())
+        drawn = generator.choice(count, size=int(anchors.numel()), p=weights / weights.sum())
     return torch.as_tensor(drawn, dtype=torch.long, device=positives.device)
+
+
+def _mixup_plan(
+    labels: torch.Tensor,
+    config: MixupConfig,
+    generator: "np.random.Generator",
+    *,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> _MixupPlan | None:
+    if not config.enabled or config.weight == 0.0:
+        return None
+    if labels.ndim != 2:
+        raise ValueError("labels must be 2-D")
+    if labels.shape[0] < 2:
+        return None
+
+    positives = labels.detach().float().sum(dim=1)
+    anchors = _anchor_mask(positives, config.anchor_quantile).nonzero(as_tuple=True)[0]
+    if anchors.numel() == 0:
+        return None
+    partners = _partner_positions(positives, anchors, config.pairing, generator)
+    distinct = partners != anchors
+    if not bool(distinct.any()):
+        return None
+    anchors = anchors[distinct]
+    partners = partners[distinct]
+
+    drawn = generator.beta(config.alpha, config.alpha, size=int(anchors.numel()))
+    if config.keep_anchor:
+        drawn = np.maximum(drawn, 1.0 - drawn)
+    weights = torch.as_tensor(drawn, dtype=dtype, device=device).unsqueeze(1)
+    anchor_labels = labels.index_select(0, anchors).to(device=device, dtype=dtype)
+    partner_labels = labels.index_select(0, partners).to(device=device, dtype=dtype)
+    mixed_labels = weights * anchor_labels + (1.0 - weights) * partner_labels
+    diagnostics: dict[str, float | int] = {
+        "anchor_fraction": anchors.numel() / labels.shape[0],
+        "mean_lambda": float(weights.mean()),
+        "anchor_positive_mean": float(anchor_labels.sum(dim=1).mean()),
+        "mixed_positive_mean": float(mixed_labels.sum(dim=1).mean()),
+        "virtual_samples": int(anchors.numel()),
+    }
+    return _MixupPlan(anchors, partners, weights, mixed_labels, diagnostics)
 
 
 def label_space_mixup(
@@ -100,39 +164,60 @@ def label_space_mixup(
         raise ValueError("features and labels must be 2-D")
     if features.shape[0] != labels.shape[0]:
         raise ValueError("features and labels must describe the same batch")
-    if features.shape[0] < 2:
+    plan = _mixup_plan(
+        labels,
+        config,
+        generator,
+        dtype=features.dtype,
+        device=features.device,
+    )
+    if plan is None:
         return None
+    anchor_features = features.index_select(0, plan.anchors)
+    partner_features = features.index_select(0, plan.partners)
+    mixed_features = plan.weights * anchor_features + (1.0 - plan.weights) * partner_features
+    return MixupBatch(mixed_features, plan.labels, plan.diagnostics)
 
-    positives = labels.detach().float().sum(dim=1)
-    anchors = _anchor_mask(positives, config.anchor_quantile).nonzero(as_tuple=True)[0]
-    if anchors.numel() == 0:
+
+def modality_space_mixup(
+    modalities: tuple[torch.Tensor | None, ...],
+    labels: torch.Tensor,
+    config: MixupConfig,
+    generator: "np.random.Generator",
+) -> ModalityMixupBatch | None:
+    """Interpolate continuous modality representations with one shared mixup plan."""
+    if not config.enabled or config.weight == 0.0:
         return None
-    partners = _partner_positions(positives, int(anchors.numel()), config.pairing, generator)
-    # A sample mixed with itself contributes nothing beyond the clean term.
-    distinct = partners != anchors
-    if not bool(distinct.any()):
+    present = tuple(value for value in modalities if value is not None)
+    if not present:
+        raise ValueError("at least one modality representation is required")
+    reference = present[0]
+    if reference.ndim != 2:
+        raise ValueError("modality representations must be 2-D")
+    for value in present[1:]:
+        if value.ndim != 2 or value.shape[0] != reference.shape[0]:
+            raise ValueError("modality representations must have the same batch dimension")
+        if value.device != reference.device:
+            raise ValueError("modality representations must be on the same device")
+    if labels.ndim != 2 or labels.shape[0] != reference.shape[0]:
+        raise ValueError("labels and modalities must describe the same batch")
+    if labels.device != reference.device:
+        raise ValueError("labels and modality representations must be on the same device")
+
+    plan = _mixup_plan(
+        labels,
+        config,
+        generator,
+        dtype=reference.dtype,
+        device=reference.device,
+    )
+    if plan is None:
         return None
-    anchors = anchors[distinct]
-    partners = partners[distinct]
-
-    drawn = generator.beta(config.alpha, config.alpha, size=int(anchors.numel()))
-    if config.keep_anchor:
-        # Keep the labelled anchor dominant so the synthetic gradient stays
-        # anchored to a real annotation rather than drifting to the partner.
-        drawn = np.maximum(drawn, 1.0 - drawn)
-    weight = torch.as_tensor(drawn, dtype=features.dtype, device=features.device).unsqueeze(1)
-
-    anchor_features = features.index_select(0, anchors)
-    partner_features = features.index_select(0, partners)
-    anchor_labels = labels.index_select(0, anchors).to(features.dtype)
-    partner_labels = labels.index_select(0, partners).to(features.dtype)
-
-    mixed_features = weight * anchor_features + (1.0 - weight) * partner_features
-    mixed_labels = weight * anchor_labels + (1.0 - weight) * partner_labels
-    diagnostics = {
-        "anchor_fraction": anchors.numel() / features.shape[0],
-        "mean_lambda": float(weight.mean()),
-        "anchor_positive_mean": float(anchor_labels.sum(dim=1).mean()),
-        "mixed_positive_mean": float(mixed_labels.sum(dim=1).mean()),
-    }
-    return MixupBatch(mixed_features, mixed_labels, diagnostics)
+    mixed_modalities = tuple(
+        None
+        if value is None
+        else plan.weights * value.index_select(0, plan.anchors)
+        + (1.0 - plan.weights) * value.index_select(0, plan.partners)
+        for value in modalities
+    )
+    return ModalityMixupBatch(mixed_modalities, plan.labels, plan.diagnostics)

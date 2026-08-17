@@ -145,7 +145,7 @@ def _config() -> dict[str, Any]:
     }
 
 
-@pytest.mark.parametrize("method_name", ["random", "comal", "mm_comal", "modis", "mosaic"])
+@pytest.mark.parametrize("method_name", ["random", "comal", "modis", "mosaic"])
 def test_all_methods_select_exact_unique_patient_budget(method_name: str) -> None:
     (
         classifier,
@@ -182,7 +182,7 @@ def test_all_methods_select_exact_unique_patient_budget(method_name: str) -> Non
     assert diagnostics["query_unit"] == "patient"
     assert diagnostics["candidate_patients"] == len(candidate_ids)
     assert diagnostics["selected_patients"] == 2
-    if method_name in {"comal", "mm_comal"}:
+    if method_name == "comal":
         assert state is not None
         assert state.labeled_outputs["labels"].shape[0] == len(labeled_ids)
         assert state.labeled_outputs["prototype_similarities"].shape[0] == len(labeled_ids)

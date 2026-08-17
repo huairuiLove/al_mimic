@@ -24,17 +24,16 @@ production execution path through an upstream checkout.
 - Concept: contrastive active learning for multi-label text classification.
 - Source: https://github.com/JunW15/CoMAL
 - Paper: https://aclanthology.org/2022.coling-1.323/
-- Repository role: the first-party `al_mimic.methods.comal` implementation and
-  its multimodal extension use CoMAL's label-prototype acquisition concepts.
+- Repository role: the first-party `al_mimic.methods.comal` implementation
+  uses CoMAL's label-prototype acquisition concepts.
 - Reproduction boundary: task classifiers, multimodal representations, data
   protocols, and integration code are repository-native; results are not a
   claim that the original text-classification program was run unchanged.
 
-### MM-CoMAL, MoDIS, and MoSAIC
+### MoDIS and MoSAIC
 
 These are repository-native multimodal acquisition methods or extensions built
-on the shared plugin contract. MM-CoMAL extends label-prototype evidence across
-modality and fused views. MoDIS uses modality probes, disagreement, and
+on the shared plugin contract. MoDIS uses modality probes, disagreement, and
 intervention stability. MoSAIC combines Fisher-design screening with a
 modality-coalition decomposition. Their implementation is under
 `src/al_mimic/methods/`; no external checkout is executed.
@@ -77,6 +76,15 @@ The task manifests retain reference revisions used during implementation:
 These revisions are provenance metadata, not tracked submodules or runtime
 dependencies. The first-party preprocessing modules and task runner implement
 the actual executable path.
+
+The phenotyping preprocessing pipeline materialises the small protocol resources
+needed for that implementation under
+`src/al_mimic/tasks/mimic_iii/preprocessing/resources/`: the HCUP CCS definition
+map, official validation/test subject lists, the 17-variable ITEMID map, and
+the 76-column discretizer configuration. These are checked-in provenance
+artifacts, not imports from an upstream checkout. Building a phenotyping HDF5
+therefore needs the credentialed raw MIMIC-III CSVs and the project runtime
+dependencies, but does not need `thirdparty/` to be present on the server.
 
 ## BRSET sources
 

@@ -7,7 +7,7 @@ The `mimic_iii` plugin includes two phenotyping task IDs alongside diagnosis:
 | Task ID | Labels | Label definition | Primary metric | Runnable configs |
 |---|---:|---|---|---|
 | `phenotyping_25` | 25 | MIMIC-III Benchmark acute-care groups | macro-AUPRC | `configs/experiments/mimic_iii/phenotyping_25_*.yaml` |
-| `phenotyping_ccs_172` | 172 | HCUP CCS 2015 groups represented in at least 30 episodes | macro-AUPRC | `configs/experiments/mimic_iii/phenotyping_ccs_172_*.yaml` |
+| `phenotyping_ccs_239` | 239 | HCUP CCS 2015 groups occurring in >=30 episodes of the final cohort | macro-AUPRC | `configs/experiments/mimic_iii/phenotyping_ccs_239_*.yaml` |
 
 One active-learning query is one ICU stay and returns its complete native
 multi-hot vector. The first-party task specs, adapters, preprocessing modules,
@@ -36,9 +36,15 @@ them. Results must not be described as a numerical reproduction of an upstream
 downstream script.
 
 The 172-label paper code also needs careful interpretation: its checked-in CCS
-definitions mark the original 25 benchmark groups by default. The package-local
-label builder enforces the paper's broader rule of CCS groups occurring in at
-least 30 episodes and fails unless the result contains exactly 172 labels.
+definitions mark the original 25 benchmark groups by default, and its released
+code selects only those. The paper itself states one selection rule -- CCS
+groups occurring in at least 30 episodes -- and reports 172 phenotypes
+without ever enumerating them. That count is not reproducible from any
+published rule: the >=30-episode rule selects 239 CCS groups on this
+repository's final cohort (243 across the full 42,276-stay benchmark
+population). The package-local label builder therefore commits to the stated
+rule and its actual yield, and fails unless the result contains exactly 239
+labels.
 
 ## Artifact contract
 
@@ -51,23 +57,29 @@ Both tasks consume one HDF5 with `with_notes/{train,val,test}`. Each row contain
 - task and label-name metadata.
 
 The 25-label task uses the official 76-feature one-hour discretization and
-subject split. The 172-label task uses the notes-benchmark subject split and an
-explicit 172-column CCS label table. The adapter validates split leakage, binary
+subject split. The 239-label task uses the notes-benchmark subject split and an
+explicit 239-column CCS label table. The adapter validates split leakage, binary
 labels, label width, feature width, and identifiers.
 
 The prepared HDF5 is expected at the path in the selected task config:
 
 ```text
 dataset/processed/mimic_phenotyping_25/splits.hdf5
-dataset/processed/mimic_phenotyping_ccs_172/splits.hdf5
+dataset/processed/mimic_phenotyping_ccs_239/splits.hdf5
 ```
 
-`al-mimic prepare` validates that already-created HDF5 and ClinicalBERT
+`al-mimic prepare` validates an already-created HDF5 and ClinicalBERT
 checkpoint and writes `manifest.json` below the configured `dataset/prepared/`
-directory. The public CLI does not currently expose raw-table-to-HDF5
-construction as an action. Creating those HDF5 inputs is therefore a separate
-first-party preprocessing step that must be completed before the documented
-runtime commands can succeed.
+directory. The raw-table construction is implemented by the first-party
+modules under `src/al_mimic/tasks/mimic_iii/preprocessing/`; it does not execute
+any checkout under `thirdparty/`. The pipeline is documented in
+[`dataset/README.md`](dataset/README.md): build the benchmark cohort, extract
+chronological notes, stream the 17 structured event variables into the official
+76-channel representation, and assemble `splits.hdf5`.
+
+The 239-label builder applies the >=30-episode rule directly and refuses to
+continue unless the final cohort selects exactly 239 CCS groups. This makes a
+cohort mismatch visible before an experiment starts.
 
 ## Model and training
 
@@ -78,7 +90,7 @@ The native classifier combines:
 - a three-layer structured Transformer with masked mean pooling;
 - a fusion gate and independent sigmoid label head.
 
-The 25-label head emits 25 logits; the CCS head emits 172. Training uses BCE with
+The 25-label head emits 25 logits; the CCS head emits 239. Training uses BCE with
 logits and the same cold-start rule as the diagnosis runner: each round reloads
 the same ClinicalBERT source and freshly initializes all other state.
 
@@ -86,7 +98,7 @@ The current phenotyping configs use six low-budget rounds with a 1% initial
 fraction and 1% increments, ending at 6% of the train pool. This differs from
 the 10%-35% schedule used by the MIMIC-III diagnosis and BRSET configs.
 
-The task plugin declares Random, CoMAL, MM-CoMAL, MoDIS, and MoSAIC capability.
+The task plugin declares Random, CoMAL, MoDIS, and MoSAIC capability.
 Checked-in runnable phenotyping configs currently cover Random and CoMAL only.
 Other methods require a matching experiment config before they are runnable.
 
@@ -115,8 +127,8 @@ uv run al-mimic active \
   --config configs/experiments/mimic_iii/phenotyping_25_random.yaml
 ```
 
-For 172 labels, use
-`configs/experiments/mimic_iii/phenotyping_ccs_172_random.yaml`. CoMAL variants
+For 239 labels, use
+`configs/experiments/mimic_iii/phenotyping_ccs_239_random.yaml`. CoMAL variants
 use the corresponding `_comal.yaml` config and `--method comal`.
 
 The output contract is the same as other MIMIC-III active runs:

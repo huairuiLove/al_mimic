@@ -235,13 +235,14 @@ class YangWuBertEncoderClassifier(nn.Module):
     def probabilities_from_fused(self, fused: torch.Tensor) -> torch.Tensor:
         return torch.sigmoid(self.classifier(fused))
 
-    def forward(
+    def forward_from_modalities(
         self,
-        batch: dict[str, torch.Tensor],
+        text: torch.Tensor,
+        series: torch.Tensor,
+        static: torch.Tensor | None,
         *,
         return_tokens: bool = False,
     ) -> dict[str, torch.Tensor]:
-        text, series, static = self.encode_modalities(batch)
         fused = self.gate(text, static, series)
         logits = self.classifier(fused)
         result = {
@@ -252,3 +253,12 @@ class YangWuBertEncoderClassifier(nn.Module):
         if return_tokens:
             result["modality_tokens"] = self._decompose(text, series, static, fused)
         return result
+
+    def forward(
+        self,
+        batch: dict[str, torch.Tensor],
+        *,
+        return_tokens: bool = False,
+    ) -> dict[str, torch.Tensor]:
+        text, series, static = self.encode_modalities(batch)
+        return self.forward_from_modalities(text, series, static, return_tokens=return_tokens)

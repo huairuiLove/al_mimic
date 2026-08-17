@@ -53,8 +53,8 @@ Methods own task-independent acquisition behavior:
 - an `acquire` implementation returning stable IDs and candidate-relative
   positions through `AcquisitionResult`.
 
-The method registry stores lazy import paths for `random`, `comal`, `mm_comal`,
-`modis`, and `mosaic`. A method must not import a concrete task. It receives all
+The method registry stores lazy import paths for `random`, `comal`,
+`modis`, `modimix`, and `mosaic`. A method must not import a concrete task. It receives all
 task data through `AcquisitionContext` or its prepared mapping.
 
 ### `al_mimic.core`
@@ -116,10 +116,10 @@ Method plugins declare only the features they need. Compatibility is the
 intersection of the task's method allow-list and these required features. The
 current declared matrix is:
 
-| Task | Random | CoMAL | MM-CoMAL | MoDIS | MoSAIC |
+| Task | Random | CoMAL | MoDIS | ModiMix | MoSAIC |
 |---|:---:|:---:|:---:|:---:|:---:|
 | `mimic_iii` | yes | yes | yes | yes | yes |
-| `brset` | yes | yes | yes | yes | yes |
+| `brset` | yes | yes | yes | no | yes |
 | `mds_ed` | no | no | no | no | no |
 
 `mds_ed` is deliberately `supervised_only` today. Adding method names to a

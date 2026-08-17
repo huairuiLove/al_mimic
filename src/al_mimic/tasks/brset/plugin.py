@@ -29,7 +29,6 @@ class BrsetTaskPlugin:
     supported_methods: tuple[str, ...] = (
         "random",
         "comal",
-        "mm_comal",
         "modis",
         "mosaic",
     )

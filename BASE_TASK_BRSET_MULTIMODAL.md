@@ -85,7 +85,7 @@ The configured active-learning schedule has six cumulative patient budgets at
 10%, 15%, 20%, 25%, 30%, and 35% of the train patient pool. Validation and test
 patients never enter the query pool.
 
-The plugin declares support for Random, CoMAL, MM-CoMAL, MoDIS, and MoSAIC.
+The plugin declares support for Random, CoMAL, MoDIS, and MoSAIC.
 Image-level model outputs are aggregated to stable patient candidates before
 selection. Compatibility is checked before the run starts.
 
@@ -127,7 +127,7 @@ uv run al-mimic active \
   --config configs/experiments/brset/random.yaml
 ```
 
-Available experiment configs cover Random, CoMAL, MM-CoMAL, MoDIS, and MoSAIC.
+Available experiment configs cover Random, CoMAL, MoDIS, and MoSAIC.
 An active run writes per-round and final checkpoints, patient/image query
 records in `active_state.json`, final metrics and predictions,
 `resolved_config.json`, and `source_audit.json` below its experiment directory.

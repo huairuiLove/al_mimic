@@ -14,8 +14,8 @@ from typing import Any
 _METHOD_PATHS = {
     "random": "al_mimic.methods.random:PLUGIN",
     "comal": "al_mimic.methods.comal:PLUGIN",
-    "mm_comal": "al_mimic.methods.mm_comal:PLUGIN",
     "modis": "al_mimic.methods.modis:PLUGIN",
+    "modimix": "al_mimic.methods.modimix:PLUGIN",
     "mosaic": "al_mimic.methods.mosaic:PLUGIN",
 }
 

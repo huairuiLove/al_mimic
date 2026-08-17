@@ -1,4 +1,0 @@
-extends: ../../methods/brset/mm_comal.yaml
-
-task:
-  family: brset

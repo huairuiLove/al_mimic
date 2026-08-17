@@ -15,7 +15,7 @@ from torch.optim.lr_scheduler import LambdaLR
 
 from .config import require_paths
 from .data import YangWuFeatureStore
-from .mixup import MixupConfig, label_space_mixup
+from .mixup import MixupConfig, label_space_mixup, modality_space_mixup
 from .model import YangWuBertEncoderClassifier
 
 
@@ -342,6 +342,7 @@ def train_multimodal_round(
                 "mixup_loss": [],
                 "mixup_anchor_positive_mean": [],
                 "mixup_mixed_positive_mean": [],
+                "mixup_virtual_samples": [],
             }
         )
 
@@ -378,26 +379,43 @@ def train_multimodal_round(
         mixup_losses: list[torch.Tensor] = []
         anchor_positives: list[float] = []
         mixed_positives: list[float] = []
+        virtual_samples = 0
         for host_batch in loader:
             if optimizer_steps >= optimizer_step_budget:
                 break
             batch = _move_batch(host_batch, device)
             optimizer.zero_grad(set_to_none=True)
             with _autocast(device, precision):
-                output = classifier(batch)
+                if mixup.enabled and mixup.space == "modalities":
+                    text, series, static = classifier.encode_modalities(batch)
+                    output = classifier.forward_from_modalities(text, series, static)
+                else:
+                    text = series = static = None
+                    output = classifier(batch)
                 classifier_loss = F.binary_cross_entropy_with_logits(output["logits"], batch["labels"])
                 loss = classifier_loss
                 if mixup.enabled:
                     assert mixup_generator is not None
-                    mixed = label_space_mixup(output["features"], batch["labels"], mixup, mixup_generator)
-                    if mixed is not None:
-                        mixup_loss = F.binary_cross_entropy_with_logits(
-                            classifier.classifier(mixed.features), mixed.labels
+                    if mixup.space == "modalities":
+                        assert text is not None and series is not None
+                        mixed = modality_space_mixup(
+                            (text, series, static), batch["labels"], mixup, mixup_generator
                         )
+                        mixed_output = (
+                            None if mixed is None else classifier.forward_from_modalities(*mixed.modalities)
+                        )
+                    else:
+                        mixed = label_space_mixup(output["features"], batch["labels"], mixup, mixup_generator)
+                        mixed_output = (
+                            None if mixed is None else {"logits": classifier.classifier(mixed.features)}
+                        )
+                    if mixed is not None and mixed_output is not None:
+                        mixup_loss = F.binary_cross_entropy_with_logits(mixed_output["logits"], mixed.labels)
                         loss = loss + mixup.weight * mixup_loss
                         mixup_losses.append(mixup_loss.detach())
-                        anchor_positives.append(mixed.diagnostics["anchor_positive_mean"])
-                        mixed_positives.append(mixed.diagnostics["mixed_positive_mean"])
+                        anchor_positives.append(float(mixed.diagnostics["anchor_positive_mean"]))
+                        mixed_positives.append(float(mixed.diagnostics["mixed_positive_mean"]))
+                        virtual_samples += int(mixed.diagnostics["virtual_samples"])
             loss.backward()
             torch.nn.utils.clip_grad_norm_(classifier.parameters(), float(training["gradient_clip"]))
             optimizer.step()
@@ -418,6 +436,7 @@ def train_multimodal_round(
             history["mixup_mixed_positive_mean"].append(
                 float(np.mean(mixed_positives)) if mixed_positives else 0.0
             )
+            history["mixup_virtual_samples"].append(float(virtual_samples))
         if validation is not None:
             assert validation_loader is not None
             current_validation_loss = _validation_loss(classifier, validation_loader, device, precision)
@@ -461,6 +480,8 @@ def train_multimodal_round(
         "optimizer": "adamw",
         "weight_decay": float(training["weight_decay"]),
         "learning_rates": learning_rates,
+        "mixup_space": mixup.space if mixup.enabled else None,
+        "mixup_virtual_samples": int(sum(history.get("mixup_virtual_samples", []))),
     }
     return TrainedMultimodalRound(
         classifier=classifier,

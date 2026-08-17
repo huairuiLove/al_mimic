@@ -11,7 +11,7 @@ TASK_ROOT = SOURCE_ROOT / "tasks"
 METHOD_ROOT = SOURCE_ROOT / "methods"
 CORE_ROOT = SOURCE_ROOT / "core"
 TASK_NAMES = {"brset", "mds_ed", "mimic_iii"}
-METHOD_NAMES = {"random", "comal", "mm_comal", "modis", "mosaic"}
+METHOD_NAMES = {"random", "comal", "modis", "modimix", "mosaic"}
 FORBIDDEN_SOURCE_TERMS = ("thirdparty", "third_party", "comal-main", "mds-ed-main")
 
 

@@ -26,7 +26,15 @@ TASKS: dict[str, MimicTaskSpec] = {
         label_format="icd9_top3_multihot",
         query_unit="icu_stay",
         primary_metric="recall_at_30",
-        metrics=("recall_at_10", "recall_at_20", "recall_at_30"),
+        metrics=(
+            "recall_at_10",
+            "recall_at_20",
+            "recall_at_30",
+            "macro_auprc",
+            "micro_auprc",
+            "macro_auroc",
+            "micro_auroc",
+        ),
         source_repositories=(("https://github.com/emnlp-mimic/mimic", "upstream"),),
     ),
     "phenotyping_25": MimicTaskSpec(
@@ -48,11 +56,11 @@ TASKS: dict[str, MimicTaskSpec] = {
             ),
         ),
     ),
-    "phenotyping_ccs_172": MimicTaskSpec(
-        task_id="phenotyping_ccs_172",
-        display_name="MIMIC-III HCUP CCS phenotyping (172 labels)",
-        label_count=172,
-        label_format="hcup_ccs_2015_multihot_172",
+    "phenotyping_ccs_239": MimicTaskSpec(
+        task_id="phenotyping_ccs_239",
+        display_name="MIMIC-III HCUP CCS phenotyping (239 labels)",
+        label_count=239,
+        label_format="hcup_ccs_2015_multihot_239",
         query_unit="icu_stay",
         primary_metric="macro_auprc",
         metrics=("macro_auprc", "micro_auprc", "macro_auroc", "micro_auroc"),

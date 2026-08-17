@@ -21,6 +21,7 @@ dependencies = [
   "torchvision>=0.16",
   "Pillow>=10",
   "iterative-stratification>=0.1.9",
+  "pandas>=2.0",
 ]
 
 [project.optional-dependencies]
@@ -37,6 +38,7 @@ include = ["al_mimic*"]
 [tool.setuptools.package-data]
 "al_mimic.tasks.mds_ed" = ["LICENSE", "NOTICE"]
 "al_mimic.tasks.mimic_iii" = ["protocol_profiles.yaml"]
+"al_mimic.tasks.mimic_iii.preprocessing" = ["resources/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

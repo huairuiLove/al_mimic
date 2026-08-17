@@ -44,9 +44,9 @@ by Git, so another checkout can have a different local-data status.
 
 | Task plugin | Native task | Query unit | Implemented actions | Local status |
 |---|---|---|---|---|
-| `mimic_iii` | `icd9_diagnoses` (915 labels) | ICU stay | `prepare`, `validate-data`, `explore`, `active`, `full-data`, `visualize`, `hardware` | Yang-Wu/FIDDLE tensors, ClinicalBERT, and completed six-round Random/CoMAL/MM-CoMAL/MoDIS/MoSAIC outputs are present; the configured HDF5 target is currently a broken cross-host symlink |
+| `mimic_iii` | `icd9_diagnoses` (915 labels) | ICU stay | `prepare`, `validate-data`, `explore`, `active`, `full-data`, `visualize`, `hardware` | Yang-Wu/FIDDLE tensors, ClinicalBERT, and completed six-round Random/CoMAL/MoDIS/MoSAIC outputs are present; the configured HDF5 target is currently a broken cross-host symlink |
 | `mimic_iii` | `phenotyping_25` | ICU stay | same MIMIC-III actions | adapter and configs implemented; no task-specific processed HDF5, prepared manifest, or experiment output is present |
-| `mimic_iii` | `phenotyping_ccs_172` | ICU stay | same MIMIC-III actions | adapter and configs implemented; no task-specific processed HDF5, prepared manifest, or experiment output is present |
+| `mimic_iii` | `phenotyping_ccs_239` (239 labels) | ICU stay | same MIMIC-III actions | adapter and configs implemented; no task-specific processed HDF5, prepared manifest, or experiment output is present |
 | `brset` | BRSET v1.0.2, 13 labels | patient | `prepare`, `validate-data`, `active`, `full-data`, `hardware` | source release is present; prepared split and experiment outputs are not present |
 | `mds_ed` | MDS-ED diagnoses, 1,428 labels | ECG study | `prepare`, `validate-data`, `train`, `hardware` | release CSV and ECG source are present; prepared memmap and supervised output are not present |
 
@@ -62,10 +62,10 @@ Task protocols and reproduction boundaries are detailed in:
 This is the compatibility declared by the task and method plugins. MDS-ED is
 currently supervised-only and therefore accepts no acquisition method.
 
-| Task | Random | CoMAL | MM-CoMAL | MoDIS | MoSAIC |
+| Task | Random | CoMAL | MoDIS | ModiMix | MoSAIC |
 |---|:---:|:---:|:---:|:---:|:---:|
 | `mimic_iii` | yes | yes | yes | yes | yes |
-| `brset` | yes | yes | yes | yes | yes |
+| `brset` | yes | yes | yes | no | yes |
 | `mds_ed` | no | no | no | no | no |
 
 Method requirements are explicit:
@@ -74,8 +74,8 @@ Method requirements are explicit:
 |---|---|
 | `random` | candidate IDs and a query budget only |
 | `comal` | multi-label probabilities and label prototypes |
-| `mm_comal` | multi-label probabilities, modality tokens, and label prototypes |
 | `modis` | multi-label probabilities, modality tokens, and token fusion |
+| `modimix` | the MoDIS acquisition capabilities plus MIMIC-III modality-space Mixup during training |
 | `mosaic` | multi-label probabilities, modality tokens, token fusion, and reference labels |
 
 The CLI validates the task action, method allow-list, required capabilities, and

@@ -18,7 +18,7 @@ copy of the artifact reported in the paper:
 | observation window | 48 hours | 48 hours |
 | note length | 512 tokens | 512 tokens |
 
-Completed six-round experiment directories for Random, CoMAL, MM-CoMAL, MoDIS,
+Completed six-round experiment directories for Random, CoMAL, MoDIS,
 and MoSAIC are present locally under `experiments/`. They contain checkpoints,
 state, final metrics, predictions, and resolved configs. They are ignored by Git.
 The configured HDF5 target is currently a broken symbolic link to an absolute
@@ -61,7 +61,11 @@ out-of-fold probes; a global row index is not an acceptable substitute.
 
 `al-mimic prepare` audits an already-built HDF5 and ClinicalBERT checkpoint and
 writes a provenance manifest. It does not reconstruct FIDDLE tensors from raw
-MIMIC tables.
+MIMIC tables. The final assembly step that combines the FIDDLE tensors, notes,
+labels, and split assignments into `splits.hdf5` is
+`al_mimic.tasks.mimic_iii.preprocessing.build_splits`; it also carries an
+`--attach-only` mode that adds the subject-aligned arrays to an older artifact
+after verifying its label row order.
 
 ## Classifier
 
@@ -80,23 +84,27 @@ source and freshly initializes the other model, method, and optimizer state.
 
 ## Active-learning protocol
 
-The configured diagnosis experiments use six cold-start rounds at cumulative
-fractions 10%, 15%, 20%, 25%, 30%, and 35% of the actual train pool. Counts use
-half-up rounding. Validation and test rows are fixed and never queried.
+The configured diagnosis experiments use nine cold-start rounds at cumulative
+fractions 10%, 15%, 20%, 25%, 30%, 35%, 40%, 45%, and 50% of the actual train
+pool. Counts use half-up rounding. Validation and test rows are fixed and never
+queried.
 
-The task plugin declares support for all five registered methods:
+The task plugin declares support for these registered methods:
 
 | Method | Task-provided inputs |
 |---|---|
 | `random` | ICU-stay IDs and query budget |
 | `comal` | fused probabilities and label-prototype evidence |
-| `mm_comal` | note, time-series, time-invariant, and fused views |
 | `modis` | modality tokens, grouped probes, and token interventions |
+| `modimix` | MoDIS-style acquisition inputs plus synchronized modality-space Mixup during classifier training |
 | `mosaic` | modality coalitions, labeled outputs, and fixed validation reference outputs |
 
 Every round has an 80-epoch ceiling, a 1,200 optimizer-step budget, and
 validation-loss early stopping. No prior-round classifier or optimizer state is
-inherited.
+inherited. Each round persists its final classifier checkpoint
+(`checkpoints/round_XXX.pt`, plus `final.pt` for the last round) and resumable
+loop state (`checkpoints/progress.json`); rerunning `al-mimic active` resumes
+from the last completed round by default, and `--no-resume` forces a fresh run.
 
 ## Evaluation
 

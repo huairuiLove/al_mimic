@@ -359,7 +359,6 @@ def acquire_modis(
             work_combined, prediction_entropy.index_select(0, work_positions)
         ),
         "paper_comal": None,
-        "mm_comal_dispersion": None,
         "mosaic_synergy": None,
     }
     if comparison_scores:

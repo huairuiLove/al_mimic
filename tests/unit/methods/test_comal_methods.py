@@ -14,14 +14,8 @@ from al_mimic.methods.comal import (
     positive_similarity_thresholds as legacy_positive_similarity_thresholds,
 )
 from al_mimic.methods.comal.plugin import CoMALPlugin
-from al_mimic.methods.mm_comal import (
-    MMCoMALPlugin,
-    estimate_mm_comal_statistics,
-    mm_comal_acquisition_scores,
-)
 from al_mimic.utils.prototypes import (
     attach_prototype_outputs,
-    positive_similarity_thresholds,
     refresh_prototypes,
 )
 
@@ -145,47 +139,6 @@ def test_comal_plugin_ranks_candidates_and_returns_uniform_result() -> None:
     assert result.diagnostics["method"] == "comal"
 
 
-def test_mm_comal_alpha_zero_equals_fused_paper_comal() -> None:
-    labels = torch.tensor([[1.0, 0.0], [1.0, 1.0], [0.0, 1.0], [0.0, 0.0]])
-    labeled_similarity = torch.tensor(
-        [
-            [[0.8, -0.4], [0.7, -0.2], [0.9, -0.3]],
-            [[0.6, 0.5], [0.4, 0.7], [0.8, 0.6]],
-            [[-0.3, 0.8], [-0.1, 0.6], [-0.2, 0.9]],
-            [[-0.6, -0.4], [-0.5, -0.3], [-0.7, -0.5]],
-        ]
-    )
-    candidate_similarity = labeled_similarity[:3] * 0.9
-    probabilities = torch.tensor([[0.8, 0.2], [0.7, 0.8], [0.2, 0.9]])
-    statistics = estimate_mm_comal_statistics(
-        labeled_similarity,
-        labels,
-        threshold_estimator="midpoint",
-    )
-
-    mm_parts = mm_comal_acquisition_scores(
-        probabilities,
-        candidate_similarity,
-        statistics,
-        expected_cardinality=1.0,
-        alpha=0.0,
-    )
-    fused_thresholds = positive_similarity_thresholds(labels, own_similarity=labeled_similarity[:, -1])
-    paper_parts = paper_comal_acquisition_scores(
-        probabilities,
-        None,
-        torch.empty(0),
-        fused_thresholds,
-        expected_cardinality=1.0,
-        own_similarity=candidate_similarity[:, -1],
-    )
-
-    assert torch.allclose(statistics.thresholds[-1], fused_thresholds)
-    assert torch.allclose(mm_parts.base_score, paper_parts.combined)
-    assert torch.allclose(mm_parts.combined, paper_parts.combined)
-    assert torch.equal(mm_parts.dispersion, torch.zeros_like(mm_parts.dispersion)) is False
-
-
 def _task_outputs(
     *,
     rows: int,
@@ -254,62 +207,3 @@ def test_comal_fit_prepare_and_acquire_need_no_task_adapter(context_style: str) 
     assert prepared.labeled_own_similarity.shape == (6, 3)
     assert len(result.selected_ids) == 2
     assert "own_similarity" not in values
-
-
-@pytest.mark.parametrize("context_style", ["mimic", "brset"])
-def test_mm_comal_fit_prepare_and_acquire_need_no_task_adapter(context_style: str) -> None:
-    plugin = MMCoMALPlugin()
-    labeled = _task_outputs(rows=6, feature_dim=4, labels=3, modalities=2, seed=9)
-    candidates = _task_outputs(rows=4, feature_dim=4, labels=3, modalities=2, seed=10)
-    candidate_ids = (201, 202, 203, 204) if context_style == "mimic" else ("a", "b", "c", "d")
-    values = {
-        "candidate_ids": candidate_ids,
-        "query_size": 2,
-        "labeled_outputs": labeled,
-        "candidate_outputs": candidates,
-        "config": _fit_config(),
-    }
-    context = SimpleNamespace(**values) if context_style == "mimic" else values
-
-    state = plugin.fit(context)
-    prepared = plugin.prepare_context(context, state)
-    result = plugin.acquire(prepared)
-
-    assert state.module.num_views == 3
-    assert len(state.history) == 2
-    assert state.labeled_outputs["view_own_similarity"].shape == (6, 3, 3)
-    assert state.labeled_outputs["own_similarity"].shape == (6, 3)
-    assert prepared.candidate_outputs["view_own_similarity"].shape == (4, 3, 3)
-    assert prepared.view_own_similarity.shape == (4, 3, 3)
-    assert prepared.own_similarity.shape == (4, 3)
-    assert prepared.labeled_view_own_similarity.shape == (6, 3, 3)
-    assert torch.equal(prepared.prototypes, state.module.prototypes)
-    assert len(result.selected_ids) == 2
-    assert "view_own_similarity" not in values
-
-
-def test_mm_comal_plugin_normalizes_view_weights_and_selects_exact_budget() -> None:
-    labels = torch.tensor([[1.0, 0.0], [1.0, 1.0], [0.0, 1.0], [0.0, 0.0]])
-    labeled_similarity = torch.tensor(
-        [
-            [[0.9, -0.5], [0.7, -0.3], [0.8, -0.4]],
-            [[0.8, 0.7], [0.6, 0.8], [0.7, 0.6]],
-            [[-0.4, 0.9], [-0.2, 0.7], [-0.3, 0.8]],
-            [[-0.6, -0.5], [-0.4, -0.6], [-0.5, -0.4]],
-        ]
-    )
-    result = MMCoMALPlugin().acquire(
-        candidate_ids=(10, 11, 12),
-        query_size=2,
-        probabilities=torch.tensor([[0.9, 0.1], [0.6, 0.8], [0.2, 0.7]]),
-        view_own_similarity=labeled_similarity[:3],
-        labeled_labels=labels,
-        labeled_view_own_similarity=labeled_similarity,
-        config={"acquisition": {"mm": {"alpha": 0.5}}},
-    )
-
-    weights = result.diagnostics["view_weights"]
-    assert torch.allclose(weights[:-1].sum(dim=0), torch.ones(2))
-    assert torch.equal(weights[-1], torch.zeros(2))
-    assert len(result.selected_positions) == 2
-    assert len(set(result.selected_ids)) == 2

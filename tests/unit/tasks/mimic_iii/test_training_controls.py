@@ -118,20 +118,33 @@ class _TinyRoundClassifier(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.text_encoder = torch.nn.Linear(3, 4)
-        self.fusion = torch.nn.Linear(4, 4)
+        self.series_encoder = torch.nn.Linear(3, 4)
+        self.static_encoder = torch.nn.Linear(3, 4)
+        self.fusion = torch.nn.Linear(12, 4)
         self.classifier = torch.nn.Linear(4, 2)
         self.feature_dim = 4
         self.num_labels = 2
 
-    def forward(self, batch, *, return_tokens=False):
-        del return_tokens
-        features = torch.tanh(self.fusion(torch.tanh(self.text_encoder(batch["features"]))))
+    def encode_modalities(self, batch):
+        values = batch["features"]
+        return (
+            torch.tanh(self.text_encoder(values)),
+            torch.tanh(self.series_encoder(values)),
+            torch.tanh(self.static_encoder(values)),
+        )
+
+    def forward_from_modalities(self, text, series, static):
+        features = torch.tanh(self.fusion(torch.cat((text, series, static), dim=1)))
         logits = self.classifier(features)
         return {
             "logits": logits,
             "probabilities": torch.sigmoid(logits),
             "features": features,
         }
+
+    def forward(self, batch, *, return_tokens=False):
+        del return_tokens
+        return self.forward_from_modalities(*self.encode_modalities(batch))
 
 
 class _TinyStore:
@@ -173,6 +186,37 @@ def _train_tiny_round(monkeypatch, training_overrides):
         torch.device("cpu"),
         validation_indices=[4, 5],
     )
+
+
+def test_modality_mixup_generates_virtual_samples_without_changing_step_budget(monkeypatch) -> None:
+    config = _training_config(epochs=3, optimizer_steps_per_round=3)
+    config["mixup"] = {
+        "enabled": True,
+        "space": "modalities",
+        "alpha": 1.0,
+        "weight": 1.0,
+        "pairing": "random",
+        "anchor_quantile": 1.0,
+        "keep_anchor": False,
+    }
+    monkeypatch.setattr(
+        "al_mimic.tasks.mimic_iii.training.build_classifier",
+        lambda store, config, device: _TinyRoundClassifier().to(device),
+    )
+
+    trained = train_multimodal_round(
+        _TinyStore(),
+        [0, 1, 2, 3],
+        config,
+        torch.device("cpu"),
+        validation_indices=[4, 5],
+    )
+
+    assert trained.training_summary["optimizer_steps"] == 3
+    assert trained.training_summary["mixup_space"] == "modalities"
+    assert trained.training_summary["mixup_virtual_samples"] > 0
+    assert sum(trained.history["mixup_virtual_samples"]) > 0
+    assert all(value > 0.0 for value in trained.history["mixup_loss"])
 
 
 def test_round_stops_at_the_fixed_optimizer_step_budget(monkeypatch) -> None:

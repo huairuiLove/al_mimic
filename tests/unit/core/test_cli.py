@@ -43,7 +43,7 @@ def test_run_parser_requires_config_for_data_actions() -> None:
 
 
 def test_registry_methods_are_first_party_plugins() -> None:
-    assert set(METHODS) == {"random", "comal", "mm_comal", "modis", "mosaic"}
+    assert set(METHODS) == {"random", "comal", "modis", "modimix", "mosaic"}
     assert set(available_methods()) == set(METHODS)
     for name in METHODS:
         plugin = get_method(name)
@@ -73,6 +73,8 @@ def test_capabilities_dispatch_builds_task_method_matrix() -> None:
     records = dispatch(build_parser().parse_args(["capabilities"]))
     by_id = {record["task_id"]: record for record in records}
     assert by_id["mimic_iii"]["method_support"]["mosaic"] is True
+    assert by_id["mimic_iii"]["method_support"]["modimix"] is True
+    assert by_id["brset"]["method_support"]["modimix"] is False
     assert by_id["brset"]["method_support"]["random"] is True
     assert all(value is False for value in by_id["mds_ed"]["method_support"].values())
 

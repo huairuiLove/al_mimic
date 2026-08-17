@@ -3,6 +3,16 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+from al_mimic.methods.modimix import (
+    ModalityProbes as ModiMixModalityProbes,
+)
+from al_mimic.methods.modimix import (
+    ModiMixPlugin,
+    ModiMixProbeState,
+)
+from al_mimic.methods.modimix import (
+    ReliabilityStatistics as ModiMixReliabilityStatistics,
+)
 from al_mimic.methods.modis import (
     ModalityProbes,
     MoDISPlugin,
@@ -138,6 +148,56 @@ def test_modis_plugin_runs_without_mosaic_and_selects_exact_budget() -> None:
     }
     assert torch.isfinite(result.scores["combined"]).all()
     assert result.diagnostics["method"] == "modis"
+
+
+def test_modimix_plugin_has_independent_identity_and_acquisition_config() -> None:
+    classifier = SumFusionClassifier()
+    tokens = torch.tensor(
+        [
+            [[2.0, -1.0], [-1.0, 1.5]],
+            [[1.0, 1.0], [-1.0, -1.0]],
+            [[-2.0, 1.0], [1.0, -1.5]],
+            [[0.2, 0.1], [0.1, 0.2]],
+        ]
+    )
+    probabilities = classifier.probabilities_from_fused(classifier.fuse_from_tokens(tokens))
+    original = _probe_state()
+    probes = ModiMixModalityProbes(2, 2, 2)
+    probes.load_state_dict(original.probes.state_dict())
+    statistics = ModiMixReliabilityStatistics(**vars(original.statistics))
+    state = ModiMixProbeState(
+        probes=probes,
+        statistics=statistics,
+        prototypes=original.prototypes,
+        labeled_prevalence=original.labeled_prevalence,
+        labeled_cardinality=original.labeled_cardinality,
+        diagnostics=original.diagnostics,
+        history=original.history,
+    )
+
+    result = ModiMixPlugin().acquire(
+        candidate_ids=("a", "b", "c", "d"),
+        query_size=2,
+        classifier=classifier,
+        probe_state=state,
+        candidate_outputs={
+            "probabilities": probabilities,
+            "modality_tokens": tokens,
+        },
+        config={
+            "modimix": {
+                "workset_size": 4,
+                "grid_k": 2,
+                "bisect_steps": 1,
+                "fusion_batch_size": 4,
+                "probe_eval_batch_size": 4,
+            }
+        },
+    )
+
+    assert len(result.selected_ids) == 2
+    assert result.diagnostics["method"] == "modimix"
+    assert torch.isfinite(result.scores["combined"]).all()
 
 
 def test_mobius_inversion_recovers_additive_and_synergy_terms() -> None:

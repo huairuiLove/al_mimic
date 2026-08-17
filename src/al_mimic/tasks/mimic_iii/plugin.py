@@ -31,8 +31,8 @@ class MimicIIITaskPlugin:
     supported_methods: tuple[str, ...] = (
         "random",
         "comal",
-        "mm_comal",
         "modis",
+        "modimix",
         "mosaic",
     )
     query_unit: str = "icu_stay"
@@ -63,8 +63,8 @@ class MimicIIITaskPlugin:
     def runner(self, config: dict[str, Any]) -> ActiveLearningExperiment:
         return ActiveLearningExperiment(config)
 
-    def run(self, config: dict[str, Any]) -> dict[str, Any]:
-        return self.runner(config).run()
+    def run(self, config: dict[str, Any], *, resume: bool = True) -> dict[str, Any]:
+        return self.runner(config).run(resume=resume)
 
     def run_full_data(self, config: dict[str, Any]) -> dict[str, Any]:
         return self.runner(config).run_full_data()
@@ -79,7 +79,7 @@ class MimicIIITaskPlugin:
 
             return explore_dataset(config, options.get("output_dir"))
         if action == "active":
-            return self.run(config)
+            return self.run(config, resume=bool(options.get("resume", True)))
         if action == "full-data":
             return self.run_full_data(config)
         if action == "visualize":

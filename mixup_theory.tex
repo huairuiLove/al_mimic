@@ -1,0 +1,687 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{ctex}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning}
+\usepackage{enumitem}
+\usepackage[colorlinks=true,linkcolor=blue,citecolor=darkgray,urlcolor=blue,bookmarks=true,bookmarksnumbered=true,unicode=true]{hyperref}
+
+\widowpenalty=10000
+\clubpenalty=10000
+
+\theoremstyle{definition}
+\newtheorem{definition}{定义}[section]
+
+\title{%
+  mixup 理论：从邻近风险最小化\\[0.4em]
+  \large 到 MIMIC-III 多模态主动学习任务的应用与可视化
+}
+\author{MIMIC-III 主动学习项目组}
+\date{2026 年 8 月}
+
+\begin{document}
+
+\hypersetup{
+  pdftitle={mixup 理论：从邻近风险最小化到 MIMIC-III 多模态主动学习任务的应用与可视化},
+  pdfauthor={MIMIC-III 主动学习项目组},
+  pdfsubject={mixup 邻近风险最小化、ModiMix、多模态主动学习、可视化方案},
+  pdfkeywords={mixup, vicinal risk minimization, ModiMix, multimodal active learning, MIMIC-III}
+}
+
+\maketitle
+
+\begin{abstract}
+本文整理 mixup 方法\cite{zhang2018mixup}的数学基础，并给出其在 MIMIC-III 多模态诊断任务
+（ModiMix 方法）中的具体实现与可视化方案。第一节回顾邻近风险最小化（VRM）框架并给出
+mixup 邻近分布的严格定义；第二节推导当前项目在连续多模态表示空间中的 mixup 目标；
+第三节对比原有的融合特征空间 mixup 与新的模态空间 mixup；第四节讨论原始论文中 GAN 示
+意图可否迁移；第五节到第九节给出五类可视化方案及一个组合图设计；第十节说明为支持这些
+可视化需要在实验中保存的诊断产物；第十一节结合当前主动学习预算结果给出解释框架。
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+% ═══════════════════════════════════════════════════════
+\section{原始论文的数学对象}
+\label{sec:original}
+% ═══════════════════════════════════════════════════════
+
+\subsection{期望风险与经验风险最小化}
+
+监督学习的目标是寻找函数 $f\in\mathcal{F}$ 描述随机特征向量 $X$ 与随机目标向量 $Y$ 之间
+的关系，二者服从联合分布 $P(X,Y)$。定义损失函数 $\ell$ 惩罚预测 $f(x)$ 与真实目标 $y$
+的差异，则期望风险为
+
+\begin{equation}
+  R(f)=\mathbb{E}_{(x,y)\sim P}\bigl[\ell(f(x),y)\bigr].
+  \label{eq:expected-risk}
+\end{equation}
+
+实际中分布 $P$ 未知，只能用训练集 $\mathcal{D}=\{(x_i,y_i)\}_{i=1}^{n}$ 上的经验分布
+$P_\delta$ 近似，其中 $P_\delta$ 为狄拉克测度的混合：
+
+\begin{equation}
+  P_\delta(x,y)=\frac{1}{n}\sum_{i=1}^{n}\delta(x=x_i,\;y=y_i).
+  \label{eq:empirical-dist}
+\end{equation}
+
+最小化 $P_\delta$ 下的平均损失即经验风险最小化（ERM）：
+
+\begin{equation}
+  R_\delta(f)=\frac{1}{n}\sum_{i=1}^{n}\ell\bigl(f(x_i),y_i\bigr).
+  \label{eq:erm}
+\end{equation}
+
+\subsection{邻近风险最小化}
+
+ERM 的朴素经验分布只是逼近真实分布 $P$ 的众多选择之一。邻近风险最小化
+（Vicinal Risk Minimization, VRM）\cite{chapelle2000vicinal} 用邻近分布逼近 $P$：
+
+\begin{equation}
+  P_\nu(\tilde{x},\tilde{y})=\frac{1}{n}\sum_{i=1}^{n}\nu(\tilde{x},\tilde{y}\mid x_i,y_i),
+  \label{eq:vicinal-dist}
+\end{equation}
+
+其中 $\nu$ 衡量在训练特征--目标对 $(x_i,y_i)$ 的邻近找到虚拟特征--目标对
+$(\tilde{x},\tilde{y})$ 的概率。例如高斯邻近 $\nu(\tilde{x},\tilde{y}\mid x_i,y_i)
+=\mathcal{N}(\tilde{x}-x_i,\sigma^2)\,\delta(\tilde{y}=y_i)$ 等价于加性高斯噪声增强。
+对邻近分布采样构造数据集 $\mathcal{D}_\nu=\{(\tilde{x}_i,\tilde{y}_i)\}_{i=1}^{m}$，
+最小化经验邻近风险：
+
+\begin{equation}
+  R_\nu(f)=\frac{1}{m}\sum_{i=1}^{m}\ell\bigl(f(\tilde{x}_i),\tilde{y}_i\bigr).
+  \label{eq:vicinal-risk}
+\end{equation}
+
+\subsection{mixup 邻近分布}
+
+mixup 提出一种通用的邻近分布\cite{zhang2018mixup}：
+
+\begin{equation}
+  \mu(\tilde{x},\tilde{y}\mid x_i,y_i)
+  =\frac{1}{n}\sum_{j}\mathbb{E}_{\lambda}\Bigl[
+    \delta\bigl(\tilde{x}=\lambda x_i+(1-\lambda)x_j,\;
+    \tilde{y}=\lambda y_i+(1-\lambda)y_j\bigr)
+  \Bigr],
+  \label{eq:mixup-dist}
+\end{equation}
+
+其中 $\lambda\sim\mathrm{Beta}(\alpha,\alpha)$，$\alpha\in(0,\infty)$。简言之，从 mixup
+邻近分布采样产生虚拟特征--目标向量
+
+\begin{equation}
+  \tilde{x}=\lambda x_i+(1-\lambda)x_j,\qquad
+  \tilde{y}=\lambda y_i+(1-\lambda)y_j,
+  \label{eq:mixup-sample}
+\end{equation}
+
+其中 $(x_i,y_i)$ 与 $(x_j,y_j)$ 是从训练数据中随机抽取的两个特征--目标向量，
+$\lambda\in[0,1]$。超参数 $\alpha$ 控制插值强度：当 $\alpha\to 0$ 时 $\lambda$ 集中于
+$\{0,1\}$，mixup 退化为 ERM。
+
+\begin{definition}[mixup 目标]
+mixup 训练最小化经验邻近风险
+\begin{equation}
+  \min_{f}\;\mathbb{E}_{i,j,\lambda}\Bigl[
+    \ell\bigl(f(\lambda x_i+(1-\lambda)x_j),\;\lambda y_i+(1-\lambda)y_j\bigr)
+  \Bigr].
+  \label{eq:mixup-objective}
+\end{equation}
+\end{definition}
+
+\subsection{mixup 在做什么：线性行为的归纳偏置}
+
+mixup 邻近分布可理解为一种数据增强形式，它鼓励模型 $f$ 在训练示例之间表现出线性行为。
+这种线性行为减少了在训练示例之外进行预测时的不良振荡；从奥卡姆剃刀的角度看，线性也是
+最简单的可能行为之一，是一种良好的归纳偏置。
+
+更严格地说，mixup 的先验要求虚拟样本的预测逼近插值标签：
+
+\begin{equation}
+  f\bigl(\lambda x_i+(1-\lambda)x_j\bigr)\;\approx\;\lambda y_i+(1-\lambda)y_j,
+  \label{eq:mixup-prior}
+\end{equation}
+
+即监督信号要求 $f(\tilde{x})\approx\tilde{y}$。原文图~1 展示的是：mixup 带来类别之间
+线性过渡的决策边界，提供更平滑的不确定性估计；图~2 展示的是：在随机采样的训练样本对
+之间评估时，mixup 训练的模型在预测与梯度范数两方面都更加稳定。具体而言，图~2 度量了
+两个量：
+
+\begin{enumerate}[itemsep=1pt]
+  \item 在 $x=\lambda x_i+(1-\lambda)x_j$ 处的预测误差——若预测不属于 $\{y_i,y_j\}$，
+        计为一次“失误”（miss）；
+  \item 在训练样本之间评估的模型输入梯度范数。
+\end{enumerate}
+
+\subsection{mixup 对 GAN 的稳定化}
+
+mixup 的另一个应用是稳定生成对抗网络（GAN）\cite{goodfellow2014gan} 的训练。标准 GAN
+求解
+
+\begin{equation}
+  \max_{g}\min_{d}\;\mathbb{E}_{x,z}\bigl[
+    \ell(d(x),1)+\ell(d(g(z)),0)
+  \bigr],
+  \label{eq:gan}
+\end{equation}
+
+其中 $g$ 把噪声 $z\sim Q$ 映射为伪样本，$d$ 竞争区分真实样本与伪样本。判别器经常给
+生成器带来消失梯度，而 mixup 对判别器的梯度起正则化作用，保证生成器获得稳定的梯度
+来源。mixup 形式的 GAN 为
+
+\begin{equation}
+  \max_{g}\min_{d}\;\mathbb{E}_{x,z,\lambda}\bigl[
+    \ell\bigl(d(\lambda x+(1-\lambda)g(z)),\;\lambda\bigr)
+  \bigr].
+  \label{eq:mixup-gan}
+\end{equation}
+
+即判别器的输入在真实样本与生成样本之间插值，目标标签变为标量 $\lambda$。其目的不是
+普通分类，而是让判别器在真实样本与生成样本之间提供更平滑、更稳定的梯度。
+
+% ═══════════════════════════════════════════════════════
+\section{当前 MIMIC-III 任务中 ModiMix 的数学实现}
+\label{sec:modimix}
+% ═══════════════════════════════════════════════════════
+
+\subsection{为什么不在原始输入空间插值}
+
+ModiMix 没有直接混合原始输入 $x$：临床文本以离散的 BERT token 序列
+（\texttt{input\_ids}、\texttt{token\_type\_ids}、\texttt{attention\_mask}）进入模型，
+对离散 token ID 做数值插值没有语义。因此 mixup 在连续表示空间中进行。
+
+\subsection{模态编码与同步插值}
+
+当前模型先把一个 ICU stay 编码成三个连续表示：
+
+\begin{equation}
+  h_i=\bigl(h_i^{\text{text}},\;h_i^{\text{series}},\;h_i^{\text{static}}\bigr),
+  \label{eq:modalities}
+\end{equation}
+
+其中 $h_i^{\text{text}}$ 为 ClinicalBERT 池化表示，$h_i^{\text{series}}$ 为时序投影与
+Transformer 编码输出，$h_i^{\text{static}}$ 为静态特征编码输出。对两个样本 $i,j$ 采样
+$\lambda\sim\mathrm{Beta}(\alpha,\alpha)$ 后，三个模态同步插值：
+
+\begin{align}
+  \tilde{h}^{\text{text}}  &= \lambda h_i^{\text{text}}+(1-\lambda)h_j^{\text{text}},
+  \label{eq:mix-text}\\
+  \tilde{h}^{\text{series}} &= \lambda h_i^{\text{series}}+(1-\lambda)h_j^{\text{series}},
+  \label{eq:mix-series}\\
+  \tilde{h}^{\text{static}} &= \lambda h_i^{\text{static}}+(1-\lambda)h_j^{\text{static}}.
+  \label{eq:mix-static}
+\end{align}
+
+三个模态必须使用同一对样本与同一个 $\lambda$，避免出现“文本来自一组、时序来自另一组”
+的不一致虚拟样本。标签为 915 维 ICD-9 multi-hot 向量 $y_i,y_j\in\{0,1\}^{915}$，混合
+标签为
+
+\begin{equation}
+  \tilde{y}=\lambda y_i+(1-\lambda)y_j,
+  \label{eq:soft-label}
+\end{equation}
+
+混合后的连续表示重新经过 Yang--Wu 门控融合与线性分类头：
+
+\begin{equation}
+  \tilde{z}=G\bigl(\tilde{h}^{\text{text}},\;\tilde{h}^{\text{series}},\;\tilde{h}^{\text{static}}\bigr),
+  \qquad
+  \tilde{p}=\sigma\bigl(W\tilde{z}+b\bigr).
+  \label{eq:predict}
+\end{equation}
+
+训练损失为
+
+\begin{equation}
+  \mathcal{L}=\mathcal{L}_{\text{clean}}+\gamma\cdot
+  \mathrm{BCEWithLogits}\bigl(\tilde{p},\tilde{y}\bigr),
+  \label{eq:loss}
+\end{equation}
+
+其中 $\gamma$ 为 mixup 权重。当前配置为 $\alpha=1.0$、$\gamma=1.0$、随机配对、
+全 batch 参与且不强制 anchor 占主导，因此 $\lambda\sim\mathrm{Beta}(1,1)$ 即 $[0,1]$
+上的均匀分布。这属于连续隐空间（manifold）mixup，而非原始输入空间 mixup。整体目标可
+写成
+
+\begin{equation}
+  f_{\theta}\Bigl(G\bigl(\lambda h_i+(1-\lambda)h_j\bigr)\Bigr)
+  \;\approx\;\lambda y_i+(1-\lambda)y_j,
+  \label{eq:modimix-objective}
+\end{equation}
+
+其中 $h_i$ 不是单个向量，而是三个同步插值的模态表示。
+
+% ═══════════════════════════════════════════════════════
+\section{ModiMix 与原始 mixup 的关系}
+\label{sec:relation}
+% ═══════════════════════════════════════════════════════
+
+当前实现存在两条 mixup 路径。
+
+\subsection{原有的融合特征空间 mixup}
+
+Random+Mixup 与 CoMAL+Mixup 使用旧路径：先由完整模型得到融合特征
+$z_i=G(h_i)$、$z_j=G(h_j)$，再插值
+
+\begin{equation}
+  \tilde{z}=\lambda z_i+(1-\lambda)z_j,
+  \label{eq:fused-mix}
+\end{equation}
+
+随后 $\tilde{p}=\sigma(W\tilde{z}+b)$。由于分类头是线性的，
+
+\begin{equation}
+  W\tilde{z}+b=\lambda(Wz_i+b)+(1-\lambda)(Wz_j+b),
+  \label{eq:fused-linear}
+\end{equation}
+
+该分支约束的是融合后的表示与线性分类头，不直接对多模态融合函数本身提出线性要求。
+
+\subsection{ModiMix 的模态空间 mixup}
+
+ModiMix 采用
+
+\begin{equation}
+  \tilde{z}=G\bigl(\lambda h_i+(1-\lambda)h_j\bigr).
+  \label{eq:modality-mix}
+\end{equation}
+
+由于 Yang--Wu 门控是非线性的，通常
+
+\begin{equation}
+  G\bigl(\lambda h_i+(1-\lambda)h_j\bigr)\;\neq\;\lambda G(h_i)+(1-\lambda)G(h_j).
+  \label{eq:gate-nonlinear}
+\end{equation}
+
+因此模态空间 mixup 要求整个多模态融合函数在连续模态表示之间保持平滑，而不只是要求
+线性分类头对插值后的融合特征给出合理预测。这是 ModiMix 与旧路径的本质区别。
+
+% ═══════════════════════════════════════════════════════
+\section{关于 GAN 示意图的迁移讨论}
+\label{sec:gan}
+% ═══════════════════════════════════════════════════════
+
+原始论文图~5 展示 mixup 在建模玩具数据集时稳定 GAN 训练的效果：生成样本（橙色）逐步
+向真实样本（蓝色）聚集，判别器提供平滑梯度。该图不能直接迁移到当前任务，因为当前
+实验没有生成器、判别器、隐空间噪声与真实--生成的对抗优化。
+
+但可以借鉴其表达方式，绘制 ModiMix 的多模态版本（图~\ref{fig:modimix-flow}）：两个
+真实 ICU stay 是“标定点”，mixup 在它们的连续表示之间生成虚拟点，虚拟点的目标不是硬
+标签而是两个诊断向量的凸组合，模型需要在这条路径上给出平滑的诊断概率。图题建议为
+“ModiMix constructs synchronized multimodal vicinal samples between labeled ICU
+stays”，而不应表述为 GAN 或生成真实患者。
+
+\begin{figure}[htbp]
+  \centering
+  \begin{tikzpicture}[
+    box/.style={draw, rounded corners=2pt, text width=3.1cm, minimum height=0.75cm,
+                align=center, font=\small},
+    arr/.style={-{Stealth[length=4pt]}, thick, gray!70}
+  ]
+    \node[box, fill=blue!8]  (a) {真实 ICU stay $i$\\ $h_i^{\text{text}},h_i^{\text{series}},h_i^{\text{static}}$};
+    \node[box, fill=orange!8, right=1.6cm of a] (b) {真实 ICU stay $j$\\ $h_j^{\text{text}},h_j^{\text{series}},h_j^{\text{static}}$};
+    \node[box, fill=green!8, below=1.1cm of a, xshift=0.8cm] (m) {$\lambda$ 同步插值\\ $\tilde{h}=\lambda h_i+(1-\lambda)h_j$};
+    \node[box, below=1.1cm of m] (g) {Yang--Wu 多模态门控 $G$};
+    \node[box, fill=blue!5, below=1.1cm of g] (p) {诊断概率 $\tilde{p}$};
+    \node[box, fill=orange!5, right=1.4cm of g] (t) {软标签 $\tilde{y}=\lambda y_i+(1-\lambda)y_j$};
+    \draw[arr] (a) -- (m);
+    \draw[arr] (b) -- (m);
+    \draw[arr] (m) -- (g);
+    \draw[arr] (g) -- (p);
+    \draw[arr] (g) -- (t);
+  \end{tikzpicture}
+  \caption{ModiMix 虚拟样本构造流程：两个真实 ICU stay 的多模态表示按同一
+  $\lambda$ 同步插值，重新经过融合门控得到预测，监督目标为软标签。}
+  \label{fig:modimix-flow}
+\end{figure}
+
+% ═══════════════════════════════════════════════════════
+\section{可视化方案一：真实点、插值点与路径}
+\label{sec:vis-geometry}
+% ═══════════════════════════════════════════════════════
+
+\subsection{做法}
+
+对当前某一轮的已标注池：
+
+\begin{enumerate}[itemsep=1pt]
+  \item 收集每个 ICU stay 的融合表示 $z_i$，或拼接后的多模态表示
+        $h_i=[h_i^{\text{text}};\,h_i^{\text{series}};\,h_i^{\text{static}}]$；
+  \item 用 PCA 降至二维；
+  \item 随机选取若干真实样本对 $(i,j)$；
+  \item 对每对样本在 $\lambda\in\{0,0.1,\ldots,1\}$ 网格上计算
+        \begin{equation}
+          \tilde{h}_\lambda=\lambda h_i+(1-\lambda)h_j;
+          \label{eq:interp-path}
+        \end{equation}
+  \item 将真实点、虚拟点与连接线段画在同一坐标平面。
+\end{enumerate}
+
+\subsection{图形设计}
+
+真实已标注 stay 用大圆点，mixup 虚拟点用小圆点，$\lambda$ 从 0 到 1 用颜色或点大小
+渐变表示，真实点之间画连接线段。颜色按以下维度之一着色：诊断基数（cardinality）、
+某个选定的 ICD-9 标签、主导诊断组、获取轮次。不建议把 915 个标签画成 915 种颜色；
+更适合选择正标签数最多的若干 ICD-9 类别、一个临床主题、标签基数或 PCA 后的标签
+嵌入。
+
+PCA 与 UMAP 建议同时使用但解释不同：PCA 适合展示“线性插值”的几何关系；UMAP 适合
+展示局部聚类，但其投影本身是非线性变换，不能严格说明投影空间中的线段对应原空间
+线段。正文建议用 PCA，附录可放 UMAP。
+
+\subsection{对照要求}
+
+必须同时绘制 ERM/plain Random、原有融合特征 mixup 与 ModiMix 三种模型，并使用
+\textbf{相同的一组样本对与相同的 $\lambda$ 网格}，否则视觉比较会混入采样差异。
+
+% ═══════════════════════════════════════════════════════
+\section{可视化方案二：预测插值曲线}
+\label{sec:vis-prediction}
+% ═══════════════════════════════════════════════════════
+
+对一对真实 ICU stay $(i,j)$，在 $\lambda=0,0.05,0.10,\ldots,1$ 网格上计算
+
+\begin{equation}
+  p_\theta(\lambda)=f_\theta\bigl(\lambda h_i+(1-\lambda)h_j\bigr),
+  \label{eq:pred-curve}
+\end{equation}
+
+同时构造目标曲线
+
+\begin{equation}
+  y_{\text{target}}(\lambda)=\lambda y_i+(1-\lambda)y_j.
+  \label{eq:target-curve}
+\end{equation}
+
+对一个标签 $c$，横轴为 $\lambda$，实线为模型预测 $p_{\theta,c}(\lambda)$，虚线为目标
+插值 $y_{\text{target},c}(\lambda)$，两端标注真实样本 A 与 B。理想情况下预测曲线平滑
+地跟随目标曲线。
+
+\subsection{标签选择}
+
+对 915 个标签不全部绘制，选择：$y_{i,c}\neq y_{j,c}$ 的标签、A 与 B 差异最大的标签、
+训练集中频率较高的标签、一个仅在 A 出现的标签、一个仅在 B 出现的标签、一个 A 与 B
+共有的标签。这样可展示：A 独有诊断概率从高到低平滑变化，B 独有诊断概率从低到高平滑
+变化，共有诊断全程保持高概率。
+
+\subsection{汇总指标}
+
+对一批样本对与多个 $\lambda$，计算插值目标误差
+
+\begin{equation}
+  E_{\text{target}}(\lambda)
+  =\frac{1}{|C|}\Bigl\lVert
+    p_\theta(\lambda)-\bigl[\lambda y_i+(1-\lambda)y_j\bigr]
+  \Bigr\rVert_1,
+  \label{eq:target-error}
+\end{equation}
+
+或插值目标 BCE
+
+\begin{equation}
+  E_{\text{BCE}}(\lambda)
+  =\mathrm{BCE}\Bigl(p_\theta(\lambda),\;\lambda y_i+(1-\lambda)y_j\Bigr).
+  \label{eq:target-bce}
+\end{equation}
+
+比较 ERM、融合特征 mixup 与 ModiMix 三者的曲线。这直接回答：ModiMix 是否真的学会
+了“输入表示插值对应标签插值”，而不仅是提升最终 Recall@30。
+
+% ═══════════════════════════════════════════════════════
+\section{可视化方案三：预测与梯度稳定性}
+\label{sec:vis-gradient}
+% ═══════════════════════════════════════════════════════
+
+原始论文图~2 的核心度量是插值路径上的预测错误与输入梯度范数。MIMIC 没有连续的原始
+文本输入，因此梯度定义在连续编码表示上。对插值表示
+$\tilde{h}_\lambda=\lambda h_i+(1-\lambda)h_j$，计算
+
+\begin{equation}
+  g(\lambda)=\Bigl\lVert
+    \frac{\partial\mathcal{L}(\tilde{h}_\lambda,\tilde{y}_\lambda)}
+         {\partial\tilde{h}_\lambda}
+  \Bigr\rVert_2,
+  \label{eq:grad-norm}
+\end{equation}
+
+并分别计算各模态分量
+
+\begin{equation}
+  g_{\text{text}}(\lambda)=\Bigl\lVert
+    \frac{\partial\mathcal{L}}{\partial\tilde{h}^{\text{text}}}\Bigr\rVert_2,\qquad
+  g_{\text{series}}(\lambda)=\Bigl\lVert
+    \frac{\partial\mathcal{L}}{\partial\tilde{h}^{\text{series}}}\Bigr\rVert_2,\qquad
+  g_{\text{static}}(\lambda)=\Bigl\lVert
+    \frac{\partial\mathcal{L}}{\partial\tilde{h}^{\text{static}}}\Bigr\rVert_2.
+  \label{eq:grad-per-modality}
+\end{equation}
+
+绘制时横轴为 $\lambda$，纵轴为梯度范数，实线为 ERM，虚线为 ModiMix，阴影为不同样本
+对的 95\% 区间。若 ModiMix 起作用，预期梯度曲线更少尖峰、中间区域的最大梯度更低、
+曲线在 $\lambda=0.5$ 附近更稳定。注意表述应限定为 “ModiMix produces smoother
+optimization geometry along labeled-pair interpolation paths”，不宜直接声称模型
+更鲁棒。
+
+% ═══════════════════════════════════════════════════════
+\section{可视化方案四：不确定性曲线}
+\label{sec:vis-uncertainty}
+% ═══════════════════════════════════════════════════════
+
+mixup 带来更平滑的不确定性估计。多标签任务中定义每标签 Bernoulli 熵
+
+\begin{equation}
+  H(p)=-p\log p-(1-p)\log(1-p),
+  \label{eq:entropy}
+\end{equation}
+
+对一条插值路径计算平均预测熵
+
+\begin{equation}
+  H_\lambda=\frac{1}{915}\sum_{c=1}^{915}H\bigl(p_c(\lambda)\bigr).
+  \label{eq:mean-entropy}
+\end{equation}
+
+更推荐同时绘制两类曲线：
+
+\begin{enumerate}[itemsep=1pt]
+  \item \textbf{预测熵曲线}：观察不确定性是否随 A 到 B 的过渡自然增加；
+  \item \textbf{MC dropout 方差}：推理时保留 dropout，重复预测 $K$ 次，
+        \begin{equation}
+          U(\lambda)=\frac{1}{915}\sum_{c=1}^{915}
+          \mathrm{Var}_{k}\bigl[p_{\theta,k,c}(\lambda)\bigr].
+          \label{eq:mc-var}
+        \end{equation}
+\end{enumerate}
+
+比较 ERM 与 ModiMix：ERM 可能在中间区域出现异常尖峰，ModiMix 理想情况下更平滑；但
+不应期待不确定性一定单调，因为多标签诊断之间存在复杂结构。
+
+% ═══════════════════════════════════════════════════════
+\section{可视化方案五：虚拟样本对稀缺区域的覆盖}
+\label{sec:vis-coverage}
+% ═══════════════════════════════════════════════════════
+
+主动学习场景中，低预算时不仅决策边界不平滑，真实已标注样本本身也很少。因此需要
+可视化 mixup 虚拟样本是否真正覆盖稀缺区域。
+
+\subsection{近邻距离}
+
+对每个 mixup 虚拟点，计算其到当前已标注池的最近邻距离
+
+\begin{equation}
+  d_{\text{NN}}(\tilde{h})=\min_{k\in L}\lVert\tilde{h}-h_k\rVert_2,
+  \label{eq:nn-dist}
+\end{equation}
+
+分别绘制已标注真实点、mixup 虚拟点与候选池点的距离分布，说明虚拟点主要是填充真实
+样本之间的空隙，还是停留在真实样本附近。
+
+\subsection{局部密度}
+
+在 PCA 或原始隐空间中用 kNN 估计密度
+
+\begin{equation}
+  \rho(x)=\frac{k}{d_k(x)^{D}},
+  \label{eq:density}
+\end{equation}
+
+比较已标注真实、mixup 虚拟与未标注候选三类点的密度分布。
+
+\subsection{凸组合覆盖}
+
+计算每个候选样本到某个已标注样本对线段的距离
+
+\begin{equation}
+  d_{\text{segment}}(u;h_i,h_j)=\min_{\lambda\in[0,1]}
+  \bigl\lVert u-\bigl(\lambda h_i+(1-\lambda)h_j\bigr)\bigr\rVert_2,
+  \label{eq:segment-dist}
+\end{equation}
+
+再对候选池中的每个样本取最小
+
+\begin{equation}
+  d_{\text{pair}}(u)=\min_{i,j\in L}d_{\text{segment}}(u;h_i,h_j).
+  \label{eq:pair-dist}
+\end{equation}
+
+该指标非常适合主动学习预算曲线：预算 5\% 时已标注点少、线段覆盖低；预算 10\% 时
+mixup 虚拟点填充更多区域；预算 20\% 时真实标注覆盖已提高，mixup 的边际作用下降。
+
+% ═══════════════════════════════════════════════════════
+\section{组合图设计}
+\label{sec:composite}
+% ═══════════════════════════════════════════════════════
+
+建议最终组合为一个 $2\times3$ 的 figure。
+
+第一行（几何结构）：
+\begin{enumerate}[itemsep=1pt]
+  \item[(a)] 隐空间 PCA 图：真实已标注 ICU stay、未标注候选、mixup 虚拟点与样本对
+        连线；
+  \item[(b)] 标签基数/标签嵌入图：点颜色表示诊断数量，展示虚拟标签是否落在 A 与 B
+        之间；
+  \item[(c)] 虚拟样本覆盖图：已标注、mixup 与候选三类的最近邻距离或密度。
+\end{enumerate}
+
+第二行（模型行为）：
+\begin{enumerate}[itemsep=1pt]
+  \item[(d)] 预测插值曲线：$p_\theta(\lambda)$ 对 $\tilde{y}(\lambda)$；
+  \item[(e)] 梯度范数曲线：$\lVert\partial\mathcal{L}/\partial h\rVert$；
+  \item[(f)] 不确定性曲线：预测熵或 MC dropout 方差。
+\end{enumerate}
+
+每个面板都固定：同一主动学习轮次、同一已标注池、同一组样本对、同一 $\lambda$ 网格、
+同一模型初始化策略与同一验证/测试协议，并同时比较 ERM/Random、融合特征 mixup 与
+ModiMix。这样才能把 mixup 的作用与主动学习选样本的作用分离开。
+
+% ═══════════════════════════════════════════════════════
+\section{实验需要补充的诊断产物}
+\label{sec:artifacts}
+% ═══════════════════════════════════════════════════════
+
+当前训练时 mixup 虚拟样本生成后立即用于损失计算并被丢弃，训练历史中仅保留以下聚合量：
+
+\begin{itemize}[itemsep=1pt]
+  \item \texttt{mixup\_loss}；
+  \item \texttt{mixup\_virtual\_samples}；
+  \item anchor 与混合后的标签基数。
+\end{itemize}
+
+为支持上述可视化，还需要保存样本对索引、每个样本的 $\lambda$、混合前后的隐表示、
+插值路径上的预测、梯度范数与不确定性。
+
+不建议保存每个训练 batch 的全部虚拟样本（存储量过大），而是在训练后、评估时增加一个
+固定随机种子的可视化采样器：
+
+\begin{enumerate}[itemsep=1pt]
+  \item 从某轮已标注池中固定随机抽取 $N$ 对样本；
+  \item 保存样本对的 ICU stay ID 与 subject ID；
+  \item 在 $\lambda=0,0.05,\ldots,1$ 网格上重新计算插值；
+  \item 输出小型诊断产物目录：
+        \begin{verbatim}
+mixup_diagnostics/
+  pairs.json                      # 样本对与 lambda 网格
+  interpolation_predictions.npz   # [N, K, 915] 预测概率
+  interpolation_targets.npz       # [N, K, 915] 插值标签
+  latent_points.npz               # 真实与虚拟隐表示
+  gradient_norms.npz              # 各模态梯度范数
+  uncertainty.npz                 # 熵与 MC dropout 方差
+  summary.json
+        \end{verbatim}
+\end{enumerate}
+
+其中 \texttt{pairs.json} 的每条记录包含样本对的索引、主题标识与插值网格：
+
+\begin{itemize}[itemsep=1pt]
+  \item \texttt{anchor\_index}、\texttt{partner\_index}：样本对在已标注池中的索引；
+  \item \texttt{anchor\_subject\_id}、\texttt{partner\_subject\_id}：ICU stay 的主题标识；
+  \item \texttt{lambda\_grid}：插值网格，如 $[0.0,\;0.05,\;0.1]$。
+\end{itemize}
+
+该采样器不污染训练，也不影响主动学习选择。
+
+% ═══════════════════════════════════════════════════════
+\section{对当前实验结果的解释框架}
+\label{sec:interpretation}
+% ═══════════════════════════════════════════════════════
+
+当前训练表的观察结果是：5\% 预算下 Random 与其余方法几乎打平；7.5\% 预算下 MoSAIC
+领先；10\% 与 15\% 预算下 MoDIS 领先。这提示
+mixup 的价值很可能不是简单地让某个获取方法在所有预算上取胜，而是：
+
+\begin{enumerate}[itemsep=1pt]
+  \item 在低预算时缓解模型对少量已标注 stay 的记忆化；
+  \item 让模型在已标注 stay 之间的隐空间区域预测更稳定；
+  \item 但随着预算增加，原型、跨模态对齐或获取覆盖度可能比 mixup 更重要。
+\end{enumerate}
+
+因此论文中除最终 Recall@30 曲线外，还应绘制
+
+\begin{equation}
+  \text{标签预算}\;\to\;\text{插值误差},\qquad
+  \text{标签预算}\;\to\;\text{梯度变化},\qquad
+  \text{标签预算}\;\to\;\text{不确定性平滑度}.
+  \label{eq:budget-curves}
+\end{equation}
+
+一个可能且更有价值的结果是：ModiMix 不一定在每个预算点取得最高 Recall@30，但它显著
+降低了低预算下的插值误差、梯度尖峰与预测不稳定性。这比单独增加一条 recall 曲线更能
+证明其实现了 mixup 论文所述的机制。
+
+% ═══════════════════════════════════════════════════════
+\section{结论}
+\label{sec:conclusion}
+% ═══════════════════════════════════════════════════════
+
+本文把 mixup 从邻近风险最小化框架下的严格定义，映射到 MIMIC-III 多模态诊断任务中的
+连续表示空间实现：三个模态表示按同一 $\lambda$ 同步插值，软标签为两个 multi-hot 诊断
+向量的凸组合，插值表示重新经过非线性融合门控。与融合特征空间 mixup 相比，模态空间
+mixup 对多模态融合函数本身施加了线性平滑约束。基于论文图~1 与图~2 的度量，本文给出
+五类可视化方案（几何路径、预测插值曲线、梯度范数、不确定性、覆盖分析）与组合图设计，
+并明确了支持这些可视化所需的诊断产物。这些可视化将回答一个核心问题：mixup 在主动
+学习低预算场景中的作用，究竟体现在最终指标，还是体现在训练样本之间的模型行为。
+
+\begin{thebibliography}{3}
+  \bibitem[Zhang et al.(2018)]{zhang2018mixup}
+  Hongyi Zhang, Moustapha Cisse, Yann N. Dauphin, and David Lopez-Paz.
+  \newblock mixup: Beyond empirical risk minimization.
+  \newblock In \emph{International Conference on Learning Representations (ICLR)}, 2018.
+
+  \bibitem[Chapelle et al.(2000)]{chapelle2000vicinal}
+  Olivier Chapelle, Jason Weston, L{\'e}on Bottou, and Vladimir Vapnik.
+  \newblock Vicinal risk minimization.
+  \newblock In \emph{Advances in Neural Information Processing Systems (NeurIPS)}, 2000.
+
+  \bibitem[Goodfellow et al.(2014)]{goodfellow2014gan}
+  Ian Goodfellow, Jean Pouget-Abadie, Mehdi Mirza, Bing Xu, David Warde-Farley,
+  Sherjil Ozair, Aaron Courville, and Yoshua Bengio.
+  \newblock Generative adversarial nets.
+  \newblock In \emph{Advances in Neural Information Processing Systems (NeurIPS)}, 2014.
+\end{thebibliography}
+
+\end{document}

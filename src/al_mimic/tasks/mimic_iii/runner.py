@@ -5,8 +5,9 @@ from __future__ import annotations
 import json
 import random
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 import torch
@@ -20,6 +21,7 @@ from .metrics import task_multilabel_metrics
 from .tasks import task_manifest, task_spec
 from .training import (
     TrainedMultimodalRound,
+    build_classifier,
     collect_classifier_outputs,
     train_multimodal_round,
 )
@@ -64,6 +66,115 @@ def labeled_schedule(
 def _initial_indices(train_indices: np.ndarray, size: int, seed: int) -> list[int]:
     rng = np.random.default_rng(seed)
     return sorted(int(value) for value in rng.choice(train_indices, size=size, replace=False))
+
+
+@dataclass(frozen=True, slots=True)
+class ResumedRun:
+    """Loop state restored from a previous attempt of the same experiment."""
+
+    rounds_done: int
+    records: list[dict[str, Any]]
+    initial: np.ndarray
+    labeled: list[int]
+
+
+def write_round_progress(
+    checkpoint_dir: Path,
+    *,
+    round_index: int,
+    record: Mapping[str, Any],
+    labeled: Sequence[int],
+    initial: Sequence[int],
+    schedule: Sequence[int],
+    strategy: str,
+    seed: int,
+    rounds: int,
+) -> None:
+    """Persist resumable loop state next to the round's classifier checkpoint."""
+    checkpoint_dir.mkdir(exist_ok=True)
+    _write_json(checkpoint_dir / f"round_{round_index:03d}_record.json", dict(record))
+    _write_json(
+        checkpoint_dir / "progress.json",
+        {
+            "format_version": 1,
+            "strategy": strategy,
+            "seed": int(seed),
+            "rounds": int(rounds),
+            "schedule": [int(value) for value in schedule],
+            "rounds_done": round_index + 1,
+            "initial_indices": [int(value) for value in initial],
+            "labeled_indices": [int(value) for value in labeled],
+        },
+    )
+
+
+def _purge_resume_artifacts(checkpoint_dir: Path) -> None:
+    """Drop artifacts of a previous attempt so a later crash-restart cannot mix runs."""
+    if not checkpoint_dir.exists():
+        return
+    for pattern in ("progress.json", "round_*_record.json", "round_*.pt", "final.pt"):
+        for path in checkpoint_dir.glob(pattern):
+            path.unlink()
+
+
+def load_round_progress(
+    checkpoint_dir: Path,
+    *,
+    resume: bool,
+    schedule: Sequence[int],
+    strategy: str,
+    seed: int,
+    rounds: int,
+    train_indices: np.ndarray,
+) -> ResumedRun | None:
+    """Return the restored loop state, or None when starting fresh.
+
+    Fresh starts purge stale checkpoint artifacts: keeping them would let a
+    crash followed by `--resume` continue a run that was intentionally replaced.
+    """
+    progress_path = checkpoint_dir / "progress.json"
+    if not resume or not progress_path.exists():
+        _purge_resume_artifacts(checkpoint_dir)
+        return None
+    progress = json.loads(progress_path.read_text(encoding="utf-8"))
+    mismatches: list[str] = []
+    if int(progress.get("format_version", 0)) != 1:
+        mismatches.append("progress format version")
+    if str(progress.get("strategy")) != strategy:
+        mismatches.append(f"strategy {progress.get('strategy')!r}")
+    if int(progress.get("seed", -1)) != int(seed):
+        mismatches.append("seed")
+    if [int(value) for value in progress.get("schedule", [])] != [int(value) for value in schedule]:
+        mismatches.append("labeled schedule")
+    if int(progress.get("rounds", -1)) != int(rounds):
+        mismatches.append("rounds")
+    if mismatches:
+        raise ValueError(
+            "resume refused: checkpoint does not match this configuration "
+            f"({', '.join(mismatches)}); rerun with --no-resume to start fresh"
+        )
+    rounds_done = int(progress["rounds_done"])
+    if not 0 < rounds_done <= int(rounds):
+        raise ValueError("resume refused: checkpoint rounds_done is outside the configured schedule")
+    records: list[dict[str, Any]] = []
+    for index in range(rounds_done):
+        record_path = checkpoint_dir / f"round_{index:03d}_record.json"
+        if not record_path.exists():
+            raise ValueError(f"resume refused: missing round record {record_path}")
+        records.append(json.loads(record_path.read_text(encoding="utf-8")))
+    initial = [int(value) for value in progress["initial_indices"]]
+    labeled = sorted(int(value) for value in progress["labeled_indices"])
+    if len(initial) != int(schedule[0]) or len(labeled) != int(schedule[rounds_done - 1]):
+        raise ValueError("resume refused: checkpoint labeled counts disagree with the schedule")
+    pool = {int(value) for value in train_indices}
+    if not set(labeled) <= pool:
+        raise ValueError("resume refused: checkpoint labels contain indices outside the train pool")
+    return ResumedRun(
+        rounds_done=rounds_done,
+        records=records,
+        initial=np.asarray(initial, dtype=np.int64),
+        labeled=labeled,
+    )
 
 
 def _host(tensor: torch.Tensor) -> np.ndarray:
@@ -350,7 +461,40 @@ class ActiveLearningExperiment:
         _write_json(output_dir / "resolved_config.json", self.config)
         return {"output_dir": str(output_dir), "final_metrics": final}
 
-    def run(self) -> dict[str, Any]:
+    def _final_outputs_from_checkpoint(
+        self,
+        checkpoint_path: Path,
+        validation_indices: np.ndarray,
+        test_indices: np.ndarray,
+    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+        """Rebuild final-round outputs when resuming a fully completed schedule."""
+        if not checkpoint_path.exists():
+            raise RuntimeError(f"cannot rebuild final outputs: missing round checkpoint {checkpoint_path}")
+        payload = torch.load(checkpoint_path, map_location=self.device, weights_only=True)
+        classifier = build_classifier(self.store, self.config, self.device)
+        classifier.load_state_dict(
+            {key: value.to(self.device) for key, value in payload["classifier"].items()}
+        )
+        classifier.eval()
+        validation = collect_classifier_outputs(
+            classifier,
+            self.store,
+            validation_indices,
+            self.config,
+            self.device,
+            return_tokens=False,
+        )
+        test = collect_classifier_outputs(
+            classifier,
+            self.store,
+            test_indices,
+            self.config,
+            self.device,
+            return_tokens=False,
+        )
+        return validation, test
+
+    def run(self, resume: bool = True) -> dict[str, Any]:
         random.seed(self.seed)
         np.random.seed(self.seed)
         train_indices = self.store.indices("train")
@@ -363,18 +507,42 @@ class ActiveLearningExperiment:
             initial_fraction=float(self.active["initial_fraction"]),
             query_fraction=float(self.active["query_fraction"]),
         )
-        labeled = _initial_indices(train_indices, schedule[0], self.seed)
-        initial = np.asarray(labeled, dtype=np.int64)
-        labeled_mask = np.zeros(self.store.audit.total_samples, dtype=bool)
-        labeled_mask[labeled] = True
         strategy = str(self.active["strategy"]).lower()
         plugin = get_method(strategy)
-        round_records: list[dict[str, Any]] = []
+        checkpoint_dir = self.output_dir / "checkpoints"
+        resumed = load_round_progress(
+            checkpoint_dir,
+            resume=resume,
+            schedule=schedule,
+            strategy=strategy,
+            seed=self.seed,
+            rounds=rounds,
+            train_indices=train_indices,
+        )
+        if resumed is None:
+            labeled = _initial_indices(train_indices, schedule[0], self.seed)
+            initial = np.asarray(labeled, dtype=np.int64)
+            round_records: list[dict[str, Any]] = []
+            start_round = 0
+        else:
+            labeled = resumed.labeled
+            initial = resumed.initial
+            round_records = resumed.records
+            start_round = resumed.rounds_done
+        labeled_mask = np.zeros(self.store.audit.total_samples, dtype=bool)
+        labeled_mask[np.asarray(labeled, dtype=np.int64)] = True
         total_start = time.perf_counter()
         final_validation: dict[str, torch.Tensor] | None = None
         final_test: dict[str, torch.Tensor] | None = None
+        if start_round == rounds:
+            final_validation, final_test = self._final_outputs_from_checkpoint(
+                checkpoint_dir / f"round_{rounds - 1:03d}.pt",
+                validation_indices,
+                test_indices,
+            )
 
-        for round_index, target_count in enumerate(schedule):
+        for round_index in range(start_round, rounds):
+            target_count = int(schedule[round_index])
             if len(labeled) != target_count:
                 raise RuntimeError(f"round {round_index} expected {target_count} labels, got {len(labeled)}")
             round_start = time.perf_counter()
@@ -472,6 +640,17 @@ class ActiveLearningExperiment:
             if queries:
                 labeled_mask[np.asarray(queries, dtype=np.int64)] = True
                 labeled = sorted([*labeled, *queries])
+            write_round_progress(
+                checkpoint_dir,
+                round_index=round_index,
+                record=round_records[-1],
+                labeled=labeled,
+                initial=initial.tolist(),
+                schedule=schedule,
+                strategy=strategy,
+                seed=self.seed,
+                rounds=rounds,
+            )
 
         assert final_validation is not None and final_test is not None
         data_usage = {
@@ -488,13 +667,17 @@ class ActiveLearningExperiment:
             "cumulative_fraction_targets": [count / float(train_indices.size) for count in schedule],
         }
         state = {
-            "format_version": 5,
+            "format_version": 6,
             "protocol": task_manifest(self.config),
             "strategy": strategy,
             "seed": self.seed,
             "labeled_schedule": schedule,
             "initial_indices": initial.tolist(),
             "final_labeled_indices": labeled,
+            "resume": {
+                "resumed": resumed is not None,
+                "rounds_completed_before_resume": start_round,
+            },
             "records": round_records,
             "data_usage": data_usage,
             "total_wall_sec": time.perf_counter() - total_start,
@@ -518,4 +701,10 @@ class ActiveLearningExperiment:
         return {"output_dir": str(self.output_dir), "final_metrics": final, "rounds": rounds}
 
 
-__all__ = ["ActiveLearningExperiment", "labeled_schedule"]
+__all__ = [
+    "ActiveLearningExperiment",
+    "ResumedRun",
+    "labeled_schedule",
+    "load_round_progress",
+    "write_round_progress",
+]
